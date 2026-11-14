@@ -436,6 +436,9 @@ const DEFAULT_SETTINGS = {
   pinned: true,
   // 浮窗是否锁定 16:9（比例锁定，不是禁止缩放）
   ratioLocked: false,
+  // 鼠标穿透：开启后点击直接落到游戏里，浮窗只做显示。
+  // 纯净模式会强制穿透，退出时恢复到这里记录的状态。
+  clickThrough: false,
   opacity: 1,
   mode: 'web',
   volume: 100,
@@ -568,10 +571,9 @@ function loadSettings() {
       if (kept.length) roiBy[id] = kept;
     }
 
-    // 已废弃字段：clickThrough（穿透改由纯净模式控制）和 togglePass 热键。
+    // 已废弃字段：togglePass 热键（穿透改为控制台里的独立开关）。
     // 旧配置里残留的条目直接丢掉，否则会被 spread 带回来，
-    // 让「设置里有个没人用的开关 / 键位」一直存在。
-    delete raw.clickThrough;
+    // 让「设置里有个没人用的键位」一直存在。
     if (raw.hotkeys) delete raw.hotkeys.togglePass;
 
     settings = {
@@ -857,6 +859,8 @@ function createWindow() {
 
   win.once('ready-to-show', () => {
     win.showInactive(); // 不抢游戏焦点
+    // 恢复用户上次的穿透设置（纯净模式不持久化，这里只按开关来）
+    applyMousePass();
     if (settings.opacity < 1) win.setOpacity(settings.opacity);
     // applyRatioLock 内部先 await 量准 chromeHeight，再对齐并抖动一次
     applyRatioLock();
@@ -1994,6 +1998,36 @@ function toggleVisible() {
   }
 }
 
+/** 纯净模式当前是否开启（不持久化：每次启动都是关闭） */
+let cleanMode = false;
+
+/**
+ * 鼠标穿透开关（控制台「浮窗 → 鼠标穿透」）。
+ * 开启后点击直接落到游戏里，浮窗只做显示；设置会被记住。
+ */
+function setClickThrough(on) {
+  settings.clickThrough = !!on;
+  applyMousePass();
+  persist();
+  return settings.clickThrough;
+}
+
+/**
+ * 真正把「穿透 / 不穿透」应用到窗口上。
+ *
+ * 实际穿透 = 用户开关 || 纯净模式。纯净模式里 UI 全隐藏，穿透与否都点不到
+ * 控件，所以强制穿透更符合直觉；退出纯净模式时再按用户开关恢复。
+ */
+function applyMousePass() {
+  if (!win || win.isDestroyed()) return;
+  const pass = !!settings.clickThrough || cleanMode;
+  try {
+    win.setIgnoreMouseEvents(pass, { forward: true });
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
 /**
  * 纯净模式 = 隐藏 UI + 整窗鼠标穿透。
  *
@@ -2005,11 +2039,9 @@ function toggleVisible() {
 function setCleanMode(on) {
   const next = !!on;
   if (!win || win.isDestroyed()) return next;
-  try {
-    win.setIgnoreMouseEvents(next, { forward: true });
-  } catch {
-    /* 窗口正在销毁 */
-  }
+  cleanMode = next;
+  // 进纯净模式强制穿透；退出时恢复用户自己的开关状态（而不是一律关闭）
+  applyMousePass();
   return next;
 }
 
@@ -2562,6 +2594,7 @@ function registerIpc() {
     }
     // 这个开关本身不是「观看记录」，别顺手刷新 lastWatchedAt
     if (patch.resumeOnLaunch !== undefined) settings.resumeOnLaunch = !!patch.resumeOnLaunch;
+    if (patch.clickThrough !== undefined) setClickThrough(patch.clickThrough);
     if (patch.snapAdjustment !== undefined) {
       settings.snapAdjustment = Math.max(-20, Math.min(20, Math.round(Number(patch.snapAdjustment) || 0)));
       // 窗口正好贴着边时立刻按新值重贴，做到「边拖滑块边看效果」
@@ -2763,6 +2796,9 @@ function registerIpc() {
         break;
       case 'clean':
         setCleanMode(payload);
+        break;
+      case 'click-through':
+        setClickThrough(payload);
         break;
       case 'opacity':
         setOpacity(payload);

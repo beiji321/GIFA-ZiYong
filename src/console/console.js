@@ -363,6 +363,7 @@ function paintRange(el) {
 
 function fillSettings(s) {
   $('setPin').checked = !!s.pinned;
+  $('setClickThrough').checked = s.clickThrough === true;
   // 老 settings.json 没这个字段，默认视为开启
   $('setResumeOnLaunch').checked = s.resumeOnLaunch !== false;
   $('setSubtitleSprite').checked = !!s.enableSubtitleSprite;
@@ -504,6 +505,12 @@ function wireSettings() {
   });
 
   $('setPin').addEventListener('change', (e) => window.api.action('pin', e.target.checked));
+
+  $('setClickThrough').addEventListener('change', (e) => {
+    state.boot.settings.clickThrough = e.target.checked;
+    window.api.save({ clickThrough: e.target.checked });
+    toast(e.target.checked ? '已开启鼠标穿透，点击会落到游戏里' : '已关闭鼠标穿透');
+  });
 
   // 吸附微调：拖动时实时保存，主进程会立刻把正贴边的窗口重贴一次
   let snapTimer = null;
