@@ -23,7 +23,8 @@ const state = {
   uiTimer: null,
   toastTimer: null,
   immersiveTimer: null,
-  loadIssuedAt: 0
+  loadIssuedAt: 0,
+  ratioLocked: false
 };
 
 let wv = null;
@@ -87,6 +88,11 @@ async function init() {
   createWebview();
   wireUi();
   wireHotkeys();
+  wireResizePhase();
+
+  // 恢复上次的比例锁定状态：界面和本地 state 一起同步
+  paintRatioLock(!!s.ratioLocked);
+
 
   pumpUi();
 
@@ -118,6 +124,24 @@ async function init() {
 
 /* --------------------------------------------------------------- webview */
 
+/**
+ * 请求主进程按当前窗口宽度重算一次 16:9。
+ * 只在锁定时有意义：B 站播放器要过一会儿才把视频撑开，主进程在 ready-to-show
+ * 那一刻量到的 #stage 高度可能还没稳定，算出来的窗口高度差几像素 —— 上下黑边。
+ * 这里在 webview 加载完、播放器起播后再补一次，把误差挤掉。
+ * 合并 200ms 内的重复请求，避免 dom-ready / did-finish-load / 定时器一起发。
+ */
+let refitTimer = null;
+function requestRatioRefit(delay = 0) {
+  if (!state.ratioLocked) return;
+  clearTimeout(refitTimer);
+  refitTimer = setTimeout(() => {
+    refitTimer = null;
+    if (!state.ratioLocked) return;
+    window.api.action('ratio-refit');
+  }, delay);
+}
+
 function createWebview() {
   wv = document.createElement('webview');
   wv.id = 'view';
@@ -136,7 +160,25 @@ function createWebview() {
       state.pendingUrl = '';
       loadUrl(u);
     }
+    syncSubtitleToGuest();
+    requestRatioRefit(0);
   });
+
+  // 访客页抓到的字幕文本 → 底部悬浮条；off=true 表示开关被关掉
+  wv.addEventListener('ipc-message', (e) => {
+    // 访客页的字幕调试日志转进浮窗控制台（F12 直接看）
+    if (e.channel === 'guest-log') {
+      console.log('[guest]', (e.args && e.args[0]) || '');
+      return;
+    }
+    if (e.channel !== 'subtitle') return;
+    const p = e.args && e.args[0];
+    if (p && p.off) hideSubtitleSprite();
+    else showSubtitleSprite(p);
+  });
+
+  // 整页（含 B 站播放器骨架）加载完：这时 #stage 的尺寸才可信
+  wv.addEventListener('did-finish-load', () => requestRatioRefit(0));
 
   wv.addEventListener('ipc-message', (e) => {
     if (e.channel === 'state') {
@@ -169,6 +211,7 @@ function createWebview() {
 
   wv.addEventListener('did-stop-loading', () => {
     state.guestReady = true;
+    requestRatioRefit(120);
     sendVolume();
     sendPlayer({ cmd: 'clean', on: true });
     syncBearingToGuest();
@@ -241,6 +284,21 @@ function roisFor(id) {
   const own = id && b.roiBy ? b.roiBy[id] : null;
   if (Array.isArray(own) && own.length) return own;
   return Array.isArray(b.rois) ? b.rois : [];
+}
+
+/**
+ * 把「字幕精灵」开关同步给访客页。
+ * 关闭时必须真的发一条 on:false，让 preload 断开观察器，
+ * 不能只是不下发（那样旧的 MutationObserver 会一直挂着）。
+ */
+function syncSubtitleToGuest() {
+  sendPlayer({
+    cmd: 'subtitle',
+    // 只要字幕条或转向提醒有一个开着，就得抓字幕（转向判断依赖它）
+    on: !!(state.boot.settings.enableSubtitleSprite || state.boot.settings.enableTurnReminder),
+    // 弹幕抓取和字幕抓取共用一次下发：两者都由webview-preload里的观察器负责
+    danmaku: !!state.boot.settings.enableDanmakuProjection
+  });
 }
 
 function syncBearingToGuest(extra) {
@@ -601,6 +659,17 @@ async function loadVideo(text, part, autoplay) {
   state.guestReady = false;
   state.queue = [];
   state.loadIssuedAt = Date.now();
+  lastDmTime = -1;
+  lastDmReport = 0;
+  lastDmPlaying = null;
+
+  // 换片：把上一个视频的残留状态清干净
+  //  - 底部字幕条立刻收起（新视频的字幕要等它自己 dom-ready 再谈）
+  //  - 转向提示收起
+  //  - 弹幕层清空，等主进程按新 cid 拉到的列表重新灌
+  hideSubtitleSprite();
+  hideTurnHint();
+  window.api.danmakuTime({ t: 0, seek: true, playing: false });
 
   $('urlInput').value = t;
   $('videoTitle').textContent = res.title || res.id;
@@ -611,6 +680,8 @@ async function loadVideo(text, part, autoplay) {
   toggleUrlbar(false);
 
   loadUrl(res.url);
+  // 播放器起播大约要几百毫秒，等它把画面撑开后再校正一次窗口尺寸
+  requestRatioRefit(500);
   if (res.message) toast(res.message, 3500);
 }
 
@@ -674,6 +745,48 @@ function applyState(v) {
   $('timeText').textContent = `${fmt(v.current)} / ${fmt(v.duration)}`;
 
   if (v.title && v.title !== '哔哩哔哩') $('videoTitle').textContent = v.title;
+
+  reportDanmakuTime(v);
+}
+
+/* --------------------------------------------------------- 弹幕时间驱动 */
+
+let lastDmTime = -1;
+let lastDmReport = 0;
+let lastDmPlaying = null;
+
+/**
+ * 把播放进度报给主进程，由它按进度切出「当前点前后几秒」的弹幕片段。
+ * 这里只做两件事：正常推进时节流上报；进度跳变（拖条 / 换片）时补一个 seek 标记。
+ */
+function reportDanmakuTime(v) {
+  if (!state.boot || !state.boot.settings.enableDanmakuProjection) return;
+  if (!v || !v.found || !Number.isFinite(v.current)) return;
+
+  const now = Date.now();
+
+  // 播放 / 暂停必须立刻上报，不能被 1 秒节流吞掉 ——
+  // 否则暂停后弹幕窗还要再飘最多 1 秒才停。
+  if (lastDmPlaying !== v.playing) {
+    lastDmPlaying = v.playing;
+    lastDmTime = v.current;
+    lastDmReport = now;
+    window.api.danmakuTime({ t: v.current, playing: !!v.playing });
+    return;
+  }
+
+  const jumped = lastDmTime >= 0 && Math.abs(v.current - lastDmTime) > 2;
+  if (jumped) {
+    lastDmTime = v.current;
+    lastDmReport = now;
+    window.api.danmakuTime({ t: v.current, seek: true, playing: !!v.playing });
+    return;
+  }
+
+  lastDmTime = v.current;
+  if (now - lastDmReport < 1000) return;
+  lastDmReport = now;
+  window.api.danmakuTime({ t: v.current, playing: !!v.playing });
 }
 
 function paintProgress(cur, total) {
@@ -725,6 +838,11 @@ function wireUi() {
   $('btnMin').addEventListener('click', () => window.api.action('minimize'));
   $('btnClose').addEventListener('click', () => window.api.action('close'));
 
+  // 16:9 锁定：状态在这里维护，主进程负责真正约束窗口尺寸
+  $('lock-ratio-btn').addEventListener('click', () => {
+    setRatioLocked(!state.ratioLocked);
+  });
+
   // 浮窗不带设置，⚙ 只负责把启动器叫到前台
   $('btnSettings').addEventListener('click', () => window.api.action('open-console'));
 
@@ -750,7 +868,21 @@ function wireUi() {
     if (!next) return;
     state.boot.settings = next;
     syncBearingToGuest();
+    syncSubtitleToGuest();
+    // 关掉开关时字幕条要立刻消失，不等 3 秒淡出
+    if (!next.enableSubtitleSprite) hideSubtitleSprite();
+    if (!next.enableDanmakuProjection) window.api.danmakuTime({ t: 0, seek: true });
     sendVolume();
+  });
+
+  // 贴边吸附：主进程按窗口位置告诉我们哪几条边该亮
+  window.api.onSnapEdges((payload) => {
+    const edges = (payload && payload.edges) || [];
+    const map = { left: 'snapL', right: 'snapR', top: 'snapT', bottom: 'snapB' };
+    for (const [edge, id] of Object.entries(map)) {
+      const el = $(id);
+      if (el) el.classList.toggle('show', edges.includes(edge));
+    }
   });
 
   // 全屏时标题栏/控制条浮层化（设置入口在启动器里，这里只是为了不挡画面）
@@ -821,6 +953,89 @@ function wireProgress() {
   });
 }
 
+/* ------------------------------------------------------------ 16:9 锁定 */
+
+/** 只画 UI：按钮图标、提示语、手柄高亮 */
+function paintRatioLock(on) {
+  state.ratioLocked = !!on;
+  const btn = $('lock-ratio-btn');
+  if (!btn) return;
+  btn.classList.toggle('locked', state.ratioLocked);
+  btn.title = state.ratioLocked ? '已锁定 16:9（点击解锁）' : '锁定 16:9 比例';
+  btn.setAttribute('aria-pressed', state.ratioLocked ? 'true' : 'false');
+  document.body.classList.toggle('ratio-locked', state.ratioLocked);
+}
+
+/** 用户点击：更新 UI 并通知主进程约束窗口 */
+function setRatioLocked(on) {
+  paintRatioLock(on);
+  // 主进程负责约束窗口并持久化 ratioLocked
+  window.api.action('ratio-lock', state.ratioLocked);
+  toast(state.ratioLocked ? '已锁定 16:9' : '已解锁比例', 1600);
+}
+
+/* ----------------------------------------------------- 拖动缩放防黑边 */
+
+/**
+ * 拖动窗口时 Chromium 会先丢掉旧的合成表面、再按新尺寸重绘访客页，
+ * 中间空出来的那一帧就是「黑边闪烁」。这里的办法是：拖动期间把 webview
+ * 的布局尺寸冻结在开始那一刻，再用 transform 把它拉到当前可视区，
+ * 这样 GPU 直接缩放旧画面，不需要访客页重排。
+ * 松手（主进程 140ms 内没有新的 resize）后解除冻结，访客页只重排一次。
+ */
+let freezeRect = null;
+let freezeTimer = null;
+
+function beginResizeFreeze() {
+  const wvEl = $('view');
+  if (!wvEl) return;
+  if (!freezeRect) {
+    freezeRect = { width: wvEl.offsetWidth || 1, height: wvEl.offsetHeight || 1 };
+    wvEl.classList.add('resize-freeze');
+    $('stage').classList.add('resizing');
+  }
+  paintResizeFreeze();
+  clearTimeout(freezeTimer);
+  freezeTimer = setTimeout(endResizeFreeze, 180);
+}
+
+function paintResizeFreeze() {
+  const wvEl = $('view');
+  const stage = $('stage');
+  if (!wvEl || !freezeRect) return;
+  const w = stage.clientWidth || 1;
+  const h = stage.clientHeight || 1;
+  wvEl.style.width = `${freezeRect.width}px`;
+  wvEl.style.height = `${freezeRect.height}px`;
+  wvEl.style.transform = `scale(${w / freezeRect.width}, ${h / freezeRect.height})`;
+}
+
+function endResizeFreeze() {
+  clearTimeout(freezeTimer);
+  freezeTimer = null;
+  freezeRect = null;
+  const wvEl = $('view');
+  if (!wvEl) return;
+  wvEl.classList.remove('resize-freeze');
+  wvEl.style.width = '';
+  wvEl.style.height = '';
+  wvEl.style.transform = '';
+  $('stage').classList.remove('resizing');
+}
+
+/** 主进程在拖动期间持续推送 active=true，停止后推一次 false */
+function wireResizePhase() {
+  // 主进程在页面加载完后会下发真实状态；以它为准校正图标
+  window.api.onRatioState((r) => {
+    if (r && typeof r.locked === 'boolean') paintRatioLock(r.locked);
+  });
+
+  window.api.onResizePhase((s) => {
+    if (s && s.active) beginResizeFreeze();
+    else endResizeFreeze();
+  });
+}
+
 /* ------------------------------------------------------------ 缩放手柄 */
 
 function wireGrip() {
@@ -834,18 +1049,133 @@ function wireGrip() {
     grip.setPointerCapture(e.pointerId);
 
     const move = (ev) => {
-      window.api.action('resize', {
-        w: Math.max(240, startW + (ev.screenX - sx)),
-        h: Math.max(150, startH + (ev.screenY - sy))
-      });
+      beginResizeFreeze();
+      const w = Math.max(240, startW + (ev.screenX - sx));
+      // 锁定比例时手柄也走 16:9：窗口高 = 视频区高 + 标题栏/控制条的实际高度。
+      // 原生 setAspectRatio 只管系统边框拖拽，管不到这条自绘手柄。
+      let h = Math.max(150, startH + (ev.screenY - sy));
+      if (state.ratioLocked) {
+        const chromeH = Math.max(0, window.innerHeight - $('stage').clientHeight);
+        h = Math.max(150, Math.round(((w * 9) / 16)) + chromeH);
+      }
+      window.api.action('resize', { w, h });
     };
     const up = () => {
       grip.removeEventListener('pointermove', move);
       grip.removeEventListener('pointerup', up);
+      endResizeFreeze();
     };
     grip.addEventListener('pointermove', move);
     grip.addEventListener('pointerup', up);
   });
+}
+
+/* ------------------------------------------------------------ 字幕精灵 */
+
+/**
+ * 字幕不再画在浮窗里：浮窗可以拖到任何位置，画在里面就永远沉不到屏幕底部。
+ * 这里只负责把文本转发给主进程，由独立的全屏透明字幕窗口绘制。
+ */
+function showSubtitleSprite(payload) {
+  if (!state.boot) return;
+  const text = String((payload && payload.text) || '').replace(/\s+/g, ' ').trim();
+  if (!text) return;
+
+  // 字幕条和转向提醒是两个独立开关：只要有一个开着就处理文本
+  if (state.boot.settings.enableSubtitleSprite) window.api.subtitle({ text });
+  detectTurn(text);
+}
+
+/* -------------------------------------------------------- 字幕转向提醒 */
+
+/**
+ * 从一句字幕里判断行进方向。只认「带方向动词」的组合，避免
+ * 「左右」「上面有个宝箱」这类普通叙述误触发 —— 竞品那种见字就弹
+ * 会把人烦死，这里必须有 转/走/往/向/靠 之类的上下文。
+ */
+/**
+ * 四个方向：左/右贴左右边缘，上/下贴上下边缘。
+ * 用词表而不是单字匹配，避免「左右」「右上方有个宝箱」这类叙述误触发。
+ * 优先级：左右（转弯指令更明确）> 上下（直行/后退）。
+ */
+const TURN_RULES = [
+  { dir: 'left', group: 'lr', label: '左', re: /(左转|向左|往左|左前|左侧|左边|左拐|左方|靠左)/ },
+  { dir: 'right', group: 'lr', label: '右', re: /(右转|向右|往右|右前|右侧|右边|右拐|右方|靠右)/ },
+  // 抬头 / 低头 也算「上」「下」：都是让你把视线或人往上下挪，不必分两套提示
+  {
+    dir: 'up',
+    group: 'ud',
+    label: '上',
+    re: /(抬头|抬一下头|往上看|向上看|看上面|看上方|上面看|向前|往前|直行|直走|一直走|前行|上楼|往上|向上)/
+  },
+  {
+    dir: 'down',
+    group: 'ud',
+    label: '下',
+    re: /(低头|低一下头|往下看|向下看|看下面|看下方|下面看|向后|往后|后退|倒退|掉头|回头|下楼|往下|向下)/
+  }
+];
+
+let lastTurnAt = 0;
+let lastTurnDir = '';
+
+/** 命中「左」或「右」就发给字幕层；同一方向 1.2 秒内不重复弹 */
+function detectTurn(text) {
+  if (!state.boot || !state.boot.settings.enableTurnReminder) return;
+
+  // 分开启用：只匹配开启的那一组（左右 / 上下）
+  const lr = state.boot.settings.turnEnableLR !== false;
+  const ud = state.boot.settings.turnEnableUD !== false;
+  if (!lr && !ud) return;
+
+  const hit = TURN_RULES.find((r) => {
+    if (r.group === 'lr' && !lr) return false;
+    if (r.group === 'ud' && !ud) return false;
+    return r.re.test(text);
+  });
+  if (!hit) return;
+
+  const now = Date.now();
+  if (hit.dir === lastTurnDir && now - lastTurnAt < 1200) return;
+  lastTurnDir = hit.dir;
+  lastTurnAt = now;
+  console.log('[turn] 命中', hit.dir, '←', text);
+  // 只发单字，UI 里不再拼「转」之类的后缀
+  window.api.turn({ dir: hit.dir, label: hit.label, text });
+}
+
+function hideSubtitleSprite() {
+  window.api.subtitle({ off: true });
+}
+
+/** 收起转向提示（换片 / 关开关时用） */
+function hideTurnHint() {
+  lastTurnDir = '';
+  lastTurnAt = 0;
+  window.api.turn({ off: true });
+}
+
+/* ------------------------------------------------------------ 纯净模式 */
+
+/**
+ * 隐藏标题栏 / 控制条 / 地址栏 / 缩放手柄，让 webview 铺满整个窗口。
+ * 隐藏后窗口没有可拖区域了，所以 index.html 里留了一条 5px 透明的 #cleanDrag，
+ * CSS 里给它 -webkit-app-region: drag，鼠标贴到最上面仍能拖动这个无边框窗口。
+ */
+/**
+ * 纯净模式 = 隐藏 UI + 鼠标穿透，两者绑死。
+ *
+ * 穿透之后窗口里什么都点不到（包括关闭按钮），只能靠全局快捷键 Alt+Z 退出。
+ * 这也意味着进入纯净模式时不能再弹 toast —— 反正看不见了，靠快捷键退出。
+ */
+function toggleCleanMode(force) {
+  const on = typeof force === 'boolean' ? force : !document.body.classList.contains('clean-mode');
+  document.body.classList.toggle('clean-mode', on);
+  // 主进程负责真正的穿透开关
+  window.api.action('clean', on);
+  // 布局变了（chrome 高度从 64 变成 0 或反过来），锁比例时让主进程重新对齐一次
+  if (state.ratioLocked) window.api.action('ratio-refit');
+  toast(on ? '纯净模式：按 Alt+Z 退出' : '已恢复界面，可正常点击', 1600);
 }
 
 /* ------------------------------------------------------------ 自动隐藏 UI */
@@ -906,6 +1236,9 @@ function wireHotkeys() {
       case 'nextPart':
         changePart(1);
         break;
+      case 'toggleClean':
+        toggleCleanMode();
+        break;
       default:
         break;
     }
@@ -934,6 +1267,8 @@ function wireHotkeys() {
 function prettify(acc) {
   if (!acc) return '未设置';
   // 鼠标侧键单独映射，别让后续的 Left/Right 替换把它搅乱
+  if (/^RMB\+Mouse4$/i.test(acc)) return '右键+侧键 ◀';
+  if (/^RMB\+Mouse5$/i.test(acc)) return '右键+侧键 ▶';
   if (/^Mouse4$/i.test(acc)) return '鼠标侧键 ◀';
   if (/^Mouse5$/i.test(acc)) return '鼠标侧键 ▶';
   return String(acc)

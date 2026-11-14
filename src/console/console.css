@@ -284,7 +284,8 @@ html, body {
 #tab-home:checked ~ #shell .pane-home,
 #tab-bearing:checked ~ #shell .pane-bearing,
 #tab-window:checked ~ #shell .pane-window,
-#tab-hotkeys:checked ~ #shell .pane-hotkeys { display: block; animation: pane-in 0.18s ease; }
+#tab-hotkeys:checked ~ #shell .pane-hotkeys,
+#tab-bili:checked ~ #shell .pane-bili { display: block; animation: pane-in 0.18s ease; }
 
 @keyframes pane-in {
   from { opacity: 0; transform: translateY(4px); }
@@ -829,4 +830,31 @@ button.small { flex: 0 0 auto; height: 28px; padding: 0 11px; font-size: 12px; }
 /* 系统里关了动画的用户：不做位移和淡入 */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+
+/* ------------------------------------------------------ 字幕外观（B站设置）
+   颜色选择器与「恢复默认」按钮的尺寸，跟现有 .setting 行对齐 */
+.setting-ctrl input[type="color"] {
+  width: 46px;
+  height: 26px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.setting-ctrl input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.setting-ctrl input[type="color"]::-webkit-color-swatch {
+  border: 0;
+  border-radius: 4px;
+}
+
+.sub-reset-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
 }

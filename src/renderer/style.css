@@ -160,6 +160,32 @@ button {
   color: #fff;
 }
 
+/* 16:9 锁定：同一个按钮里两枚图标，按 .locked 切显示（同播放键的写法） */
+#lock-ratio-btn .i-ratio-locked,
+#lock-ratio-btn.locked .i-ratio-open {
+  display: none;
+}
+
+#lock-ratio-btn.locked .i-ratio-locked {
+  display: block;
+}
+
+#lock-ratio-btn.locked {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+#lock-ratio-btn.locked:hover {
+  background: rgba(73, 178, 252, 0.28);
+  color: var(--accent);
+}
+
+/* 锁定时底角的缩放手柄点亮一下：还能拖，但只会等比缩放 */
+body.ratio-locked #grip {
+  filter: drop-shadow(0 0 3px var(--accent));
+  opacity: 1;
+}
+
 /* 把「功能按钮」和「窗口按钮」隔开一点，避免想点设置时误关窗口 */
 .tb-sep {
   width: 1px;
@@ -298,6 +324,20 @@ button.ghost:hover {
   height: 100%;
   display: flex;
   border: 0;
+  transform-origin: top left;
+}
+
+/* 拖动缩放期间：webview 的布局尺寸被冻结在开始那一刻（app.js 写内联宽高），
+ * 再用 transform 拉到当前可视区。这样只让 GPU 缩放旧画面，访客页不重排，
+ * 不会出现「旧表面已清空、新画面还没画」的黑边。 */
+#stage webview.resize-freeze {
+  will-change: transform;
+  transition: none;
+}
+
+/* 冻结期间整块舞台也点亮成不透明底色，视觉上把边缘的一像素缝盖住 */
+#stage.resizing {
+  background: #000;
 }
 
 #placeholder {
@@ -639,6 +679,56 @@ body:not(.ui) #controls {
   white-space: nowrap;
 }
 
+/* ------------------------------------------------------ 贴边吸附提示线
+   4 条绝对定位的发光细线，贴哪条边亮哪条；贴角时两条同时亮。
+   平时 opacity: 0，不占视觉也不吃点击（pointer-events: none）。 */
+
+.snap-line {
+  position: absolute;
+  z-index: 65;
+  pointer-events: none;
+  opacity: 0;
+  background: rgba(0, 153, 255, 0.95);
+  box-shadow:
+    0 0 6px 2px rgba(0, 153, 255, 0.9),
+    0 0 16px 5px rgba(0, 153, 255, 0.4);
+  transition: opacity 0.14s ease;
+}
+
+.snap-line.show {
+  opacity: 1;
+}
+
+#snapL,
+#snapR {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+
+#snapL {
+  left: 0;
+}
+
+#snapR {
+  right: 0;
+}
+
+#snapT,
+#snapB {
+  left: 0;
+  right: 0;
+  height: 4px;
+}
+
+#snapT {
+  top: 0;
+}
+
+#snapB {
+  bottom: 0;
+}
+
 /* ------------------------------------------------- 全屏（沉浸）状态
    窗口全屏时视频铺满整个客户区，标题栏和底部控制条改成浮层：
    平时淡出，鼠标移上去就出现。设置入口因此永远不会被画面盖住。 */
@@ -680,6 +770,55 @@ body:not(.ui) #controls {
 /* 全屏时右下角的缩放手柄只会碍事 */
 #app.immersive #grip {
   display: none;
+}
+
+/* ------------------------------------------------- 纯净模式（clean-mode）
+   隐藏标题栏、地址栏、控制条、缩放手柄，让 <webview> 铺满整个窗口。
+   这些元素都是 flex 流里的固定高度块，display:none 之后 #stage 的 flex:1
+   自然就吃满整窗，不需要改 #app 的高度。
+
+   注意：UI 全没了就没有可拖动区域，所以顶端留 5px 透明条给 #cleanDrag，
+   由它承担 -webkit-app-region: drag；其余部分完全让给视频交互。 */
+
+body.clean-mode #titlebar,
+body.clean-mode #urlbar,
+body.clean-mode #controls,
+body.clean-mode #grip,
+body.clean-mode #placeholder {
+  display: none !important;
+}
+
+/* 圆角和描边也去掉，四边不留缝，视频真正顶到窗口边缘 */
+body.clean-mode #app {
+  border: 0;
+  border-radius: 0;
+}
+
+/* 5px 拖拽条：平时不存在，纯净模式才浮现 */
+#cleanDrag {
+  display: none;
+}
+
+/* 纯净模式下 toast 仍然保留：它是「已切换」的即时反馈，不算常驻 UI */
+body.clean-mode #toast {
+  z-index: 70;
+}
+
+body.clean-mode #cleanDrag {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 5px;
+  z-index: 60;
+  -webkit-app-region: drag;
+  cursor: grab;
+}
+
+/* 纯净模式下框选小地图的提示条也要收起来（它不属于视频画面） */
+body.clean-mode #calib {
+  display: none !important;
 }
 
 /* ---------------------------------------------------------------- 小窗口

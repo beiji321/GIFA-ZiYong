@@ -10,11 +10,17 @@ dist*/
 # 本地运行数据与个人配置（含账号 Cookie / 观看记录 / 标定值，禁止入库）
 .workbuddy/
 data/
+.data-run/
 settings.json
 Partitions/
 .env
 .env.*
 *.log
+
+# 打包工具产生的中间目录（可重新生成）
+.npm-cache/
+.electron-dist/
+.tmp/
 
 # 视觉探针素材：来自第三方视频的截帧、用户标注图与本机视频配置，不入库
 scripts/vision-probe/fixtures/

@@ -2325,6 +2325,430 @@ function safePlay() {
   if (p && typeof p.catch === 'function') p.catch(() => {});
 }
 
+/* ------------------------------------------------------------ 字幕精灵 */
+
+/**
+ * 自动点开 B 站播放器字幕，并把字幕文本镜像给浮窗。
+ *
+ * 为什么要「自动点一下」而不是直接读接口：B 站字幕面板是懒加载的，
+ * 只有用户点过字幕按钮之后，播放器才会把 <div class="bpx-player-subtitle-panel-text">
+ * 渲染进 DOM 并持续更新当前句。我们不去猜它的内部 JS 对象（preload 与页面
+ * 可能是隔离上下文，拿不到 window.player），只跟 DOM 打交道，稳且无害。
+ *
+ * 只有在视频确实带字幕（按钮出现 / subtitle-ready 的 exists=true）时才动手；
+ * 没有字幕节点的页面静默返回，不打印任何东西。
+ */
+/**
+ * 字幕相关日志同时转给宿主页：<webview> 的 console 默认只进它自己的 DevTools，
+ * 浮窗按 F12 是看不到的。转发一份到宿主，排查时一个控制台就够。
+ */
+function slog(...args) {
+  try {
+    console.log(...args);
+  } catch {
+    /* ignore */
+  }
+  try {
+    const line = args
+      .map((a) => {
+        if (typeof a === 'string') return a;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(' ');
+    ipcRenderer.sendToHost('guest-log', line);
+  } catch {
+    /* 页面正在卸载 */
+  }
+}
+
+const SUB_BTN_SEL = '.bpx-player-ctrl-btn.bpx-player-ctrl-subtitle';
+// 由窄到宽依次尝试：具体的文本节点优先，抓不到就退到整个面板容器取 innerText
+const SUB_PANEL_SELECTORS = [
+  '.bpx-player-subtitle-panel-text',
+  '.bpx-player-subtitle-panel',
+  '[class*="subtitle-panel"]',
+  '[class*="subtitle"][class*="text"]'
+];
+const SUB_PANEL_SEL = SUB_PANEL_SELECTORS[0];
+
+const SUBTITLE = {
+  on: false,
+  btnObserver: null,   // 等字幕按钮出现
+  panelObserver: null, // 盯字幕文字变化
+  clicked: false,      // 本轮视频是否已经点过
+  lastText: '',
+  url: location.href,
+  pollTimer: null
+};
+
+/** 临时观察器（AI 语言菜单等），关闭开关时要一并断开 */
+const observers = new Set();
+
+function subtitleButton() {
+  try {
+    return document.querySelector(SUB_BTN_SEL);
+  } catch {
+    return null;
+  }
+}
+
+/** 面板里当前这一句：取最后一个非空节点（B 站会同时保留多行） */
+/**
+ * 播放器界面上的固定文案，不是台词。
+ * 我们为了自动开字幕会点一次字幕按钮，B 站会弹出「字幕设置」面板，
+ * 面板里的标题也命中宽泛选择器，结果被当成一句字幕显示出来 ——
+ * 就是用户看到的那个黑框「字幕设置」。
+ */
+const SUB_UI_TEXTS = new Set([
+  '字幕设置',
+  '字幕',
+  '关闭字幕',
+  '开启字幕',
+  '字幕大小',
+  '字幕样式',
+  '字幕位置',
+  '双语字幕',
+  '自动字幕',
+  'AI字幕',
+  'AI 字幕',
+  '设置'
+]);
+
+/** 命中节点是否落在播放器控件/设置面板里（这些地方的文字一律不是台词） */
+function insidePlayerUI(el) {
+  try {
+    return !!el.closest(
+      '[class*="subtitle-setting"], [class*="subtitle-panel-setting"], [class*="bpx-player-ctrl"], [class*="setting-panel"], [class*="bpx-player-ctrl-subtitle"]'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function currentSubtitleText() {
+  for (const sel of SUB_PANEL_SELECTORS) {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(sel);
+    } catch {
+      continue;
+    }
+    if (!nodes.length) continue;
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const el = nodes[i];
+      // textContent 对 AI 字幕的分段 span 也有效；innerText 在隐藏元素上会返回空
+      const t = String(el.textContent || el.innerText || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!t) continue;
+      // 过滤播放器 UI 文案与设置面板里的文字
+      if (SUB_UI_TEXTS.has(t) || insidePlayerUI(el)) continue;
+      // 过短又像是按钮标签的（2 字以内且没有句子特征）也跳过
+      if (t.length <= 2 && /^(字幕|设置|中文|英文|日文)$/.test(t)) continue;
+      slog(
+        `[subtitle] 命中 ${sel}，节点=`,
+        el.tagName.toLowerCase(),
+        'class=',
+        el.getAttribute('class'),
+        '文本=',
+        t
+      );
+      return t;
+    }
+  }
+  return '';
+}
+
+/** 调试：把当前面板里所有候选节点的结构打出来，方便对选择器 */
+function dumpSubtitlePanel() {
+  const report = [];
+  for (const sel of SUB_PANEL_SELECTORS) {
+    let nodes = [];
+    try {
+      nodes = [...document.querySelectorAll(sel)];
+    } catch {
+      /* ignore */
+    }
+    report.push(
+      `${sel} → ${nodes.length} 个` +
+        (nodes.length
+          ? '：' +
+            nodes
+              .slice(-3)
+              .map((n) => `${n.tagName.toLowerCase()}.${n.getAttribute('class') || ''}`)
+              .join(' | ')
+          : '')
+    );
+  }
+  slog('[subtitle] 候选选择器命中情况:', report);
+}
+
+function pushSubtitle(text) {
+  if (!text || text === SUBTITLE.lastText) return;
+  SUBTITLE.lastText = text;
+  slog('[subtitle] → host:', text);
+  try {
+    ipcRenderer.sendToHost('subtitle', { text });
+  } catch {
+    /* 页面正在卸载 */
+  }
+}
+
+/**
+ * 收起播放器自己的「字幕设置」弹层。
+ *
+ * 我们为了开字幕会模拟点一次字幕按钮，B 站就会弹出那个面板；
+ * 如果用户长久没说话、又或者自动选语言没成功，这个面板会一直挂在屏幕底部，
+ * 看起来就像「字幕框残留」。用一次 mousedown 点空白处让它自己关闭
+ * （B 站的面板是监听外部点击关闭的），比直接 dispatch Escape 安全 ——
+ * Escape 在播放器里还可能触发退出全屏。
+ */
+function dismissPlayerPopup() {
+  try {
+    const target = document.body || document.documentElement;
+    if (!target) return;
+    // 只发 mousedown / mouseup：B 站的面板是靠「外部按下」关闭的。
+    // 不发 click —— 父级播放器容器上绑着「点画面暂停/播放」，发了会误暂停。
+    const opts = { bubbles: true, cancelable: true, view: window };
+    target.dispatchEvent(new MouseEvent('mousedown', opts));
+    target.dispatchEvent(new MouseEvent('mouseup', opts));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 语言菜单：只有【AI 字幕】的视频，点主按钮不会直接开字幕，而是弹出语言列表。
+ * 参考 BiliPlus 的做法：菜单项带 data-lan 属性，AI 中文是 ai-zh，点它才算选中。
+ * 不点的话字幕面板根本不会出现，表现就是「有字幕但打不开」。
+ */
+const SUB_LANG_SEL = '[data-lan]';
+const AI_LANG = 'ai-zh';
+
+/**
+ * 点完主按钮后在 3 秒内盯着语言菜单；出现 ai-zh 就点它，然后立刻断开。
+ * 只看带 data-lan 的元素，不猜 B 站内部选择器；没有菜单就静默超时。
+ */
+function selectAiSubtitle() {
+  let timer = null;
+  const observer = new MutationObserver(() => {
+    let item = null;
+    try {
+      item =
+        document.querySelector(`[data-lan="${AI_LANG}"]`) ||
+        [...document.querySelectorAll(SUB_LANG_SEL)].find(
+          (el) => String(el.getAttribute('data-lan') || '').toLowerCase() === AI_LANG
+        );
+    } catch {
+      item = null;
+    }
+    if (!item) return;
+    observers.delete(observer);
+    observer.disconnect();
+    clearTimeout(timer);
+    try {
+      // 菜单项自己就绑了 click；冒泡派发即可，不 preventDefault
+      item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      slog('[subtitle] 已选择 AI 字幕（data-lan=ai-zh）');
+    } catch (err) {
+      slog('[subtitle] 点击 AI 字幕项失败', err && err.message);
+    }
+    // 选完语种后立刻再看一眼面板，别等下一次 mutation
+    setTimeout(() => {
+      pushSubtitle(currentSubtitleText());
+      // 关掉 B 站自己的「字幕设置」弹层，避免它一直挂在屏幕底部
+      dismissPlayerPopup();
+    }, 300);
+  });
+
+  observers.add(observer);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  timer = setTimeout(() => {
+    observers.delete(observer);
+    observer.disconnect();
+  }, 3000);
+
+  // 菜单可能已经渲染好了（主按钮点击是同步的），先主动查一次
+  const existing = (() => {
+    try {
+      return document.querySelector(`[data-lan="${AI_LANG}"]`);
+    } catch {
+      return null;
+    }
+  })();
+  if (existing) {
+    observers.delete(observer);
+    observer.disconnect();
+    clearTimeout(timer);
+    try {
+      existing.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      slog('[subtitle] 已选择 AI 字幕（data-lan=ai-zh，已存在）');
+    } catch (err) {
+      slog('[subtitle] 点击 AI 字幕项失败', err && err.message);
+    }
+  }
+}
+
+/** 点一下按钮内部的图标；成功立刻断开「等按钮」的观察器 */
+function clickSubtitleButton(btn) {
+  if (!btn || SUBTITLE.clicked) return;
+  SUBTITLE.clicked = true;
+  try {
+    const icon = btn.querySelector('.bpx-player-ctrl-subtitle-icon') || btn;
+    icon.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  } catch {
+    SUBTITLE.clicked = false;
+    return;
+  }
+  // 点完就不需要再找按钮了，留一个观察器白耗 CPU
+  if (SUBTITLE.btnObserver) {
+    SUBTITLE.btnObserver.disconnect();
+    SUBTITLE.btnObserver = null;
+  }
+  // 普通 CC 会直接开；AI 字幕会弹语言菜单，这里补一步选 ai-zh
+  selectAiSubtitle();
+
+  // 兜底：若 1.5 秒后仍然没有字幕文本，说明点了按钮但没开成，
+  // 把播放器弹出来的面板收起来，别留个空框在屏幕上。
+  setTimeout(() => {
+    if (!SUBTITLE.on) return;
+    if (currentSubtitleText()) return;
+    dismissPlayerPopup();
+  }, 1500);
+  setTimeout(() => pushSubtitle(currentSubtitleText()), 600);
+}
+
+/** 等字幕按钮出现；已经有了就直接点 */
+function waitForSubtitleButton() {
+  const btn = subtitleButton();
+  if (btn) {
+    clickSubtitleButton(btn);
+    return;
+  }
+  if (SUBTITLE.btnObserver) return;
+  SUBTITLE.btnObserver = new MutationObserver(() => {
+    const b = subtitleButton();
+    if (b) clickSubtitleButton(b);
+  });
+  SUBTITLE.btnObserver.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+/** 盯字幕面板的文字变化，把当前句发给浮窗 */
+function watchSubtitlePanel() {
+  if (SUBTITLE.panelObserver) return;
+  let dumped = false;
+  const tick = () => {
+    if (!SUBTITLE.on) return;
+    const text = currentSubtitleText();
+    if (!text && !dumped) {
+      dumped = true;
+      dumpSubtitlePanel();
+    }
+    pushSubtitle(text);
+  };
+  SUBTITLE.panelObserver = new MutationObserver(tick);
+  SUBTITLE.panelObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+  tick();
+}
+
+/** 断开所有观察器（关闭开关时调用，必须真的全部断开） */
+function stopSubtitle() {
+  for (const ob of observers) {
+    try {
+      ob.disconnect();
+    } catch {
+      /* ignore */
+    }
+  }
+  observers.clear();
+  if (SUBTITLE.btnObserver) {
+    SUBTITLE.btnObserver.disconnect();
+    SUBTITLE.btnObserver = null;
+  }
+  if (SUBTITLE.panelObserver) {
+    SUBTITLE.panelObserver.disconnect();
+    SUBTITLE.panelObserver = null;
+  }
+  if (SUBTITLE.pollTimer) {
+    clearInterval(SUBTITLE.pollTimer);
+    SUBTITLE.pollTimer = null;
+  }
+  SUBTITLE.lastText = '';
+  SUBTITLE.clicked = false;
+}
+
+/** 换视频 / 换分 P：重置这一轮的点击状态，必要时重新找按钮 */
+function resetSubtitleForNewVideo() {
+  SUBTITLE.lastText = '';
+  SUBTITLE.clicked = false;
+  if (!SUBTITLE.on) return;
+  waitForSubtitleButton();
+  watchSubtitlePanel();
+}
+
+/**
+ * 调试用：把当前页面里所有 class 含 "subtitle" 的元素打出来，
+ * 方便对照 B 站实际 DOM 调整选择器（F12 控制台可直接看）。
+ */
+function dumpSubtitleClasses(tag) {
+  try {
+    const found = new Set();
+    for (const el of document.querySelectorAll('*')) {
+      const cls = el.getAttribute && el.getAttribute('class');
+      if (!cls || !/subtitle/i.test(cls)) continue;
+      for (const c of cls.split(/\s+/)) {
+        if (/subtitle/i.test(c)) found.add(`${c} <${el.tagName.toLowerCase()}>`);
+      }
+    }
+    slog(`[subtitle][${tag}] 含 subtitle 的 class 共 ${found.size} 个：`, [...found]);
+    const btn = subtitleButton();
+    slog(
+      `[subtitle][${tag}] 主按钮=${btn ? '存在' : '不存在'}`,
+      `面板节点=${document.querySelectorAll(SUB_PANEL_SEL).length}`,
+      `语言项=${document.querySelectorAll(SUB_LANG_SEL).length}`,
+      `AI项=${document.querySelectorAll('[data-lan="ai-zh"]').length}`
+    );
+  } catch (err) {
+    slog('[subtitle] dump 失败', err && err.message);
+  }
+}
+
+function setSubtitle(on) {
+  SUBTITLE.on = !!on;
+  if (!on) {
+    stopSubtitle();
+    try {
+      ipcRenderer.sendToHost('subtitle', { text: '', off: true });
+    } catch {
+      /* 页面正在卸载 */
+    }
+    return;
+  }
+  // www 是常规视频页，player 是嵌入播放器页；两个都可能带字幕按钮
+  if (!/(^|\.)bilibili\.com$/i.test(location.hostname)) return;
+  SUBTITLE.url = location.href;
+  dumpSubtitleClasses('enable');
+  waitForSubtitleButton();
+  watchSubtitlePanel();
+  if (!SUBTITLE.pollTimer) {
+    // SPA 换片不一定有导航事件：轮询 URL 兜底，变了就重来一轮
+    SUBTITLE.pollTimer = setInterval(() => {
+      if (!SUBTITLE.on) return;
+      if (location.href === SUBTITLE.url) return;
+      SUBTITLE.url = location.href;
+      resetSubtitleForNewVideo();
+    }, 1000);
+  }
+}
+
 function apply(msg) {
   if (!msg || typeof msg !== 'object') return;
 
@@ -2358,6 +2782,10 @@ function apply(msg) {
 
   if (msg.cmd === 'clean') {
     setClean(!!msg.on);
+    return;
+  }
+  if (msg.cmd === 'subtitle') {
+    setSubtitle(!!msg.on);
     return;
   }
   if (msg.cmd === 'bearing') {
@@ -2502,6 +2930,21 @@ function boot() {
   setInterval(() => {
     if (video && !video.paused) push();
   }, 1000);
+}
+
+// 页面若广播 subtitle-ready，只在 exists 为 true 时动作；没有就静默等按钮出现
+for (const target of [document, window]) {
+  target.addEventListener(
+    'subtitle-ready',
+    (e) => {
+      if (!SUBTITLE.on) return;
+      const exists = !!(e && e.detail && e.detail.exists);
+      if (!exists) return;
+      waitForSubtitleButton();
+      watchSubtitlePanel();
+    },
+    true
+  );
 }
 
 ipcRenderer.on('player', (_e, msg) => apply(msg));

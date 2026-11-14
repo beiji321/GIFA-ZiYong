@@ -34,6 +34,18 @@ contextBridge.exposeInMainWorld('api', {
 
   onHotkey: (cb) => ipcRenderer.on('hotkey', (_e, action) => cb(action)),
   onWinState: (cb) => ipcRenderer.on('win:state', (_e, state) => cb(state)),
+  // 贴边吸附：主进程告诉渲染层哪几条边的提示线该亮
+  onSnapEdges: (cb) => ipcRenderer.on('snap:edges', (_e, p) => cb(p)),
+  // 字幕文本转交给主进程，由独立的全屏字幕窗口绘制
+  subtitle: (payload) => ipcRenderer.send('subtitle:update', payload),
+  // 字幕转向提醒：把匹配到的方向转给字幕层画大箭头
+  turn: (payload) => ipcRenderer.send('turn:update', payload),
+  // 弹幕按播放进度驱动：浮窗把 <video> 的时间报给主进程切片段
+  danmakuTime: (payload) => ipcRenderer.send('danmaku:time', payload),
+  // 主进程是比例锁定的权威状态：窗口重建后用它校正 UI，避免图标和实际行为不一致
+  onRatioState: (cb) => ipcRenderer.on('ratio:state', (_e, s) => cb(s)),
+  // 窗口拖动缩放期间的高频通知：用来冻结 webview、避免露出黑底
+  onResizePhase: (cb) => ipcRenderer.on('win:resize-phase', (_e, s) => cb(s)),
   onLogin: (cb) => ipcRenderer.on('login:state', (_e, nav) => cb(nav)),
 
   // 启动器 ↔ 浮窗

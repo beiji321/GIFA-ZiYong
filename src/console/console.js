@@ -94,7 +94,7 @@ async function init() {
     else if (r.ok) toast('圆心本来就对准了，不用调整');
     else toast(AUTO_CENTER_FAIL[r.reason] || '自动定心没成功，再试一次', true);
   });
-  // 浮窗改了设置（比如按热键切了穿透）就同步回界面
+  // 浮窗改了设置就同步回界面
   window.api.onSettingsChanged((next) => {
     state.boot.settings = next;
     fillSettings(next);
@@ -211,9 +211,13 @@ async function launch() {
     }
 
     await window.api.action('start-float');
-    // 浮窗已经在跑的时候不能只切窗口，得让它换片
-    if (state.floatRunning && text) {
-      await window.api.action('float-load', { text, p: (state.video && state.video.p) || 1 });
+    // 只要有链接就下发「换片」指令。
+    // 以前这里判断 state.floatRunning —— 浮窗明明开着、但启动器那边状态没同步到，
+    // 指令就发不出去，表现就是「输入新 BV 号点启动跟跑没反应」。
+    // 现在无条件发，主进程自己会处理「窗口刚建好 / 已在运行」两种情况。
+    const target = text || state.boot.settings.lastText;
+    if (target) {
+      await window.api.action('float-load', { text: target, p: (state.video && state.video.p) || 1 });
     }
     toast('浮窗已启动，按 Alt+H 可以随时隐藏');
   } finally {
@@ -359,9 +363,88 @@ function paintRange(el) {
 
 function fillSettings(s) {
   $('setPin').checked = !!s.pinned;
-  $('setPass').checked = !!s.clickThrough;
   // 老 settings.json 没这个字段，默认视为开启
   $('setResumeOnLaunch').checked = s.resumeOnLaunch !== false;
+  $('setSubtitleSprite').checked = !!s.enableSubtitleSprite;
+  $('setDanmakuProjection').checked = !!s.enableDanmakuProjection;
+
+  // 字幕外观
+  const subScale = Number(s.subtitleScale ?? 100);
+  const subOffset = Number(s.subtitleOffset ?? 80);
+  const subBg = Number(s.subtitleBgOpacity ?? 70);
+  $('setSubScale').value = String(subScale);
+  $('subScaleVal').textContent = subScale + '%';
+  $('setSubColor').value = /^#[0-9a-f]{6}$/i.test(s.subtitleColor || '') ? s.subtitleColor : '#ffffff';
+  $('setSubStroke').value = s.subtitleStroke || 'outline';
+  $('setSubPos').value = s.subtitlePos || 'center';
+  $('setSubOffset').value = String(subOffset);
+  $('subOffsetVal').textContent = subOffset + 'px';
+  $('setSubBg').value = String(subBg);
+  $('subBgVal').textContent = subBg + '%';
+  $('setSubKeepRatio').checked = s.subtitleKeepRatio !== false;
+
+  const subHold = Number(s.subtitleHold ?? 3);
+  const subMaxW = Number(s.subtitleMaxWidth ?? 88);
+  const subWeight = Number(s.subtitleWeight ?? 800);
+  const subRadius = Number(s.subtitleRadius ?? 8);
+  $('setSubHold').value = String(subHold);
+  $('setSubMaxWidth').value = String(subMaxW);
+  $('setSubWeight').value = String(subWeight);
+  $('setSubRadius').value = String(subRadius);
+  $('subHoldVal').textContent = subHold + 's';
+  $('subMaxWidthVal').textContent = subMaxW + '%';
+  $('subWeightVal').textContent = String(subWeight);
+  $('subRadiusVal').textContent = subRadius + 'px';
+  $('setTurnReminder').checked = s.enableTurnReminder !== false;
+
+  const snapAdjust = Number(s.snapAdjustment ?? 0);
+  $('setSnapAdjust').value = String(snapAdjust);
+  $('snapAdjustVal').textContent = (snapAdjust > 0 ? '+' : '') + snapAdjust + 'px';
+  $('setTurnLR').checked = s.turnEnableLR !== false;
+  $('setTurnUD').checked = s.turnEnableUD !== false;
+
+  const turnOffset = Number(s.turnOffset ?? 400);
+  const turnScale = Number(s.turnScale ?? 100);
+  const turnDuration = Number(s.turnDuration ?? 2);
+  const turnOpacity = Number(s.turnOpacity ?? 85);
+  $('setTurnOffset').value = String(turnOffset);
+  $('setTurnScale').value = String(turnScale);
+  $('setTurnDuration').value = String(turnDuration);
+  $('setTurnOpacity').value = String(turnOpacity);
+  $('turnOffsetVal').textContent = turnOffset + 'px';
+  $('turnScaleVal').textContent = turnScale + '%';
+  $('turnDurationVal').textContent = turnDuration + 's';
+  $('turnOpacityVal').textContent = turnOpacity + '%';
+  $('setTurnColor').value = /^#[0-9a-f]{6}$/i.test(s.turnColor || '') ? s.turnColor : '#49b2fc';
+
+  const turnPosY = Number(s.turnPosY ?? 50);
+  const turnPosX = Number(s.turnPosX ?? 50);
+  $('setTurnPosY').value = String(turnPosY);
+  $('setTurnPosX').value = String(turnPosX);
+  $('turnPosYVal').textContent = turnPosY + '%';
+  $('turnPosXVal').textContent = turnPosX + '%';
+
+  const dmWeight = Number(s.danmakuWeight ?? 700);
+  const dmMax = Number(s.danmakuMax ?? 60);
+  $('setDmWeight').value = String(dmWeight);
+  $('setDmMax').value = String(dmMax);
+  $('dmWeightVal').textContent = String(dmWeight);
+  $('dmMaxVal').textContent = String(dmMax);
+  $('setDmStroke').checked = s.danmakuStroke !== false;
+  $('setSubFade').checked = s.subtitleFade !== false;
+
+  const dmArea = Number(s.danmakuArea ?? 50);
+  const dmOpacity = Number(s.danmakuOpacity ?? 80);
+  const dmScale = Number(s.danmakuScale ?? 100);
+  const dmSpeed = Number(s.danmakuSpeed ?? 50);
+  $('setDmArea').value = String(dmArea);
+  $('setDmOpacity').value = String(dmOpacity);
+  $('setDmScale').value = String(dmScale);
+  $('setDmSpeed').value = String(dmSpeed);
+  $('dmAreaVal').textContent = dmArea + '%';
+  $('dmOpacityVal').textContent = dmOpacity + '%';
+  $('dmScaleVal').textContent = dmScale + '%';
+  $('dmSpeedVal').textContent = speedLabel(dmSpeed);
 
   const op = Math.round((s.opacity ?? 1) * 100);
   $('setOpacity').value = String(op);
@@ -385,7 +468,32 @@ function fillSettings(s) {
   // 标定过的那一步打个绿勾，一眼能看出两步走到哪了
   $('btnPickRoi').classList.toggle('done', done);
 
-  for (const id of ['setOpacity', 'setVolume', 'setBearingSize']) paintRange($(id));
+  for (const id of [
+    'setOpacity',
+    'setVolume',
+    'setBearingSize',
+    'setDmArea',
+    'setDmOpacity',
+    'setDmScale',
+    'setDmSpeed',
+    'setSnapAdjust',
+    'setSubScale',
+    'setSubOffset',
+    'setSubBg',
+    'setSubHold',
+    'setSubMaxWidth',
+    'setSubWeight',
+    'setSubRadius',
+    'setDmWeight',
+    'setDmMax',
+    'setTurnPosY',
+    'setTurnPosX',
+    'setTurnOffset',
+    'setTurnScale',
+    'setTurnDuration',
+    'setTurnOpacity'
+  ])
+    paintRange($(id));
 }
 
 function wireSettings() {
@@ -397,9 +505,13 @@ function wireSettings() {
 
   $('setPin').addEventListener('change', (e) => window.api.action('pin', e.target.checked));
 
-  $('setPass').addEventListener('change', (e) => {
-    window.api.action('pass', e.target.checked);
-    if (e.target.checked) toast('鼠标穿透已开启，按 Alt+L 关闭');
+  // 吸附微调：拖动时实时保存，主进程会立刻把正贴边的窗口重贴一次
+  let snapTimer = null;
+  $('setSnapAdjust').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('snapAdjustVal').textContent = (v > 0 ? '+' : '') + v + 'px';
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(() => window.api.save({ snapAdjustment: v }), 60);
   });
 
   $('setOpacity').addEventListener('input', (e) => {
@@ -413,6 +525,187 @@ function wireSettings() {
     $('volumeVal').textContent = v + '%';
     state.boot.settings.volume = v;
     window.api.save({ volume: v });
+  });
+
+  // 字幕精灵：写进设置后主进程会 broadcast settings:changed，
+  // 浮窗收到再转给 webview（见 renderer/app.js 的 syncSubtitleToGuest）
+  $('setSubtitleSprite').addEventListener('change', (e) => {
+    state.boot.settings.enableSubtitleSprite = e.target.checked;
+    window.api.save({ enableSubtitleSprite: e.target.checked });
+    toast(e.target.checked ? '字幕精灵已开启' : '字幕精灵已关闭');
+  });
+
+  /* ---- 字幕外观：全部实时保存并下发给字幕窗口 ---- */
+  const saveSub = (patch) => window.api.save({ subtitle: patch });
+
+  $('setSubScale').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subScaleVal').textContent = v + '%';
+    saveSub({ scale: v });
+  });
+  $('setSubColor').addEventListener('input', (e) => saveSub({ color: e.target.value }));
+  $('setSubStroke').addEventListener('change', (e) => saveSub({ stroke: e.target.value }));
+  $('setSubPos').addEventListener('change', (e) => saveSub({ pos: e.target.value }));
+  $('setSubOffset').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subOffsetVal').textContent = v + 'px';
+    saveSub({ offset: v });
+  });
+  $('setSubBg').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subBgVal').textContent = v + '%';
+    saveSub({ bgOpacity: v });
+  });
+  $('setSubHold').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subHoldVal').textContent = v + 's';
+    saveSub({ hold: v });
+  });
+  $('setSubMaxWidth').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subMaxWidthVal').textContent = v + '%';
+    saveSub({ maxWidth: v });
+  });
+  $('setSubWeight').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subWeightVal').textContent = String(v);
+    saveSub({ weight: v });
+  });
+  $('setSubRadius').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subRadiusVal').textContent = v + 'px';
+    saveSub({ radius: v });
+  });
+  $('setSubKeepRatio').addEventListener('change', (e) => saveSub({ keepRatio: e.target.checked }));
+  $('setSubFade').addEventListener('change', (e) => saveSub({ fade: e.target.checked }));
+
+  $('setTurnReminder').addEventListener('change', (e) => {
+    state.boot.settings.enableTurnReminder = e.target.checked;
+    window.api.save({ enableTurnReminder: e.target.checked });
+    toast(e.target.checked ? '字幕转向提醒已开启' : '字幕转向提醒已关闭');
+  });
+
+  /* ---- 转向提示外观：实时保存 ---- */
+  const saveTurn = (patch) => window.api.save({ turn: patch });
+
+  $('setTurnOffset').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('turnOffsetVal').textContent = v + 'px';
+    saveTurn({ offset: v });
+  });
+  $('setTurnScale').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('turnScaleVal').textContent = v + '%';
+    saveTurn({ scale: v });
+  });
+  $('setTurnDuration').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('turnDurationVal').textContent = v + 's';
+    saveTurn({ duration: v });
+  });
+  $('setTurnColor').addEventListener('input', (e) => saveTurn({ color: e.target.value }));
+  $('setTurnLR').addEventListener('change', (e) => {
+    state.boot.settings.turnEnableLR = e.target.checked;
+    window.api.save({ turnEnableLR: e.target.checked });
+    toast(e.target.checked ? '左右方向提示已开启' : '左右方向提示已关闭');
+  });
+
+  $('setTurnUD').addEventListener('change', (e) => {
+    state.boot.settings.turnEnableUD = e.target.checked;
+    window.api.save({ turnEnableUD: e.target.checked });
+    toast(e.target.checked ? '上下方向提示已开启' : '上下方向提示已关闭');
+  });
+
+  $('setTurnPosY').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('turnPosYVal').textContent = v + '%';
+    saveTurn({ posY: v });
+  });
+  $('setTurnPosX').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('turnPosXVal').textContent = v + '%';
+    saveTurn({ posX: v });
+  });
+
+  $('setTurnOpacity').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('turnOpacityVal').textContent = v + '%';
+    saveTurn({ opacity: v });
+  });
+
+  $('btnSubReset').addEventListener('click', async () => {
+    const res = await window.api.save({
+      subtitle: {
+        scale: 100,
+        color: '#ffffff',
+        stroke: 'outline',
+        pos: 'center',
+        offset: 80,
+        bgOpacity: 70,
+        keepRatio: true,
+        fade: true,
+        hold: 3,
+        maxWidth: 88,
+        weight: 800,
+        radius: 8
+      },
+      danmaku: { weight: 700, max: 60, stroke: true },
+      turn: {
+        offset: 400,
+        scale: 100,
+        duration: 2,
+        opacity: 85,
+        color: '#49b2fc',
+        posY: 50,
+        posX: 50
+      }
+    });
+    state.boot.settings = res;
+    fillSettings(res);
+    toast('字幕设置已恢复默认');
+  });
+
+  $('setDanmakuProjection').addEventListener('change', (e) => {
+    state.boot.settings.enableDanmakuProjection = e.target.checked;
+    window.api.save({ enableDanmakuProjection: e.target.checked });
+    toast(e.target.checked ? '全屏弹幕已开启' : '全屏弹幕已关闭');
+  });
+
+  // 弹幕四个滑块：拖动时实时生效，80ms 节流避免刷爆 IPC
+  let dmTimer = null;
+  const pushDanmaku = (patch, labelEl, label) => {
+    if (labelEl) labelEl.textContent = label;
+    clearTimeout(dmTimer);
+    dmTimer = setTimeout(() => window.api.save({ danmaku: patch }), 80);
+  };
+
+  $('setDmArea').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    pushDanmaku({ area: v }, $('dmAreaVal'), v + '%');
+  });
+  $('setDmOpacity').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    pushDanmaku({ opacity: v }, $('dmOpacityVal'), v + '%');
+  });
+  $('setDmScale').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    pushDanmaku({ scale: v }, $('dmScaleVal'), v + '%');
+  });
+  $('setDmWeight').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('dmWeightVal').textContent = String(v);
+    pushDanmaku({ weight: v });
+  });
+  $('setDmMax').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('dmMaxVal').textContent = String(v);
+    pushDanmaku({ max: v });
+  });
+  $('setDmStroke').addEventListener('change', (e) => pushDanmaku({ stroke: e.target.checked }));
+
+  $('setDmSpeed').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    pushDanmaku({ speed: v }, $('dmSpeedVal'), speedLabel(v));
   });
 
   $('btnLogin').addEventListener('click', () => window.api.action('login'));
@@ -568,7 +861,8 @@ function paintKeys(kbd, acc) {
     kbd.textContent = '未设置';
     return;
   }
-  const parts = /^Mouse[45]$/i.test(acc) ? [acc] : String(acc).split('+');
+  const s = String(acc);
+  const parts = /^Mouse[45]$/i.test(s) ? [s] : s.split('+');
   parts.forEach((part, i) => {
     if (i) {
       const plus = document.createElement('span');
@@ -595,7 +889,12 @@ function renderHookState() {
   renderElevateState();
 
   const hotkeys = state.boot.settings.hotkeys || {};
-  const hookKeys = Object.entries(hotkeys).filter(([, acc]) => acc && !String(acc).includes('+'));
+  const hookKeys = Object.entries(hotkeys).filter(([, acc]) => {
+    const v = String(acc || '');
+    if (!v) return false;
+    if (/^RMB\+Mouse[45]$/i.test(v)) return true; // 右键+侧键同样走钩子
+    return !v.includes('+');
+  });
   const running = !!state.boot.hookRunning;
 
   if (!hookKeys.length) {
@@ -658,13 +957,19 @@ function captureHotkey(kbd, key) {
   window.api.capturing(true);
 
   kbd.classList.add('capturing');
-  kbd.textContent = '按键位或鼠标侧键…';
+  kbd.textContent = '按键位、侧键，或按住右键再按侧键…';
+
+  // 录制期间是否按着右键：用来拼「右键 + 侧键」的组合
+  let rightDown = false;
 
   const cleanup = () => {
+    rightDown = false;
     window.api.capturing(false);
     kbd.classList.remove('capturing');
     document.removeEventListener('keydown', onKey, true);
     document.removeEventListener('mousedown', onMouse, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
+    document.removeEventListener('contextmenu', onContextMenu, true);
     if (activeCapture === cleanup) activeCapture = null;
   };
 
@@ -709,17 +1014,41 @@ function captureHotkey(kbd, key) {
     await commit(acc);
   };
 
-  // 鼠标侧键：DOM 里 button 3 = 后退侧键、4 = 前进侧键
+  // 鼠标：DOM 里 button 2 = 右键、3 = 后退侧键、4 = 前进侧键。
+  // 只在自己的录制界面里监听，不注册系统级拦截，所以不影响别的程序。
   const onMouse = async (e) => {
+    if (e.button === 2) {
+      rightDown = true;
+      return; // 右键本身不当作键位，只作为组合的前缀
+    }
     if (e.button !== 3 && e.button !== 4) return;
     e.preventDefault();
     e.stopPropagation();
-    await commit(`Mouse${e.button + 1}`);
+    await commit(`${rightDown ? 'RMB+' : ''}Mouse${e.button + 1}`);
   };
+
+  const onMouseUp = (e) => {
+    if (e.button === 2) rightDown = false;
+  };
+
+  // 录制期间右键会弹上下文菜单，压掉；这只作用于本窗口
+  const onContextMenu = (e) => e.preventDefault();
 
   activeCapture = cleanup;
   document.addEventListener('keydown', onKey, true);
   document.addEventListener('mousedown', onMouse, true);
+  document.addEventListener('mouseup', onMouseUp, true);
+  document.addEventListener('contextmenu', onContextMenu, true);
+}
+
+/** 速度滑块 0~100 的文案：50 就是默认 8 秒 */
+function speedLabel(v) {
+  const n = Number(v);
+  if (n < 25) return '慢';
+  if (n < 45) return '偏慢';
+  if (n <= 55) return '适中';
+  if (n <= 75) return '偏快';
+  return '快';
 }
 
 function reportFailed(failed, focusKey) {
@@ -780,6 +1109,9 @@ function keyName(e) {
 
 function prettify(acc) {
   if (!acc) return '未设置';
+  if (/^RMB\+Mouse4$/i.test(acc)) return '右键+侧键 ◀';
+  if (/^RMB\+Mouse5$/i.test(acc)) return '右键+侧键 ▶';
+  if (/^RMB$/i.test(acc)) return '鼠标右键';
   if (/^Mouse4$/i.test(acc)) return '鼠标侧键 ◀';
   if (/^Mouse5$/i.test(acc)) return '鼠标侧键 ▶';
   return String(acc)

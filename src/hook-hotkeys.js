@@ -20,8 +20,20 @@
 
 const MOUSE_ACC = /^Mouse([45])$/i;
 
+/**
+ * 「按住鼠标右键 + 侧键」的组合，加速器写法：RMB+Mouse4 / RMB+Mouse5。
+ * 单独一个侧键仍是 Mouse4 / Mouse5，两者可以同时存在且互不干扰。
+ */
+const RMB_MOUSE_ACC = /^(?:RMB|RightMouse|MouseRight)\+Mouse([45])$/i;
+
 /** uiohook 的 button 编码：1=左 2=右 3=中 4=侧键后退 5=侧键前进 */
 const BUTTON_OF = { Mouse4: 4, Mouse5: 5 };
+
+/**
+ * 右键是否按着。仅用于判断「右键+侧键」，**不拦截**右键：
+ * uiohook 是纯被动监听，事件照常传给前台程序，游戏里的右键瞄准/交互完全不受影响。
+ */
+let isRightDown = false;
 
 /** Electron 加速器名 → uiohook 键名（其余同名直接用） */
 const KEY_ALIAS = {
@@ -78,6 +90,7 @@ function isHookAccelerator(acc) {
   const s = String(acc || '').trim();
   if (!s) return false;
   if (MOUSE_ACC.test(s)) return true;
+  if (RMB_MOUSE_ACC.test(s)) return true;
   return !s.includes('+');
 }
 
@@ -106,13 +119,29 @@ function fire(action, token) {
 }
 
 function onMouseDown(e) {
-  const action = bindings.get(`mouse:${e.button}`);
-  if (!action) return;
-  if (shouldIgnore && shouldIgnore()) {
-    console.log(`[hook] 鼠标侧键 ${e.button} 被忽略（正在输入或录制）`);
+  // 右键只记录状态，绝不 return 之外做任何事（不吞事件）
+  if (e.button === 2) {
+    isRightDown = true;
     return;
   }
-  fire(action, `mouse:${e.button}`);
+  if (e.button !== 4 && e.button !== 5) return;
+
+  // 右键按着时优先匹配「右键+侧键」；没配这个组合就回落到单独侧键
+  const combo = isRightDown ? bindings.get(`mouse:${e.button}+rmb`) : null;
+  const action = combo || bindings.get(`mouse:${e.button}`);
+  if (!action) return;
+
+  const token = combo ? `mouse:${e.button}+rmb` : `mouse:${e.button}`;
+  if (shouldIgnore && shouldIgnore()) {
+    console.log(`[hook] ${token} 被忽略（正在输入或录制）`);
+    return;
+  }
+  fire(action, token);
+}
+
+/** 松开右键：清状态。同样不拦截，事件照常下发 */
+function onMouseUp(e) {
+  if (e.button === 2) isRightDown = false;
 }
 
 function onKeyDown(e) {
@@ -130,6 +159,7 @@ function onKeyDown(e) {
 function start() {
   if (running || !available) return;
   uiohook.on('mousedown', onMouseDown);
+  uiohook.on('mouseup', onMouseUp);
   uiohook.on('keydown', onKeyDown);
   uiohook.start();
   running = true;
@@ -143,6 +173,7 @@ function stop() {
   if (!running) return;
   try {
     uiohook.off('mousedown', onMouseDown);
+    uiohook.off('mouseup', onMouseUp);
     uiohook.off('keydown', onKeyDown);
     uiohook.stop();
   } catch (err) {
@@ -195,6 +226,13 @@ function apply(hotkeys, trigger, ignore) {
     const s = String(acc || '').trim();
     if (!s) continue;
 
+    const mRmb = s.match(RMB_MOUSE_ACC);
+    if (mRmb) {
+      needHook = true;
+      bindings.set(`mouse:${BUTTON_OF[`Mouse${mRmb[1]}`]}+rmb`, action);
+      continue;
+    }
+
     const m = s.match(MOUSE_ACC);
     if (m) {
       needHook = true;
@@ -228,8 +266,12 @@ function apply(hotkeys, trigger, ignore) {
 
 /** 给界面用的可读名称 */
 function describe(acc) {
-  if (/^Mouse4$/i.test(acc)) return '鼠标侧键（后退）';
-  if (/^Mouse5$/i.test(acc)) return '鼠标侧键（前进）';
+  const s = String(acc || '');
+  const rmb = RMB_MOUSE_ACC.test(s);
+  if (/^Mouse4$/i.test(s)) return '鼠标侧键（后退）';
+  if (/^Mouse5$/i.test(s)) return '鼠标侧键（前进）';
+  if (rmb && /\+Mouse4$/i.test(s)) return '右键 + 鼠标侧键（后退）';
+  if (rmb && /\+Mouse5$/i.test(s)) return '右键 + 鼠标侧键（前进）';
   return acc;
 }
 
