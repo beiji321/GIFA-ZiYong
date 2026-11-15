@@ -307,6 +307,10 @@ function syncBearingToGuest(extra) {
     cmd: 'bearing',
     on: !!b.enabled,
     rois: roisFor(state.id),
+    // 绿弧（镜头朝向）开关：关掉时访客页连扇形识别都不跑
+    greenArc: !!state.boot.settings.enableVisionGreenArc,
+    // 标定圆半径：overlay 的雷达圈要按它 +15px 套在外面
+    radius: Number(b.radius) || 110,
     ...(extra || {})
   });
 }
@@ -343,7 +347,9 @@ function onGuestBearing(p) {
     viewConfidence: p.viewConfidence || 0,
     viewSource: p.viewSource || '',
     viewWidth: p.viewWidth || 0,
-    hold: !!p.hold
+    hold: !!p.hold,
+    // 识别健康度（最近 N 帧的分类计数），启动器里显示用
+    stats: p.stats || null
   });
 }
 
@@ -1076,6 +1082,145 @@ function wireGrip() {
  * 字幕不再画在浮窗里：浮窗可以拖到任何位置，画在里面就永远沉不到屏幕底部。
  * 这里只负责把文本转发给主进程，由独立的全屏透明字幕窗口绘制。
  */
+/* ------------------------------------------------ 字幕里的绝对方位 */
+
+/**
+ * 从字幕里抽取方位「原子」——只认 东/西/南/北 四个字，斜向靠组合得出。
+ *
+ * 移植自 GenshinImpactVT 的 subtitle_text.directions()。相比原来「8 条独立正则」
+ * 的做法，这套有三个直接好处：
+ *
+ *   1. 四个字是**完备基**：任意方位都能用 ±东 ±北 表示，
+ *      所以「东北」不需要单独一条规则，{东,北} 合成出来就是 45°。
+ *   2. 口语说法自动归一：「北偏东」「东偏北」都会落到东北。
+ *   3. 冲突检测是免费的：同时出现东和西（或南和北）说明这句话自相矛盾，
+ *      直接不点亮，而不是像硬正则那样「命中谁算谁」。
+ *
+ * 与 detectTurn 的分工：detectTurn 判「左转/右转」这种相对指令，
+ * 这里判「地图上的东南西北」，两者互不影响。
+ */
+
+/** 上一次点亮的方位与时间：同一句里重复命中不重复触发 */
+let lastCompassCue = { deg: -1, at: 0 };
+
+/** 只用于界面提示文案的八向名字（点亮判定在叠加层按角度做） */
+const DIR_NAMES = [
+  { deg: 0, label: '北' },
+  { deg: 45, label: '东北' },
+  { deg: 90, label: '东' },
+  { deg: 135, label: '东南' },
+  { deg: 180, label: '南' },
+  { deg: 225, label: '西南' },
+  { deg: 270, label: '西' },
+  { deg: 315, label: '西北' }
+];
+
+function nearestDirName(deg) {
+  let best = DIR_NAMES[0];
+  let bestD = 999;
+  for (const d of DIR_NAMES) {
+    const diff = Math.abs(((deg - d.deg + 540) % 360) - 180);
+    if (diff < bestD) {
+      bestD = diff;
+      best = d;
+    }
+  }
+  return best.label;
+}
+
+/**
+ * 抽方位原子。返回 Set，元素是 '东'/'西'/'南'/'北' 的子集。
+ * 七步清洗，顺序不能换（尤其「切分」必须在「归一化」之前）。
+ */
+function directionAtoms(text) {
+  const raw = String(text || '').replace(/\s+/g, '').slice(0, 500);
+  if (!raw) return new Set();
+
+  // 1) 一句里有多个指令时只看**第一个真正含方向的片段**：
+  //    「先往东然后往北」→ 东（不该被读成东北）
+  //    「然后来西南方向地图左下角」→ 西南（整句以「然后」开头，不能取空串）
+  //    「我们走吧然后往东」→ 东（第一段没方向就往后找）
+  // 注意「再」用前瞻切分：只吃掉「再」，保留后面的「往/向/朝」。
+  // 否则「再往东北一点」会被切成「东北一点」，「往」这个方向上下文就丢了，
+  // 后面第 5 步的上下文校验会把它判成裸字直接跳过。
+  const phrases = raw.split(/然后|接着|随后|再(?=往|向|朝|走|去)/);
+  for (const phrase of phrases) {
+    const hit = atomsInPhrase(phrase);
+    if (hit.size) return hit;
+  }
+  return new Set();
+}
+
+/** 在**单个**片段里抽方位原子（七步清洗的后六步） */
+function atomsInPhrase(text) {
+  let s = String(text || '');
+  if (!s) return new Set();
+
+  // 2) 剔除含方位字但根本不是方向的词（「这东西不错」「东北虎」）
+  s = s.replace(/东西南北|东西(?:方)?|北京|南京|东京|西瓜|东北虎|东风|南瓜/g, '');
+
+  // 3) 口语说法归一化：北偏东 / 东偏北 → 东北
+  s = s.replace(/北偏东|东偏北/g, '东北');
+  s = s.replace(/南偏东|东偏南/g, '东南');
+  s = s.replace(/北偏西|西偏北/g, '西北');
+  s = s.replace(/南偏西|西偏南/g, '西南');
+
+  // 4) 否定句不触发：「不要往东」「别往南走」。
+  //    原来那套硬正则会把「不要往东」点亮成东，直接指反方向。
+  s = s.replace(
+    /(?:不要|别|不能|不是|不往|不向|不朝)[^，。；！？,;!?]{0,6}?[东西南北](?:[东西南北])?(?:方向|边|方)?/g,
+    ''
+  );
+
+  // 5) 匹配 1~2 个方位字，但**要求上下文**，避免「上面有个宝箱」这类裸字误触发
+  const found = new Set();
+  const re = /[东西南北]{1,2}/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const word = m[0];
+    const before = s.slice(Math.max(0, m.index - 4), m.index);
+    const after = s.slice(m.index + word.length, m.index + word.length + 4);
+    const ok =
+      s === word ||
+      s === '正' + word ||
+      /往|向|朝|面|转|偏/.test(before) ||
+      /^(方向|边|方|侧|面|角|走|前进|这边)/.test(after);
+    if (!ok) continue;
+    for (const ch of word) found.add(ch);
+  }
+  return found;
+}
+
+
+/**
+ * 原子集合 → 罗盘角（0=北、顺时针）。
+ * 冲突（东西同时出现 / 南北同时出现）或空集返回 null。
+ */
+function atomsToCompass(active) {
+  if (!active || !active.size) return null;
+  if (active.has('东') && active.has('西')) return null;
+  if (active.has('南') && active.has('北')) return null;
+  const x = (active.has('东') ? 1 : 0) - (active.has('西') ? 1 : 0);
+  const y = (active.has('南') ? 1 : 0) - (active.has('北') ? 1 : 0);
+  if (!x && !y) return null;
+  // atan2(x, -y)：正北 = 0°，正东 = 90°，正南 = 180°，正西 = 270°
+  let deg = (Math.atan2(x, -y) * 180) / Math.PI;
+  if (deg < 0) deg += 360;
+  return deg;
+}
+
+function detectCompassDir(text) {
+  const deg = atomsToCompass(directionAtoms(text));
+  if (deg === null) return;
+
+  const now = Date.now();
+  // 800ms 内同一方位不重复点亮（一句话会被字幕面板反复推送几次）
+  if (Math.abs(deg - lastCompassCue.deg) < 1 && now - lastCompassCue.at < 800) return;
+  lastCompassCue = { deg, at: now };
+
+  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg) });
+}
+
 function showSubtitleSprite(payload) {
   if (!state.boot) return;
   const text = String((payload && payload.text) || '').replace(/\s+/g, ' ').trim();
@@ -1084,6 +1229,8 @@ function showSubtitleSprite(payload) {
   // 字幕条和转向提醒是两个独立开关：只要有一个开着就处理文本
   if (state.boot.settings.enableSubtitleSprite) window.api.subtitle({ text });
   detectTurn(text);
+  // 绝对方位点亮雷达圈（和相对转向提示互不干扰）
+  detectCompassDir(text);
 }
 
 /* -------------------------------------------------------- 字幕转向提醒 */

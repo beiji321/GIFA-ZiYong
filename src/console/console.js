@@ -77,6 +77,8 @@ async function init() {
   // 启动器窗口可能被关掉再打开，此刻主进程的放置状态未必是初始值，
   // 按钮文案必须对齐主进程，否则「显示 ② 拖到…」却一点就变成锁定。
   syncPlaceButton();
+  // 识别健康度每秒刷新一次，让「为什么没有箭头」可见
+  startHealthPoll();
 
   // 只有在输入框里真的打字时才让单键热键让路。以前是「本程序窗口在前台就全忽略」，
   // 结果用户在启动器里按 J 想试试热键，一律被吞掉，看起来就像热键没接上。
@@ -371,7 +373,7 @@ function fillSettings(s) {
 
   // 字幕外观
   const subScale = Number(s.subtitleScale ?? 100);
-  const subOffset = Number(s.subtitleOffset ?? 80);
+  const subOffset = Number(s.subtitleOffset ?? 230);
   const subBg = Number(s.subtitleBgOpacity ?? 70);
   $('setSubScale').value = String(subScale);
   $('subScaleVal').textContent = subScale + '%';
@@ -457,6 +459,7 @@ function fillSettings(s) {
 
   const b = s.bearing || {};
   $('setBearing').checked = !!b.enabled;
+  $('setGreenArc').checked = s.enableVisionGreenArc === true;
   $('setBearingSize').value = String(b.radius ?? 110);
   $('sizeVal').textContent = String(b.radius ?? 110);
 
@@ -729,6 +732,67 @@ function renderPlaceButton(placing) {
   $('btnPlace').classList.toggle('active', !!placing);
 }
 
+/* ---------------------------------------------------------- 识别健康度 */
+
+/**
+ * 把识别端的分类计数渲染成一句话。
+ *
+ * 为什么需要这个：用户反馈「箭头经常不显示」，但从界面完全看不出
+ * 卡在哪一环 —— 是没框选、画面里没有小地图、还是判据疑似反向。
+ * 这里把最近 N 帧的结果分类摊开，一眼能定位。
+ */
+function renderHealth(st) {
+  const summary = $('healthSummary');
+  const lastOk = $('healthLastOk');
+  const reason = $('healthReason');
+  if (!summary || !lastOk || !reason) return;
+
+  if (!st || !st.window) {
+    summary.textContent = '浮窗未启动或还没开始识别';
+    summary.classList.remove('bad');
+    lastOk.textContent = '—';
+    reason.textContent = '—';
+    return;
+  }
+
+  const ok = st.ok || 0;
+  const n = st.window;
+  const rate = Math.round((ok / n) * 100);
+  const parts = [`最近 ${n} 帧 成功 ${ok}（${rate}%）`];
+  if (st.noMap) parts.push(`无小地图 ${st.noMap}`);
+  if (st.noRoi) parts.push(`未框选 ${st.noRoi}`);
+  if (st.hold) parts.push(`疑似反向 ${st.hold}`);
+  summary.textContent = parts.join(' · ');
+  // 一帧都没成功 = 画面上确实没有箭头，标红
+  summary.classList.toggle('bad', ok === 0);
+
+  if (st.ageMs > 5000) {
+    lastOk.textContent = `识别已停止更新（${Math.round(st.ageMs / 1000)} 秒前）`;
+    lastOk.classList.add('bad');
+  } else if (st.lastOkAt) {
+    lastOk.textContent = `${((Date.now() - st.lastOkAt) / 1000).toFixed(1)} 秒前`;
+    lastOk.classList.remove('bad');
+  } else {
+    lastOk.textContent = '本次还没成功过';
+    lastOk.classList.add('bad');
+  }
+
+  reason.textContent = st.lastReason || '—';
+}
+
+/** 每秒拉一次；切到别的页时也照常跑，代价只有一次 IPC */
+function startHealthPoll() {
+  const tick = async () => {
+    try {
+      renderHealth(await window.api.bearingStats());
+    } catch {
+      /* 主进程还没就绪 */
+    }
+  };
+  tick();
+  setInterval(tick, 1000);
+}
+
 async function syncPlaceButton() {
   try {
     renderPlaceButton(await window.api.overlayPlaceState());
@@ -755,6 +819,14 @@ function wireBearing() {
     }
     fillSettings(state.boot.settings);
     await syncPlaceButton();
+  });
+
+  // 视觉绿弧开关：默认关闭。关掉时访客页连扇形识别都不跑，省 CPU
+  $('setGreenArc').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    state.boot.settings.enableVisionGreenArc = on;
+    await window.api.save({ enableVisionGreenArc: on });
+    toast(on ? '已开启视觉绿弧（画质差时可能乱飘）' : '已关闭视觉绿弧');
   });
 
   $('setBearingSize').addEventListener('input', (e) => {

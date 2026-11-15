@@ -48,8 +48,101 @@ function shortAngle(a, b) {
   return ((a - b + 540) % 360) - 180;
 }
 
+/* ---------------------------------------------------- 雷达圈 / 方位文字
+ *
+ * 美术风格取自参考项目 GenshinImpactVT（genshinimpactvt/compass.py）：
+ * 它的高亮**不是实心扇形**，而是一个「环带 + 角度羽化」的光：
+ *   · 径向渐变：0~58% 全透明，70% 起亮，**84% 处最亮（190/255）**，94% 回落到 165，边缘归零
+ *     —— 所以看到的是一圈贴着边缘的光环，圆心区域始终干净
+ *   · 再用锥形渐变做 DestinationIn 遮罩：±28° 实心、±42° 渐隐
+ *     —— 得到「一段圆周被点亮」的效果，而不是一个点光源
+ * 下面用 Canvas 的 radial/conic 渐变一比一复刻这两层，再加一层呼吸脉动。
+ */
+const RADAR = {
+  /** 标定圆半径（视频坐标系里的逻辑值），0 表示还没标定 */
+  radius: 0,
+  /** 标定过才显示雷达圈与方位文字 */
+  visible: false,
+  /** 当前被字幕点亮的方位（罗盘角），-1 表示没有 */
+  cueDeg: -1,
+  cueLabel: '',
+  /** 当前方位对应的轴标签（斜向两个，正方向一个） */
+  cueAxes: [],
+  cueAt: 0,
+  /** 呼吸动画的 rAF 句柄 */
+  raf: 0
+};
+
+/**
+ * 雷达圈相对标定圆的偏移。
+ *   0    → 环与小地图边缘重合（贴合，不外溢到游戏 UI）
+ *   +15  → 环套在小地图外面一圈
+ * 实测：外扩会把八向文字推到技能图标/队伍头像上，挡住游戏界面，
+ * 所以改成与标定圈同尺寸，让整套雷达完全落在地图范围内。
+ */
+const RING_OFFSET = 0;
+/**
+ * 方位文字相对雷达圈的偏移。
+ *   负值 → 画在圈**内侧**（压在小地图边缘上，不影响外面 UI）
+ *   正值 → 画到圈外面
+ * 用户要求「再贴近点」，这里收到 −14：字几乎贴着环线。
+ */
+const LABEL_OFFSET = -14;
+
+/* 字幕点亮的持续时间与淡出时长（用户要求 2.5 秒后缓缓淡出） */
+const CUE_HOLD_MS = 2500;
+const CUE_FADE_MS = 450;
+
+/* 八向文字与罗盘角（0°=北，顺时针） */
+/**
+ * 只画四个轴：北 / 东 / 南 / 西。
+ *
+ * 斜向不做单独标签 —— 指向「东南」时让**东和南两个轴同时亮**，
+ * 光晕落在两轴之间的 45° 位置。好处是：
+ *   · 圈上只有 4 个字，视觉干净（8 个字挤在圈上很吵）
+ *   · 和字幕解析的「原子模型」天然对齐：字幕只抽 东/西/南/北 四个字，
+ *     合成出角度，显示端再拆回两个轴，全程没有「东北」这个中间词
+ * 做法参考 GenshinImpactVT 的 compass.py。
+ */
+const DIRS4 = [
+  { deg: 0, label: '北' },
+  { deg: 90, label: '东' },
+  { deg: 180, label: '南' },
+  { deg: 270, label: '西' }
+];
+
+/**
+ * 罗盘角 → 需要高亮的轴标签。
+ * 正方向返回一个轴，斜向返回相邻两个轴。
+ */
+function axesForDeg(deg) {
+  // 防 NaN：typeof NaN === 'number'，上层的类型检查拦不住它，
+  // 而 Math.round(NaN) 会一路传染到 DIRS4.find(...).label 直接抛异常
+  if (!Number.isFinite(deg)) return [];
+  const bucket = ((Math.round(deg / 45) * 45) % 360 + 360) % 360;
+  const at = (d) => DIRS4.find((x) => x.deg === d).label;
+  if (bucket % 90 === 0) return [at(bucket)];
+  // 斜向：左右各退/进 45° 就是相邻的两个轴
+  return [at((bucket - 45 + 360) % 360), at((bucket + 45) % 360)];
+}
+
+/* 高亮配色：与参考项目默认的 #4080ff 一致 */
+const RADAR_BLUE = '64, 128, 255';
+
+/**
+ * 箭头 / 雷达圈的绘制半径。
+ *
+ * 保持原作者的比例映射（窗口半边长 × 0.86），**不要**改成直接取
+ * settings.bearing.radius —— 那样同一个滑块值画出来的圈会大 4px，
+ * 用户之前对齐好的标定全部偏移，看起来就是「圈突然变大、对不齐」。
+ */
 function radius(w, h) {
   return (Math.min(w, h) / 2) * 0.86;
+}
+
+/** 雷达光环半径 = 标定半径 + RING_OFFSET（默认贴合） */
+function rimRadius(w, h) {
+  return radius(w, h) + RING_OFFSET;
 }
 
 /**
@@ -284,14 +377,210 @@ function drawArrow(cx, cy, r, deg) {
   ctx.restore();
 }
 
+/**
+ * 画雷达光环。
+ *
+ * 两层叠加，和参考项目 rim_highlight() 的算法一致：
+ *   1. 径向渐变铺一个「环带」（峰值在 84% 半径）
+ *   2. 锥形渐变做 DestinationIn，把环带裁成 ±28° 实心 / ±42° 渐隐的一段
+ *
+ * @param {number} deg   要点亮的罗盘角
+ * @param {number} alpha 整体透明度（淡入淡出 + 呼吸都在这里）
+ */
+function drawRadarGlow(cx, cy, rim, deg, alpha) {
+  if (alpha <= 0.001) return;
+
+  const pad = Math.ceil(rim * 1.02) + 2;
+  ctx.save();
+
+  // ---- 第一层：环带 ----
+  const radial = ctx.createRadialGradient(cx, cy, 0, cx, cy, rim);
+  // 停靠点和参考项目一致：中心与中段全透明，靠边才亮
+  const stops = [
+    [0.0, 0],
+    [0.58, 0],
+    [0.7, 65],
+    [0.84, 190],
+    [0.94, 165],
+    [1.0, 0]
+  ];
+  for (const [pos, a] of stops) {
+    radial.addColorStop(pos, `rgba(${RADAR_BLUE}, ${(a / 255) * alpha})`);
+  }
+  ctx.fillStyle = radial;
+  ctx.beginPath();
+  ctx.arc(cx, cy, rim, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ---- 第二层：角度羽化（DestinationIn 保留 + 镂空） ----
+  // 画布 0° 在右、顺时针；罗盘 0° 在上，所以减 90。
+  const start = ((deg - 90) * Math.PI) / 180;
+  const solid = (28 * Math.PI) / 180; // 实心半角
+  const feather = (42 * Math.PI) / 180; // 渐隐半角
+
+  const angular = ctx.createConicGradient
+    ? ctx.createConicGradient(start - feather, cx, cy)
+    : null;
+
+  if (angular) {
+    /* 渐变从「渐隐起点」(start − feather) 开始铺一整圈，
+     * 所以距起点的弧度就是停靠点：
+     *   feather − solid → 对应 −28°（实心边缘，0.59）
+     *   feather         → 对应   0°（正中，1）
+     *   feather + solid → 对应 +28°
+     *   2·feather       → 对应 +42°（完全透明）
+     * 中间按参考项目的 150/255 比例给 0.59。 */
+    const span = Math.PI * 2;
+    const toStop = (rad) => Math.max(0, Math.min(1, rad / span));
+    angular.addColorStop(0, 'rgba(255,255,255,0)');
+    angular.addColorStop(toStop(feather - solid), 'rgba(255,255,255,0.59)');
+    angular.addColorStop(toStop(feather), 'rgba(255,255,255,1)');
+    angular.addColorStop(toStop(feather + solid), 'rgba(255,255,255,0.59)');
+    angular.addColorStop(toStop(feather * 2), 'rgba(255,255,255,0)');
+    angular.addColorStop(1, 'rgba(255,255,255,0)');
+
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.fillStyle = angular;
+    ctx.beginPath();
+    ctx.arc(cx, cy, rim, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  ctx.restore();
+}
+
+/**
+ * 八个方位文字。
+ *
+ * 位置用三角函数均匀铺在雷达圈外：
+ *   x = cx + R·sin(θ)   y = cy − R·cos(θ)      （θ 为罗盘角，0°=正上方）
+ *
+ * 默认半透明；被字幕点中的那个放大 + 变蓝 + 闪烁。
+ */
+function drawRadarLabels(cx, cy, rim, now) {
+  const R = rim + LABEL_OFFSET;
+  const cue = RADAR.cueDeg;
+  const age = RADAR.cueAt ? now - RADAR.cueAt : Infinity;
+  // 点中后：先闪两下再稳住，最后随整体一起淡出
+  const pulse = age < 700 ? 0.5 + 0.5 * Math.abs(Math.sin((age / 700) * Math.PI * 2)) : 1;
+  const cueAlpha = age > CUE_HOLD_MS ? Math.max(0, 1 - (age - CUE_HOLD_MS) / CUE_FADE_MS) : 1;
+
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  // 文字留出的边距：字形 15px + 描边 4px，取 14 足够
+  const PAD = 14;
+
+  for (const d of DIRS4) {
+    const rad = (d.deg * Math.PI) / 180;
+    /* 纯兜底：窗口是 (半径+20)×2、文字画在半径−14 处，
+     * 正常情况下离画布边缘还有 26px 余量，这里的夹取不会生效。
+     * 只有极端情况（窗口被系统缩到比圈还小）才会把文字收回画布内，
+     * 免得整块消失。 */
+    const x = clamp(cx + Math.sin(rad) * R, PAD, w - PAD);
+    const y = clamp(cy - Math.cos(rad) * R, PAD, h - PAD);
+
+    // 命中判定：这个轴是否在当前方位里。
+    // 指向东南时 axes = ['东','南']，两个字会一起亮。
+    const hit = cue >= 0 && (RADAR.cueAxes || []).includes(d.label);
+    const scale = hit ? 1.28 * (0.94 + 0.06 * pulse) : 1;
+    const alpha = hit ? cueAlpha : 0.45;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    ctx.font = '700 15px "Microsoft YaHei UI", "Microsoft YaHei", sans-serif';
+
+    // 先描一圈黑边：任何地形底色下都读得清（参考项目也是先画深色底再画字）
+    ctx.lineWidth = 4;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = `rgba(0, 0, 0, ${0.72 * alpha})`;
+    ctx.strokeText(d.label, 0, 0);
+
+    if (hit) {
+      // 点中：亮蓝 + 外发光，和雷达光同一套色
+      ctx.shadowColor = `rgba(${RADAR_BLUE}, ${0.9 * alpha})`;
+      ctx.shadowBlur = 12 * pulse;
+      ctx.fillStyle = `rgba(150, 200, 255, ${alpha})`;
+    } else {
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+    }
+    ctx.fillText(d.label, 0, 0);
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+/**
+ * 呼吸/淡出驱动的重绘循环。
+ *
+ * 只在「有点亮中的方位」时跑：没有 cue 就不需要每帧重画，
+ * 静态的雷达圈和文字靠一次 draw() 就够，避免常驻 rAF 白烧 CPU。
+ */
+function radarTick() {
+  RADAR.raf = 0;
+  if (RADAR.cueDeg < 0) {
+    draw();
+    return;
+  }
+  draw();
+  const age = Date.now() - RADAR.cueAt;
+  if (age < CUE_HOLD_MS + CUE_FADE_MS) {
+    RADAR.raf = requestAnimationFrame(radarTick);
+  } else {
+    // 淡出结束：清掉 cue，再补一帧恢复默认外观
+    RADAR.cueDeg = -1;
+    RADAR.cueLabel = '';
+    RADAR.cueAxes = [];
+    draw();
+  }
+}
+
+/** 字幕给出绝对方位时调用：点亮对应扇区并开始呼吸 */
+function showCompassCue(deg, label) {
+  RADAR.cueDeg = ((Number(deg) % 360) + 360) % 360;
+  RADAR.cueLabel = String(label || '');
+  // 斜向会得到两个轴，正方向只有一个
+  RADAR.cueAxes = axesForDeg(RADAR.cueDeg);
+  RADAR.cueAt = Date.now();
+  if (!RADAR.raf) RADAR.raf = requestAnimationFrame(radarTick);
+}
+
 function draw() {
   const w = window.innerWidth;
   const h = window.innerHeight;
   ctx.clearRect(0, 0, w, h);
 
+  // 窗口就是以标定圆心为中心的正方形，所以圆心恒在窗口正中
   const cx = w / 2;
   const cy = h / 2;
   const r = radius(w, h);
+  const rim = rimRadius(w, h);
+  const now = Date.now();
+
+  /* ---- 雷达圈与八向文字 ----
+   * 只有标定过才显示：没标定时圆心/半径都是猜的，画出来只会误导。
+   * 未标定状态下箭头仍然照画（它不依赖雷达）。 */
+  if (RADAR.visible && RADAR.radius > 0) {
+    if (RADAR.cueDeg >= 0 && RADAR.cueAt) {
+      const age = now - RADAR.cueAt;
+      // 淡入 120ms → 保持 → 淡出 450ms
+      let alpha = 1;
+      if (age < 120) alpha = age / 120;
+      else if (age > CUE_HOLD_MS) alpha = Math.max(0, 1 - (age - CUE_HOLD_MS) / CUE_FADE_MS);
+      // 呼吸：全程很轻的 0.88~1.0 摆动，看起来像光环在呼吸
+      const breathe = 0.88 + 0.12 * Math.sin(now / 420);
+      drawRadarGlow(cx, cy, rim, RADAR.cueDeg, alpha * breathe);
+    }
+
+    drawRadarLabels(cx, cy, rim, now);
+  }
 
   if (placing) drawRing(cx, cy, r);
 
@@ -311,7 +600,60 @@ function touchView() {
   viewExpireTimer = setTimeout(draw, VIEW_STALE_MS + 50);
 }
 
+/* --------------------------------------------------------- 自绘拖动
+ *
+ * 为什么不用 CSS 的 -webkit-app-region: drag：
+ * 那是把拖动交给 Windows 的标题栏命中测试，指针扫到屏幕顶部 / 左右边缘时
+ * 会触发 Aero Snap（吸附 / 最大化预览），松开鼠标窗口就「弹回」原位置。
+ * 这个窗口又不可最大化，系统往往直接把它复位 —— 就是用户说的
+ * 「拖上去松开自己弹回来」。
+ *
+ * 自己跟指针算位移就完全没有这层系统逻辑：1:1 跟随，能推到屏幕外，
+ * 也不会被吸附。
+ */
+let drag = null;
+
+window.addEventListener('pointerdown', (e) => {
+  if (!placing || e.button !== 0) return;
+  drag = { x: e.screenX, y: e.screenY };
+  try {
+    e.target.setPointerCapture(e.pointerId);
+  } catch {
+    /* 某些环境不支持捕获，退化为普通移动 */
+  }
+  window.overlayApi.dragStart({ x: e.screenX, y: e.screenY });
+});
+
+window.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  window.overlayApi.dragMove({ x: e.screenX, y: e.screenY });
+});
+
+const endDrag = () => {
+  if (!drag) return;
+  drag = null;
+  window.overlayApi.dragEnd();
+};
+window.addEventListener('pointerup', endDrag);
+window.addEventListener('pointercancel', endDrag);
+window.addEventListener('blur', endDrag);
+
 window.addEventListener('resize', resize);
+
+/* 雷达几何：标定圆心半径一变（拖动/缩放标定圈）就立刻重画 */
+window.overlayApi.onRadar((cfg) => {
+  const p = cfg || {};
+  RADAR.radius = Number(p.radius) || 0;
+  RADAR.visible = !!p.visible && RADAR.radius > 0;
+  draw();
+});
+
+/* 字幕点亮的绝对方位 */
+window.overlayApi.onCompassCue((cue) => {
+  if (!cue || typeof cue.deg !== 'number') return;
+  if (!RADAR.visible) return; // 没标定就不点亮（圈都还没挂上去）
+  showCompassCue(cue.deg, cue.label);
+});
 
 window.overlayApi.onBearing((payload) => {
   if (!payload) return;

@@ -13,11 +13,59 @@ let lastConfig = null;
 let holdSeconds = 3;
 
 /** 描边预设：和 B 站播放器一致的三种 */
-const STROKE = {
-  none: 'none',
-  outline: '1px 0 1px #000, 0 1px 1px #000, 0 -1px 1px #000, -1px 0 1px #000',
-  shadow: '0 2px 6px rgba(0, 0, 0, 0.95)'
-};
+/* 旧的四向阴影描边，只在浏览器不支持 -webkit-text-stroke 时兜底 */
+const STROKE_FALLBACK = '1px 0 1px #000, 0 1px 1px #000, 0 -1px 1px #000, -1px 0 1px #000';
+
+const HAS_TEXT_STROKE = (() => {
+  try {
+    return 'webkitTextStroke' in document.documentElement.style;
+  } catch {
+    return false;
+  }
+})();
+
+/**
+ * 应用描边。
+ *
+ * outline 改用 -webkit-text-stroke + paint-order: stroke fill（做法参考
+ * BiliMaku 的 DanmakuOverlayWindow）：
+ *
+ *   四向 text-shadow 是「往四个方向各偏移一份黑色」叠出来的，它有两个毛病：
+ *   · 细笔画会被两侧的阴影压瘦，字看起来比设定字重更细
+ *   · 小字号下四份偏移糊在一起，笔画黏成一块
+ *   text-stroke 是沿字形轮廓向外均匀扩一圈，paint-order 让**填充盖在描边上面**，
+ *   所以笔画宽度保持原样，边缘也干净。
+ *
+ * 注意 -webkit-text-stroke 的宽度是**总宽度**，填充会覆盖内侧一半，
+ * 所以可见的外描边约为传入值的一半。取字号的 10%：30px 字 → 3px 描边 → 约 1.5px 可见。
+ */
+function applyStroke(kind, fontPx) {
+  const k = kind === 'shadow' || kind === 'none' ? kind : 'outline';
+
+  if (k === 'none') {
+    el.style.webkitTextStroke = '';
+    el.style.paintOrder = '';
+    el.style.textShadow = 'none';
+    return;
+  }
+  if (k === 'shadow') {
+    el.style.webkitTextStroke = '';
+    el.style.paintOrder = '';
+    el.style.textShadow = '0 2px 6px rgba(0, 0, 0, 0.95)';
+    return;
+  }
+  // outline
+  if (HAS_TEXT_STROKE) {
+    const w = Math.max(2, Math.round(fontPx * 0.1));
+    el.style.webkitTextStroke = `${w}px #000`;
+    el.style.paintOrder = 'stroke fill';
+    el.style.textShadow = 'none';
+  } else {
+    el.style.webkitTextStroke = '';
+    el.style.paintOrder = '';
+    el.style.textShadow = STROKE_FALLBACK;
+  }
+}
 
 function applyConfig(cfg) {
   if (!cfg) return;
@@ -29,7 +77,7 @@ function applyConfig(cfg) {
   const fontPx = Math.round(30 * (scale / 100) * ratio);
 
   root.style.setProperty('--sub-font', `${fontPx}px`);
-  root.style.setProperty('--sub-bottom', `${Number(cfg.offset) || 80}px`);
+  root.style.setProperty('--sub-bottom', `${Number(cfg.offset) || 230}px`);
 
   // 位置：居中靠 translateX(-50%)；靠左/靠右直接贴边，留 40px 边距
   const pos = cfg.pos === 'left' || cfg.pos === 'right' ? cfg.pos : 'center';
@@ -50,9 +98,8 @@ function applyConfig(cfg) {
   // 颜色
   el.style.color = cfg.color || '#ffffff';
 
-  // 描边
-  const stroke = STROKE[cfg.stroke] || STROKE.outline;
-  el.style.textShadow = stroke;
+  // 描边（用 -webkit-text-stroke + paintOrder，笔画不会被压瘦）
+  applyStroke(cfg.stroke, fontPx);
 
   // 背景不透明度（0% 就是完全透明）
   const bg = Math.min(100, Math.max(0, Number(cfg.bgOpacity)));

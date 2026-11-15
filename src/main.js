@@ -430,6 +430,27 @@ const DEFAULT_SETTINGS = {
   // 记住上次的窗口位置（独立字段，避免和 bounds 的迁移逻辑纠缠）
   windowX: null,
   windowY: null,
+  /**
+   * 位置的比例表示（0~1），与 windowX/windowY 并存。
+   *
+   * 为什么不能只存像素：换显示器、改分辨率、改 DPI 缩放后，同一个像素坐标
+   * 会落到完全不同的相对位置。存「相对工作区的比例 + 显示器标识」才能跨设备恢复。
+   * 分母用 (工作区尺寸 − 窗口尺寸)，这样贴右/下边缘时比例恰好是 1，
+   * 换了窗口尺寸也不会算到屏幕外。
+   */
+  windowXRatio: null,
+  windowYRatio: null,
+  windowDisplayId: null,
+  windowDisplayBounds: null,
+  /**
+   * 贴边吸附造成的「出屏溢出」，单位像素，与比例分开存。
+   *
+   * 吸附会把窗口推到 x = -8 这种位置（补偿 Windows 的不可见边框）。
+   * 如果把这 -8 也塞进比例里，换到 4K 屏就会变成 -23px，窗口被吃掉一块。
+   * 所以比例只记「贴到边」这件事（夹到 0~1），溢出单独记像素、原样恢复。
+   */
+  windowSnapDx: 0,
+  windowSnapDy: 0,
   // 贴边吸附的手动微调（-20 ~ +20 px），叠加在自动补偿之上。
   // 正值 = 整体再往外推（补缝隙）；负值 = 往回收（消切边）。
   snapAdjustment: 0,
@@ -455,6 +476,9 @@ const DEFAULT_SETTINGS = {
   resumeOnLaunch: true,
   // 字幕精灵：自动点开 B 站播放器字幕并把文本镜像到浮窗底部
   enableSubtitleSprite: false,
+  // 视觉绿弧（镜头朝向）：低画质下极易乱飘，默认关闭。
+  // 关掉时访客页直接不跑扇形识别，省 CPU。
+  enableVisionGreenArc: false,
   // 字幕转向提醒：字幕里出现「左转/右转/往东」等词时弹大箭头
   enableTurnReminder: true,
   // 分组开关：左右 / 上下 可以分开启用
@@ -474,7 +498,7 @@ const DEFAULT_SETTINGS = {
   subtitleColor: '#ffffff',    // 文字颜色
   subtitleStroke: 'outline',   // none | outline(四向黑边) | shadow(单向投影)
   subtitlePos: 'center',       // center | left | right
-  subtitleOffset: 80,          // 距屏幕底边 px，10-500
+  subtitleOffset: 230,         // 距屏幕底边 px，10-500（默认按用户实测调到 230）
   subtitleBgOpacity: 70,       // 背景不透明度 0-100%
   subtitleKeepRatio: true,     // 等比缩放（随屏幕高度放大）
   subtitleFade: true,          // 淡入淡出
@@ -510,7 +534,12 @@ const DEFAULT_SETTINGS = {
     // 叠加层：圆环半径（屏幕像素）与圆心屏幕坐标
     radius: 110,
     x: null,
-    y: null
+    y: null,
+    // 圆心的比例表示（相对所在显示器工作区）与显示器标识，跨分辨率恢复用
+    xRatio: null,
+    yRatio: null,
+    displayId: null,
+    displayBounds: null
   }
 };
 
@@ -616,6 +645,130 @@ function writeSettings() {
 }
 
 /* ------------------------------------------------------------------ 窗口 */
+
+/* ------------------------------------------ 位置持久化：比例 + 显示器标识
+ *
+ * 做法参考 BiliMaku 的 SidebarOverlayPlacement（monitor_name + x_ratio/y_ratio）。
+ *
+ * 我们原来只存绝对像素，于是踩了一串坑：贴边吸附要按 DPI 写四边补偿、
+ * 窗口被夹进屏幕后圆心脱开窗口中心、拖上去弹回来 —— 根源都是
+ * 「一个像素坐标要适配多种屏幕几何」。
+ *
+ * 存成比例后，同一个配置在 1080p / 4K / 125% 缩放下都落在相同的相对位置。
+ * 像素字段继续保留：老配置没有比例时用它兜底，且比例换算出的值仍要过一次
+ * 可见性检查（防止换了更小的屏幕后窗口完全落在屏幕外）。
+ */
+
+/** 按 id / 边界找回保存时的显示器；找不到返回 null */
+function findDisplay(displayId, displayBounds) {
+  let all = [];
+  try {
+    all = screen.getAllDisplays();
+  } catch {
+    return null;
+  }
+  // 1. id 精确命中（同一台机器、没换接口时最可靠）
+  if (displayId !== null && displayId !== undefined) {
+    const hit = all.find((d) => String(d.id) === String(displayId));
+    if (hit) return hit;
+  }
+  // 2. 边界近似命中：换过扩展坞/重装后 id 会变，但尺寸位置常常一样
+  if (displayBounds && Number.isFinite(displayBounds.width)) {
+    const tol = 8;
+    const hit = all.find(
+      (d) =>
+        Math.abs(d.bounds.x - displayBounds.x) <= tol &&
+        Math.abs(d.bounds.y - displayBounds.y) <= tol &&
+        Math.abs(d.bounds.width - displayBounds.width) <= tol &&
+        Math.abs(d.bounds.height - displayBounds.height) <= tol
+    );
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** 浮窗：把当前左上角换算成比例写进设置 */
+function saveWindowRatio(b) {
+  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return;
+  let d = null;
+  try {
+    d = screen.getDisplayMatching(b);
+  } catch {
+    return;
+  }
+  if (!d || !d.workArea) return;
+  const area = d.workArea;
+  const spanX = Math.max(1, area.width - b.width);
+  const spanY = Math.max(1, area.height - b.height);
+  const rawX = (b.x - area.x) / spanX;
+  const rawY = (b.y - area.y) / spanY;
+  // 比例只表达「在可移动范围的哪个位置」，夹到 0~1
+  settings.windowXRatio = Math.min(1, Math.max(0, rawX));
+  settings.windowYRatio = Math.min(1, Math.max(0, rawY));
+  // 超出的那部分（贴边吸附的溢出）单独记像素，换分辨率时不该被放大
+  settings.windowSnapDx = Math.round(b.x - (area.x + settings.windowXRatio * spanX));
+  settings.windowSnapDy = Math.round(b.y - (area.y + settings.windowYRatio * spanY));
+  settings.windowDisplayId = d.id;
+  settings.windowDisplayBounds = { ...d.bounds };
+}
+
+/** 浮窗：按比例算出应该放在哪；没有比例时返回 null */
+function restoreWindowRatio(b) {
+  if (!Number.isFinite(settings.windowXRatio) || !Number.isFinite(settings.windowYRatio)) return null;
+  let d = findDisplay(settings.windowDisplayId, settings.windowDisplayBounds);
+  if (!d) {
+    try {
+      d = screen.getPrimaryDisplay();
+    } catch {
+      return null;
+    }
+  }
+  const area = d.workArea;
+  const spanX = Math.max(1, area.width - b.width);
+  const spanY = Math.max(1, area.height - b.height);
+  const dx = Number.isFinite(settings.windowSnapDx) ? settings.windowSnapDx : 0;
+  const dy = Number.isFinite(settings.windowSnapDy) ? settings.windowSnapDy : 0;
+  return {
+    x: Math.round(area.x + settings.windowXRatio * spanX + dx),
+    y: Math.round(area.y + settings.windowYRatio * spanY + dy)
+  };
+}
+
+/** 叠加层：把圆心换算成比例（圆心对工作区整体取比例，与圆大小无关） */
+function saveBearingRatio(cx, cy) {
+  if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+  let d = null;
+  try {
+    d = screen.getDisplayNearestPoint({ x: Math.round(cx), y: Math.round(cy) });
+  } catch {
+    return;
+  }
+  if (!d || !d.workArea) return;
+  const area = d.workArea;
+  settings.bearing.xRatio = (cx - area.x) / Math.max(1, area.width);
+  settings.bearing.yRatio = (cy - area.y) / Math.max(1, area.height);
+  settings.bearing.displayId = d.id;
+  settings.bearing.displayBounds = { ...d.bounds };
+}
+
+/** 叠加层：按比例算出圆心；没有比例时返回 null */
+function restoreBearingRatio() {
+  const b = settings.bearing || {};
+  if (!Number.isFinite(b.xRatio) || !Number.isFinite(b.yRatio)) return null;
+  let d = findDisplay(b.displayId, b.displayBounds);
+  if (!d) {
+    try {
+      d = screen.getPrimaryDisplay();
+    } catch {
+      return null;
+    }
+  }
+  const area = d.workArea;
+  return {
+    x: Math.round(area.x + b.xRatio * area.width),
+    y: Math.round(area.y + b.yRatio * area.height)
+  };
+}
 
 function clampBounds(b) {
   let width = Math.max(240, Math.round(b.width || 896));
@@ -782,6 +935,7 @@ function createWindow() {
     win.showInactive();
     applyPin();
     applyRatioLock();
+    ensureOverlayVisible();
     return win;
   }
 
@@ -798,7 +952,20 @@ function createWindow() {
     settings.bounds.y
   );
 
-  const bounds = clampBounds({ ...settings.bounds, x: wantX, y: wantY });
+  const probe = clampBounds({ ...settings.bounds, x: wantX, y: wantY });
+  // 比例优先：有比例就按比例算，像素只当兜底（老配置）
+  const byRatio = restoreWindowRatio(probe);
+  const bounds = byRatio ? { ...probe, x: byRatio.x, y: byRatio.y } : probe;
+  if (byRatio) {
+    console.log(
+      '[bounds] 按比例恢复 x=%s y=%s（比例 %s, %s · 显示器 %s）',
+      bounds.x,
+      bounds.y,
+      settings.windowXRatio.toFixed(4),
+      settings.windowYRatio.toFixed(4),
+      settings.windowDisplayId
+    );
+  }
   console.log('[bounds] 实际应用 x=%s y=%s w=%s h=%s', bounds.x, bounds.y, bounds.width, bounds.height);
   // 老的扁条尺寸被纠正过一次就记下来，之后用户自己拉成什么比例都不再干预
   if (settings.bounds.aspect !== 2) {
@@ -866,6 +1033,17 @@ function createWindow() {
     applyRatioLock();
     notifyFloatState();
 
+    /* 方位叠加层跟着浮窗一起起来。
+     *
+     * 以前只有两条路会 showOverlay()：启动时浮窗已经存在（继续上次观看），
+     * 或者在控制台点「② 拖到我的游戏小地图上」。所以正常「启动跟跑」之后
+     * 箭头和雷达一直不出现，必须手动点一次那个按钮才亮 —— 这就是用户遇到的
+     * 「每次都要点一下」。这里补上：只要方位箭头是开着的，浮窗起来就一并显示。
+     *
+     * 叠加层本身是 setIgnoreMouseEvents(true) + focusable:false，
+     * 显示它不会抢焦点，也不会挡住游戏操作。 */
+    ensureOverlayVisible();
+
     // 显示后核对一次：确认没有别的逻辑（比例对齐 / 吸附）偷偷挪了坐标
     setTimeout(() => {
       if (!win || win.isDestroyed()) return;
@@ -896,6 +1074,8 @@ function createWindow() {
 
     settings.windowX = b.x;
     settings.windowY = b.y;
+    // 同步写比例表示：下次启动优先按比例恢复，换分辨率/DPI 也不会跑偏
+    saveWindowRatio(b);
     // 保留 aspect 标记：用户手动拉过之后就不该在下次启动时被强行改回 16:9
     settings.bounds = { ...settings.bounds, x: b.x, y: b.y, width: b.width, height: b.height, aspect: 2 };
     persist();
@@ -967,6 +1147,8 @@ function createWindow() {
 
   win.on('closed', () => {
     win = null;
+    // 健康度快照属于「当前这次识别」，浮窗关了就不该再显示旧数字
+    lastBearingStats = null;
     // 主窗关了，叠加层和字幕层不能独自留下，否则 window-all-closed 不触发、进程退不掉
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.destroy();
     destroySubtitleWindow();
@@ -1105,23 +1287,109 @@ setInterval(() => {
 let overlayWin = null;
 let overlayPlacing = false;
 let lastBearing = null;
+/** 最近一次识别健康度快照（分类计数 + 时间戳） */
+let lastBearingStats = null;
+/** 自绘拖动状态：起点指针位置 + 窗口起始矩形 */
+let overlayDrag = null;
 
 function overlaySize() {
-  // 半径 ×2 再留 12% 余量，箭头尖端才不会贴到窗口边被裁掉
+  // 半径 ×2 再留 12% 余量，箭头尖端才不会贴到窗口边被裁掉。
+  // 这个系数是原作者调出来的，别动：改它会让「标记大小」滑块的实际
+  // 视觉尺寸整体偏移，用户之前对齐好的标定就全乱了。
   return Math.round(Math.max(60, Number(settings.bearing.radius) || 110) * 2.24);
 }
 
+/**
+ * overlay 窗口的屏幕矩形：以标定圆心为中心的正方形。
+ *
+ * 这里**不能**把窗口夹进工作区。夹了之后窗口中心就不再等于标定圆心，
+ * 而拖动窗口时是按「窗口中心 = 圆心」写回的 —— 结果每拖一次圆心就偏一截，
+ * 表现出来正是「往上拖不动，反而越拖越靠下」。
+ *
+ * 现在雷达圈与标定圈同尺寸、八向文字画在圈内侧，本来就全部落在窗口里，
+ * 不再需要靠夹取来防止文字被裁。
+ */
 function overlayBounds() {
   const size = overlaySize();
   const area = screen.getPrimaryDisplay().workArea;
-  const cx = Number.isFinite(settings.bearing.x) ? settings.bearing.x : area.x + 260;
-  const cy = Number.isFinite(settings.bearing.y) ? settings.bearing.y : area.y + 260;
+  // 比例优先：圆心按所在显示器的相对位置恢复，换分辨率/DPI 后仍落在同一处
+  const byRatio = restoreBearingRatio();
+  const cx = byRatio
+    ? byRatio.x
+    : Number.isFinite(settings.bearing.x)
+      ? settings.bearing.x
+      : area.x + 260;
+  const cy = byRatio
+    ? byRatio.y
+    : Number.isFinite(settings.bearing.y)
+      ? settings.bearing.y
+      : area.y + 260;
   return {
     x: Math.round(cx - size / 2),
     y: Math.round(cy - size / 2),
     width: size,
     height: size
   };
+}
+
+/**
+ * 保证叠加层还能被抓到。
+ *
+ * 自绘拖动**不夹取**（允许推到屏幕外，这是用户明确要的），但推得太远就再也
+ * 抓不回来了 —— 窗口位置和圆心坐标一起出屏，改「标记大小」也救不了，
+ * 只能手改 settings.json。
+ *
+ * 所以离开拖动、进入放置模式时各检查一次：与工作区的相交面积不足 20%
+ * 就沿最近的边拉回工作区内（不是直接居中，尽量少挪动用户的位置）。
+ *
+ * @returns {boolean} 是否真的拉回过
+ */
+function ensureOverlayReachable() {
+  if (!overlayWin || overlayWin.isDestroyed()) return false;
+  let b = null;
+  try {
+    b = overlayWin.getBounds();
+  } catch {
+    return false;
+  }
+  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return false;
+
+  let d = null;
+  try {
+    d = screen.getDisplayMatching(b);
+  } catch {
+    return false;
+  }
+  if (!d || !d.workArea) return false;
+  const area = d.workArea;
+
+  // 与工作区的相交面积占窗口面积的比例
+  const ix = Math.max(0, Math.min(b.x + b.width, area.x + area.width) - Math.max(b.x, area.x));
+  const iy = Math.max(0, Math.min(b.y + b.height, area.y + area.height) - Math.max(b.y, area.y));
+  const visible = (ix * iy) / Math.max(1, b.width * b.height);
+  if (visible >= 0.2) return false;
+
+  // 沿最近的边夹回工作区（窗口比工作区还大时贴左上角）
+  const nx = Math.max(area.x, Math.min(b.x, area.x + area.width - b.width));
+  const ny = Math.max(area.y, Math.min(b.y, area.y + area.height - b.height));
+  try {
+    overlayWin.setBounds({ x: Math.round(nx), y: Math.round(ny), width: b.width, height: b.height });
+  } catch {
+    return false;
+  }
+  settings.bearing.x = Math.round(nx + b.width / 2);
+  settings.bearing.y = Math.round(ny + b.height / 2);
+  saveBearingRatio(settings.bearing.x, settings.bearing.y);
+  persist();
+  pushDanmakuConfig();
+  pushRadarConfig();
+  console.log(
+    '[overlay] 叠加层跑到屏幕外（可见 %s%%），已拉回 (%s, %s)',
+    Math.round(visible * 100),
+    Math.round(nx),
+    Math.round(ny)
+  );
+  return true;
 }
 
 function createOverlay() {
@@ -1158,12 +1426,20 @@ function createOverlay() {
     const b = overlayWin.getBounds();
     settings.bearing.x = Math.round(b.x + b.width / 2);
     settings.bearing.y = Math.round(b.y + b.height / 2);
+    // 同步写比例：换显示器/改缩放后圆心仍落在相同的相对位置
+    saveBearingRatio(settings.bearing.x, settings.bearing.y);
     persist();
-    // 箭头挪了，弹幕层的挖空也要跟着挪
+    /* 拖动中每个 pointermove 都会触发 setBounds → move。
+     * 逐帧重配弹幕挖空、重推雷达几何既没必要也会拖慢拖动，
+     * 所以拖动期间只更新坐标，收尾时统一补一次。 */
+    if (overlayDrag) return;
     pushDanmakuConfig();
+    pushRadarConfig();
   });
 
+  /* ---- 自绘拖动：绕开系统标题栏拖动（否则会被 Aero Snap 弹回）---- */
   overlayWin.on('closed', () => {
+    overlayDrag = null;
     overlayWin = null;
   });
 
@@ -1173,9 +1449,28 @@ function createOverlay() {
     if (!overlayWin || overlayWin.isDestroyed()) return;
     overlayWin.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
     if (lastBearing) overlayWin.webContents.send('bearing', lastBearing);
+    // 雷达圈几何：页面一就绪就补一次，否则第一次打开时圈和文字都不出现
+    pushRadarConfig();
   });
 
   return overlayWin;
+}
+
+/**
+ * 方位箭头开着时，确保叠加层已经显示出来。
+ *
+ * 以前只有两条路会 showOverlay()：启动时浮窗已存在（继续上次观看），
+ * 或者在控制台点「② 拖到我的游戏小地图上」。所以正常「启动跟跑」之后
+ * 箭头和雷达一直不出现，必须手动点一次那个按钮才亮 ——
+ * 这就是「每次都要点一下」的根因。
+ *
+ * 叠加层是 setIgnoreMouseEvents(true) + focusable:false，
+ * 显示它不抢焦点，也不挡游戏操作。
+ */
+function ensureOverlayVisible() {
+  if (!settings.bearing.enabled) return;
+  showOverlay();
+  pushRadarConfig();
 }
 
 function showOverlay() {
@@ -1583,7 +1878,7 @@ const SUBTITLE_STYLE_DEFAULTS = {
   subtitleColor: '#ffffff',
   subtitleStroke: 'outline',
   subtitlePos: 'center',
-  subtitleOffset: 80,
+  subtitleOffset: 230,
   subtitleBgOpacity: 70,
   subtitleKeepRatio: true,
   subtitleFade: true
@@ -1923,6 +2218,8 @@ function setOverlayPlacing(placing) {
     w.setIgnoreMouseEvents(false);
     w.setFocusable(true);
     w.showInactive();
+    // 进放置模式先保证抓得到：上次可能被推到屏幕外了
+    ensureOverlayReachable();
   } else {
     w.setIgnoreMouseEvents(true, { forward: true });
     w.setFocusable(false);
@@ -1930,6 +2227,33 @@ function setOverlayPlacing(placing) {
 
   if (!w.webContents.isLoading()) w.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
   return overlayPlacing;
+}
+
+/**
+ * 把雷达圈的几何下发给 overlay。
+ *
+ * overlay 的窗口是以标定圆心为中心、边长 overlaySize() 的正方形，
+ * 所以那边只需要知道「半径多少、要不要显示」，坐标天然对齐。
+ * 没标定过就 visible=false —— 圆心和半径都是猜的，画出来只会误导。
+ */
+function pushRadarConfig() {
+  if (!overlayWin || overlayWin.isDestroyed()) return;
+  const b = settings.bearing || {};
+  // 只要「开过箭头 + 标定过 + 有识别区域」就挂雷达。
+  // 不按视频区分：overlay 只需要知道圈画多大，具体用哪块 ROI 是访客页的事。
+  const hasRois =
+    (Array.isArray(b.rois) && b.rois.length > 0) ||
+    (b.roiBy && Object.values(b.roiBy).some((v) => Array.isArray(v) && v.length > 0));
+  const visible = !!b.enabled && !!b.calibrated && hasRois;
+  const payload = {
+    radius: Math.max(60, Number(b.radius) || 110),
+    visible
+  };
+  try {
+    overlayWin.webContents.send('radar:config', payload);
+  } catch {
+    /* 窗口正在销毁 */
+  }
 }
 
 function setBearingEnabled(on) {
@@ -1951,6 +2275,8 @@ function setBearingEnabled(on) {
   persist();
   // 箭头开/关会影响弹幕层的挖空区域
   pushDanmakuConfig();
+  // 开关箭头也决定雷达圈显不显示
+  pushRadarConfig();
   return settings.bearing;
 }
 
@@ -1959,6 +2285,8 @@ function setOverlayRadius(r) {
   if (overlayWin && !overlayWin.isDestroyed()) {
     overlayWin.setBounds(overlayBounds());
   }
+  // 半径变了：雷达圈直径 = 半径 + 15，文字位置也要跟着挪
+  pushRadarConfig();
   persist();
   // 半径变了，挖空圆的大小也要跟着变
   pushDanmakuConfig();
@@ -2493,10 +2821,71 @@ function registerIpc() {
 
   ipcMain.on('overlay:bearing', (_e, payload) => {
     lastBearing = payload;
+    // 识别健康度：启动器轮询这个值来显示「最近 60 帧成功/失败分类」
+    if (payload && payload.stats) lastBearingStats = { ...payload.stats, at: Date.now() };
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.webContents.send('bearing', payload);
   });
 
   ipcMain.handle('overlay:enable', (_e, on) => setBearingEnabled(on));
+
+  /* ---- 识别健康度：启动器每秒轮询一次，用来显示「为什么没有箭头」 ---- */
+  ipcMain.handle('bearing:stats', () => {
+    if (!lastBearingStats) return null;
+    // 超过 5 秒没更新说明识别循环停了（视频暂停 / 开关关闭），界面要能区分
+    return { ...lastBearingStats, ageMs: Date.now() - lastBearingStats.at };
+  });
+
+  /* ---- overlay 自绘拖动 ----
+   * 渲染层按指针在屏幕上的位移发过来，这里直接把窗口平移同样的距离。
+   * 不经过系统拖动，所以不会被屏幕边缘吸附、也不会弹回。 */
+  ipcMain.on('overlay:drag-start', (_e, p) => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    const x = Number(p && p.x);
+    const y = Number(p && p.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    overlayDrag = { x, y, bounds: overlayWin.getBounds() };
+  });
+
+  ipcMain.on('overlay:drag-move', (_e, p) => {
+    if (!overlayDrag || !overlayWin || overlayWin.isDestroyed()) return;
+    const x = Number(p && p.x);
+    const y = Number(p && p.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const b = overlayDrag.bounds;
+    try {
+      overlayWin.setBounds({
+        x: Math.round(b.x + (x - overlayDrag.x)),
+        y: Math.round(b.y + (y - overlayDrag.y)),
+        width: b.width,
+        height: b.height
+      });
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  });
+
+  ipcMain.on('overlay:drag-end', () => {
+    overlayDrag = null;
+    // 拖完先保证还能抓回来（推出去太远就拉回工作区内）
+    ensureOverlayReachable();
+    // 拖动结束：把坐标落盘，并补一次挖空圆 / 雷达几何的同步
+    persist();
+    pushDanmakuConfig();
+    pushRadarConfig();
+    if (win && !win.isDestroyed()) win.webContents.send('bearing:state', settings.bearing);
+  });
+
+  /* ---- 字幕点亮的绝对方位：浮窗解析出「东北/往东/右下角」后转给 overlay ---- */
+  ipcMain.on('compass:cue', (_e, cue) => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    const deg = Number(cue && cue.deg);
+    if (!Number.isFinite(deg)) return;
+    try {
+      overlayWin.webContents.send('compass:cue', { deg, label: String(cue.label || '') });
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  });
 
   /**
    * 手动自动定心的结果。访客算出的 dx/dy 是「视频像素」，这里换算成归一化偏移，
@@ -2506,6 +2895,7 @@ function registerIpc() {
    * 只接受 ok && applied 的结果；失败 / 取消不改任何标定。
    */
   ipcMain.handle('bearing:auto-center-result', (_e, res) => {
+    // 自动定心会把修正写进标定，标定状态可能因此从「未标定」变「已标定」
     const p = res && typeof res === 'object' ? res : {};
     let out = { ok: !!p.ok, applied: !!p.applied, reason: p.reason || '' };
 
@@ -2527,6 +2917,8 @@ function registerIpc() {
         // 自动定心成功本身就说明这块区域已经对准，别再提示「还没标定」
         b.calibrated = true;
         persist();
+        // 刚变成「已标定」：雷达圈和八向文字立刻挂上去
+        pushRadarConfig();
         // 两边都通知：浮窗会拿新标定重挂识别，启动器刷新文案
         broadcast('settings:changed', settings);
         out = { ok: true, applied: true, dx: p.dx, dy: p.dy, roi };
@@ -2594,6 +2986,11 @@ function registerIpc() {
     }
     // 这个开关本身不是「观看记录」，别顺手刷新 lastWatchedAt
     if (patch.resumeOnLaunch !== undefined) settings.resumeOnLaunch = !!patch.resumeOnLaunch;
+    if (patch.enableVisionGreenArc !== undefined) {
+      // 只需记状态：本轮末尾的 broadcast('settings:changed') 会带给浮窗，
+      // 浮窗再通过 syncBearingToGuest 把 greenArc 下发给访客页
+      settings.enableVisionGreenArc = !!patch.enableVisionGreenArc;
+    }
     if (patch.clickThrough !== undefined) setClickThrough(patch.clickThrough);
     if (patch.snapAdjustment !== undefined) {
       settings.snapAdjustment = Math.max(-20, Math.min(20, Math.round(Number(patch.snapAdjustment) || 0)));
@@ -2669,6 +3066,8 @@ function registerIpc() {
       }
     }
     persist();
+    // 标定 / 半径 / 开关都走 settings:save，统一在这里刷新雷达几何
+    pushRadarConfig();
     broadcast('settings:changed', settings);
     return settings;
   });
@@ -2767,6 +3166,8 @@ function registerIpc() {
         const fresh = !win || win.isDestroyed();
         if (fresh) createWindow();
         if (!win || win.isDestroyed()) return false;
+        // 换片/重开也把叠加层带上（浮窗已存在时不会走 ready-to-show）
+        ensureOverlayVisible();
         const cmd = { cmd: 'load', text: payload && payload.text, p: payload && payload.p };
         if (win.webContents.isLoading()) win.webContents.once('did-finish-load', () => sendTo(win, 'float:cmd', cmd));
         else sendTo(win, 'float:cmd', cmd);

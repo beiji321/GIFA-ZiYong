@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('api', {
   saveDump: (p) => ipcRenderer.invoke('overlay:dump-save', p),
   revealDump: () => ipcRenderer.invoke('overlay:reveal-dump'),
   onBearingState: (cb) => ipcRenderer.on('bearing:state', (_e, s) => cb(s)),
+  // 识别健康度：启动器轮询，显示「最近 N 帧成功/失败分类」
+  bearingStats: () => ipcRenderer.invoke('bearing:stats'),
 
   // 输入状态：告诉主进程现在是不是在输入框里打字、是不是在录制新热键，
   // 这两段时间单键热键要让路，其余情况（包括窗口在前台）都该正常触发
@@ -40,6 +42,8 @@ contextBridge.exposeInMainWorld('api', {
   subtitle: (payload) => ipcRenderer.send('subtitle:update', payload),
   // 字幕转向提醒：把匹配到的方向转给字幕层画大箭头
   turn: (payload) => ipcRenderer.send('turn:update', payload),
+  // 字幕里的绝对方位（东北/往东/右下角…）：点亮叠加层雷达圈对应的扇区
+  compassCue: (payload) => ipcRenderer.send('compass:cue', payload),
   // 弹幕按播放进度驱动：浮窗把 <video> 的时间报给主进程切片段
   danmakuTime: (payload) => ipcRenderer.send('danmaku:time', payload),
   // 主进程是比例锁定的权威状态：窗口重建后用它校正 UI，避免图标和实际行为不一致

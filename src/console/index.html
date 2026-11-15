@@ -217,6 +217,35 @@
                   <span class="setting-text"><strong>显示方位箭头</strong><small>在叠加层画出视频里的行进方向与视角方位</small></span>
                   <span class="switch"><input type="checkbox" id="setBearing" /></span>
                 </label>
+
+                <label class="setting" for="setGreenArc">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>显示视觉镜头绿弧</strong>
+                    <small>绿色弧段表示视频里的镜头朝向（与红色行进箭头相互独立）</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setGreenArc" /></span>
+                </label>
+
+                <p class="tip tip-muted" style="margin: -4px 0 12px 44px">
+                  注：极不准确。本自用版已建议弃用，等原作者后续自己优化吧。
+                </p>
+
+                <!-- 识别健康度：把「箭头不显示」从黑盒变成可读数字 -->
+                <div class="health" id="bearingHealth">
+                  <div class="health-row">
+                    <span class="health-label">识别状态</span>
+                    <span class="health-val" id="healthSummary">等待浮窗启动…</span>
+                  </div>
+                  <div class="health-row">
+                    <span class="health-label">最近成功</span>
+                    <span class="health-val dim" id="healthLastOk">—</span>
+                  </div>
+                  <div class="health-row">
+                    <span class="health-label">失败原因</span>
+                    <span class="health-val dim" id="healthReason">—</span>
+                  </div>
+                </div>
                 <div class="setting">
                   <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
                   <span class="setting-text"><strong>标记大小</strong><small>叠加层上红圈与绿弧的直径</small></span>

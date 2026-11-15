@@ -14,7 +14,10 @@
       user-select: none;
     }
     canvas { display: block; width: 100%; height: 100%; }
-    body.placing { -webkit-app-region: drag; cursor: move; }
+    /* 不用 -webkit-app-region: drag：那是交给 Windows 的标题栏拖动，
+     * 指针碰到屏幕边缘时会触发 Aero Snap，松手窗口会「弹回」原位置。
+     * 改为在 overlay.js 里自己跟指针算位移，1:1 移动且能推出屏幕。 */
+    body.placing { cursor: move; }
   </style>
 </head>
 <body>

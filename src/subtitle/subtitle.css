@@ -34,11 +34,9 @@ body {
   line-height: 1.35;
   letter-spacing: 0.6px;
   text-align: center;
-  text-shadow:
-    1px 0 1px #000,
-    0 1px 1px #000,
-    0 -1px 1px #000,
-    -1px 0 1px #000;
+  /* 描边由 subtitle.js 的 applyStroke() 按设置动态写入：
+   * 优先 -webkit-text-stroke + paint-order，不支持时才退回四向 text-shadow。
+   * 这里不能再留默认阴影，否则两种描边会叠加，字会糊。 */
   white-space: pre-wrap;
   word-break: break-word;
   opacity: 0;

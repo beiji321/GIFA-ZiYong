@@ -156,6 +156,12 @@ const BEARING = {
    * 每帧挑最可信的一块用。
    */
   rois: [],
+  /**
+   * 视觉绿弧（镜头朝向）是否启用。默认关闭：
+   * 低画质下白色扇形边缘糊得几乎不可分辨，跑它只会得到乱飘的结果，
+   * 还要占每帧一次 512px 窗口的扫描。关掉后采集循环里直接跳过 analyzeCone。
+   */
+  greenArc: false,
   canvas: null,
   ctx: null,
   timer: null,
@@ -219,6 +225,22 @@ const BEARING = {
   },
   // 最近几帧的原始角度，用来做圆形中值（剔除「认成三角形另一个角」这类野值）
   raw: [],
+  /**
+   * 识别健康度：最近 N 帧的结果码环形缓冲。
+   *
+   * 目的：把「箭头不显示」从黑盒变成可读数字。失败原因分类计数，
+   * 界面显示「最近 60 帧 成功 41 / 无小地图 17 / 疑似反向 2」，
+   * 一眼能看出卡在哪一环，不用翻控制台。
+   * 分类计数的做法参考 lanren-genshin-impact-ai 的 state.py（计次_定位失败 等）。
+   */
+  stats: {
+    window: 60,
+    ring: [],
+    total: 0,
+    lastReason: '',
+    lastOkAt: 0,
+    lastBadAt: 0
+  },
   invalidSince: 0,
   reportedValid: null,
   explained: false,
@@ -1273,6 +1295,53 @@ function viewPayload(view, cone) {
  * extra 用来捎上视角：箭头认不出来不等于视角也丢了（箭头被特效盖住、
  * 扇形反而清楚是常事），这种情况绿弧还得继续走。
  */
+/**
+ * 记一帧的识别结果。
+ * @param {'ok'|'noRoi'|'noMap'|'hold'} code
+ * @param {string} reason 给人看的原因
+ */
+function noteBearingResult(code, reason) {
+  const st = BEARING.stats;
+  st.ring.push(code);
+  if (st.ring.length > st.window) st.ring.shift();
+  st.total += 1;
+  const now = Date.now();
+  if (code === 'ok') {
+    st.lastOkAt = now;
+    st.lastReason = '';
+  } else {
+    st.lastBadAt = now;
+    if (reason) st.lastReason = reason;
+  }
+}
+
+/** 汇总最近窗口内的计数，随每帧 payload 一起带给界面 */
+function bearingStats() {
+  const st = BEARING.stats;
+  const out = {
+    window: st.ring.length,
+    ok: 0,
+    noRoi: 0,
+    noMap: 0,
+    hold: 0,
+    total: st.total,
+    lastReason: st.lastReason,
+    lastOkAt: st.lastOkAt,
+    lastBadAt: st.lastBadAt
+  };
+  for (const c of st.ring) out[c] = (out[c] || 0) + 1;
+  return out;
+}
+
+/** 所有 bearing 上报都走这里，保证每帧都捎上健康度统计 */
+function sendBearing(payload) {
+  try {
+    ipcRenderer.sendToHost('bearing', { ...(payload || {}), stats: bearingStats() });
+  } catch {
+    /* 页面正在卸载 */
+  }
+}
+
 function markInvalid(reason, extra) {
   BEARING.raw.length = 0;
   BEARING.smooth = -1;
@@ -1280,12 +1349,19 @@ function markInvalid(reason, extra) {
   BEARING.ab.omega = 0;
   BEARING.ab.suspect = 0;
   BEARING.lastAngle = -1;
+
+  /* 计数必须在节流**之前**。
+   * 之前放在节流之后，导致整段失败只被记一次（第一秒内直接 return，
+   * 之后 reportedValid===false 又 return），面板会显示「最近 1 帧 全失败」，
+   * 看起来像没数据，而不是「60 帧全失败」。 */
+  noteBearingResult(reason === '还没框选小地图' ? 'noRoi' : 'noMap', reason);
+
   if (!BEARING.invalidSince) BEARING.invalidSince = Date.now();
   if (Date.now() - BEARING.invalidSince < 1000) return;
   if (BEARING.reportedValid === false) return;
 
   BEARING.reportedValid = false;
-  ipcRenderer.sendToHost('bearing', { ok: false, reason, angle: null, ...(extra || {}) });
+  sendBearing({ ok: false, reason, angle: null, ...(extra || {}) });
 }
 
 function tickBearing() {
@@ -1344,7 +1420,10 @@ function tickBearing() {
     // 扇形每帧都要算，且必须换**大窗口**：几何通道的 0.62R 中心小窗
     // 看不到径向衰减，等于把「内浓外淡」这个关键证据直接丢掉。
     // 大窗口按 step=2 跳采，扫描像素数与几何通道同量级。
-    if (gc) {
+    //
+    // 绿弧开关关闭时**整段跳过**：低画质下它本来就不可靠，还白占一次
+    // 512px 窗口扫描（约 10ms）。省下来的时间留给箭头通道。
+    if (gc && BEARING.greenArc) {
       const cn = analyzeCone(gc.img, gc.size, gc.step);
       mapCyan = Math.max(mapCyan, cn.cyanFrac || 0);
       // 扇形恒在：连 invalid 的结果也交给 updateView 走宽限，别在采集层就丢掉
@@ -1373,7 +1452,8 @@ function tickBearing() {
 
   // 视角通道独立于行进通道，先把它算出来。几何彻底失效时它可能还有值。
   // 门控只管「小地图在不在」，不管「这一帧有没有认出扇形」—— 后者由宽限兜。
-  const view = updateView(cone, now, mapCyan >= MAP_CYAN_FRAC_MIN);
+  // 绿弧关闭时直接给 null：不跑 updateView，也就不会有任何绿弧上报
+  const view = BEARING.greenArc ? updateView(cone, now, mapCyan >= MAP_CYAN_FRAC_MIN) : null;
 
   if (!best) {
     // 只在第一次失配时打一行日志，避免每帧刷屏
@@ -1431,7 +1511,8 @@ function tickBearing() {
   // out === null：这一帧被判为「疑似反向」，箭头保持不动。
   // 但视角是**独立通道**，必须照常送 —— 否则绿弧会跟着箭头一起卡住半秒。
   if (out === null) {
-    ipcRenderer.sendToHost('bearing', {
+    noteBearingResult('hold', '这一帧判据疑似反向，保持不动');
+    sendBearing({
       ok: true,
       angle: BEARING.lastAngle < 0 ? (90 - best.angle + 720) % 360 : (90 - BEARING.lastAngle + 720) % 360,
       confidence: conf,
@@ -1446,6 +1527,10 @@ function tickBearing() {
   const moved = BEARING.lastAngle < 0 ? 999 : Math.abs(angDiff(out, BEARING.lastAngle));
   // 视角也要参与「要不要重发」的判断：箭头不动但镜头在转时，绿弧不能停
   const viewMoved = view ? Math.abs(angDiff(view.deg, BEARING.view.sent)) : 0;
+  /* 计数必须在节流**之前**：角度稳定时这里每 250ms 才发一次，
+   * 但识别其实每帧都成功了。放在节流后面会让「成功率」严重偏低。 */
+  noteBearingResult('ok', '');
+
   // 只挡「几乎没动」的重复上报，不再有 450ms 的强制冷却
   if (BEARING.reportedValid === true && moved <= 0.6 && viewMoved <= 1.5 && now - BEARING.lastSentAt < 250) {
     return;
@@ -1470,7 +1555,7 @@ function tickBearing() {
    * 顺便和「0=北、顺时针」这个业界约定对齐，日志读起来也直观。
    */
   const compass = (90 - out + 720) % 360;
-  ipcRenderer.sendToHost('bearing', {
+  sendBearing({
     ok: true,
     angle: compass,
     confidence: conf,
@@ -2283,6 +2368,27 @@ function setBearing(cfg = {}) {
       } catch (err) {
         console.warn('[跟跑助手] 导出小地图截图失败', err.message);
       }
+    }
+  }
+
+  // 绿弧开关可以单独下发（改设置时不用重开识别）
+  if (cfg.greenArc !== undefined) {
+    const next = !!cfg.greenArc;
+    if (next !== BEARING.greenArc) {
+      BEARING.greenArc = next;
+      // 关掉时立刻把视角状态清空，避免残留一段绿弧挂着
+      BEARING.view.theta = -1;
+      BEARING.view.conf = 0;
+      BEARING.view.pending = -1;
+      BEARING.view.sent = -1;
+      if (!next) {
+        try {
+          ipcRenderer.sendToHost('bearing', { ok: false, view: null, viewConfidence: 0, viewSource: 'off' });
+        } catch {
+          /* 页面正在卸载 */
+        }
+      }
+      console.log(`[跟跑助手] 视觉绿弧 ${next ? '已启用' : '已关闭（跳过扇形识别，省 CPU）'}`);
     }
   }
 

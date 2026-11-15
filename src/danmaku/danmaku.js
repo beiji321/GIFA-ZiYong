@@ -70,14 +70,23 @@ function clearAll() {
 
 /* ----------------------------------------------------------- 轨道碰撞 */
 
-/** tracks[i] = 该轨道上一条弹幕的「尾部完全进屏」时刻（秒） */
+/** tracks[i] = 该轨道上一条弹幕的「尾部完全进屏 + 余量」时刻（秒） */
 const tracks = [];
+
+/**
+ * 轨道复用的安全余量（像素）。
+ *
+ * 判据不能只算「尾部刚好出屏」：下一条弹幕入场时会有淡入，且人眼对
+ * 「两条字挨在一起」很敏感。留 64px 相当于给下一条留一个字的间距。
+ * 这个值来自 BiliMaku 的 laneReusableAt（宽度 + 64px 走完的时间）。
+ */
+const LANE_GAP_PX = 64;
 
 /**
  * 给一条弹幕挑轨道：从第一条开始找 freeAt <= now 的；
  * 全忙就返回 -1，调用方必须丢弃这条弹幕。
  */
-function pickLane(now, widthPx) {
+function pickLane(now) {
   const total = laneCount();
   while (tracks.length < total) tracks.push(0);
   tracks.length = total;
@@ -88,10 +97,21 @@ function pickLane(now, widthPx) {
   return -1;
 }
 
-function occupyLane(lane, now, widthPx) {
-  // 尾部完全进入屏幕所需时间占整段飞行的比例
-  const ratio = Math.min(1, widthPx / (window.innerWidth + widthPx));
-  tracks[lane] = now + durationSeconds() * ratio;
+/**
+ * 占用一条轨道。
+ *
+ * @param {number} duration 这一条**实际**的动画时长（秒）。
+ *   必须传进来而不是内部再调 durationSeconds()：spawn 里会给时长加
+ *   0.92~1.08 的随机抖动，内部重算拿到的是未抖动的基准值，两者最多差 8%。
+ *   按 8 秒、占比 0.3 估，就是 0.19 秒的误差 —— 换算成像素约 250px，
+ *   足以让下一条弹幕直接压在还没走完的尾巴上。
+ */
+function occupyLane(lane, now, widthPx, duration) {
+  // 飞行总距离 = 视口宽 + 自身宽（对应 CSS 的 translateX(-100vw - 100%)）
+  const travel = Math.max(1, window.innerWidth + widthPx);
+  // 尾部出屏 + 安全余量所需时间，占整段飞行的比例
+  const ratio = Math.min(1, (widthPx + LANE_GAP_PX) / travel);
+  tracks[lane] = now + duration * ratio;
 }
 
 /* --------------------------------------------------------------- 渲染 */
@@ -116,7 +136,7 @@ function spawn(item) {
   layer.appendChild(el);
 
   const width = el.offsetWidth || 100;
-  const lane = pickLane(now, width);
+  const lane = pickLane(now);
   if (lane < 0) {
     // 全轨道占满：直接丢弃，绝不强行塞入造成重叠
     el.remove();
@@ -124,10 +144,10 @@ function spawn(item) {
     return;
   }
 
-  occupyLane(lane, now, width);
-  el.style.top = `${lane * laneHeight() + Math.random() * 4}px`;
-
+  // 时长必须先算出来：占轨道要用真实值，不能用未抖动的基准值
   const duration = durationSeconds() * (0.92 + Math.random() * 0.16);
+  occupyLane(lane, now, width, duration);
+  el.style.top = `${lane * laneHeight() + Math.random() * 4}px`;
   el.style.animationDuration = `${duration}s`;
   const dispose = () => {
     clearTimeout(el.__killTimer);
