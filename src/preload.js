@@ -7,7 +7,6 @@ contextBridge.exposeInMainWorld('api', {
   save: (patch) => ipcRenderer.invoke('settings:save', patch),
   action: (name, payload) => ipcRenderer.invoke('win:action', name, payload),
   load: (payload) => ipcRenderer.invoke('bili:load', payload),
-  nav: () => ipcRenderer.invoke('bili:nav'),
   // 游戏内热键需要管理员身份（UIPI），由用户在启动器里按需触发 UAC 提权重启
   relaunchElevated: () => ipcRenderer.invoke('app:relaunch-elevated'),
   updateHotkeys: (hotkeys) => ipcRenderer.invoke('hotkeys:update', hotkeys),
@@ -25,7 +24,6 @@ contextBridge.exposeInMainWorld('api', {
   onAutoCenterResult: (cb) => ipcRenderer.on('auto-center-result', (_e, r) => cb(r)),
   saveDump: (p) => ipcRenderer.invoke('overlay:dump-save', p),
   revealDump: () => ipcRenderer.invoke('overlay:reveal-dump'),
-  onBearingState: (cb) => ipcRenderer.on('bearing:state', (_e, s) => cb(s)),
   // 识别健康度：启动器轮询，显示「最近 N 帧成功/失败分类」
   bearingStats: () => ipcRenderer.invoke('bearing:stats'),
 
@@ -40,6 +38,12 @@ contextBridge.exposeInMainWorld('api', {
   onSnapEdges: (cb) => ipcRenderer.on('snap:edges', (_e, p) => cb(p)),
   // 字幕文本转交给主进程，由独立的全屏字幕窗口绘制
   subtitle: (payload) => ipcRenderer.send('subtitle:update', payload),
+  // 官方字幕模式：主进程拉到字幕轨后通知浮窗，浮窗再让访客页按进度报时间
+  onSubtitleApi: (cb) => ipcRenderer.on('subtitle:api', (_e, s) => cb(s)),
+  subtitleTime: (payload) => ipcRenderer.send('subtitle:time', payload),
+  // 字幕来源状态 + 手动重读
+  subtitleStatus: () => ipcRenderer.invoke('subtitle:status'),
+  subtitleRefetch: () => ipcRenderer.invoke('subtitle:refetch'),
   // 字幕转向提醒：把匹配到的方向转给字幕层画大箭头
   turn: (payload) => ipcRenderer.send('turn:update', payload),
   // 字幕里的绝对方位（东北/往东/右下角…）：点亮叠加层雷达圈对应的扇区

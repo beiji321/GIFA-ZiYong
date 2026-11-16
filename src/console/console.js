@@ -72,6 +72,7 @@ async function init() {
   wireVideo();
   wireSettings();
   wireBearing();
+  wireSubtitle();
   wireHotkeys();
 
   // 启动器窗口可能被关掉再打开，此刻主进程的放置状态未必是初始值，
@@ -366,6 +367,8 @@ function paintRange(el) {
 function fillSettings(s) {
   $('setPin').checked = !!s.pinned;
   $('setClickThrough').checked = s.clickThrough === true;
+  $('setCloseToTray').checked = s.closeToTray !== false;
+  $('setTrayClickFloat').checked = s.trayClickAction === 'float';
   // 老 settings.json 没这个字段，默认视为开启
   $('setResumeOnLaunch').checked = s.resumeOnLaunch !== false;
   $('setSubtitleSprite').checked = !!s.enableSubtitleSprite;
@@ -375,6 +378,11 @@ function fillSettings(s) {
   const subScale = Number(s.subtitleScale ?? 100);
   const subOffset = Number(s.subtitleOffset ?? 230);
   const subBg = Number(s.subtitleBgOpacity ?? 70);
+  $('setSubUseApi').checked = s.subtitleUseApi !== false;
+  $('setSubHideNative').checked = s.subtitleHideNative !== false;
+  $('setSubMergeOverlap').checked = s.subtitleMergeOverlap !== false;
+  $('setSubHideOnPause').checked = s.subtitleHideOnPause === true;
+  $('setSubAutoOpen').checked = s.subtitleAutoOpen !== false;
   $('setSubScale').value = String(subScale);
   $('subScaleVal').textContent = subScale + '%';
   $('setSubColor').value = /^#[0-9a-f]{6}$/i.test(s.subtitleColor || '') ? s.subtitleColor : '#ffffff';
@@ -508,6 +516,19 @@ function wireSettings() {
   });
 
   $('setPin').addEventListener('change', (e) => window.api.action('pin', e.target.checked));
+
+  $('setTrayClickFloat').addEventListener('change', (e) => {
+    const action = e.target.checked ? 'float' : 'launcher';
+    state.boot.settings.trayClickAction = action;
+    window.api.save({ trayClickAction: action });
+    toast(e.target.checked ? '托盘单击切换浮窗' : '托盘单击显示启动器');
+  });
+
+  $('setCloseToTray').addEventListener('change', (e) => {
+    state.boot.settings.closeToTray = e.target.checked;
+    window.api.save({ closeToTray: e.target.checked });
+    toast(e.target.checked ? '关闭启动器时会收进托盘' : '关闭启动器会直接退出');
+  });
 
   $('setClickThrough').addEventListener('change', (e) => {
     state.boot.settings.clickThrough = e.target.checked;
@@ -780,6 +801,50 @@ function renderHealth(st) {
   reason.textContent = st.lastReason || '—';
 }
 
+/**
+ * 字幕来源状态。
+ *   api  官方接口拿到了字幕轨（带精确时间戳，暂停/拖动都准）
+ *   dom  接口没给，降级成抓播放器面板的文字
+ *   none 两边都没拿到
+ */
+function renderSubStatus(st) {
+  const src = $('subSource');
+  const last = $('subLastText');
+  if (!src || !last) return;
+
+  if (!st) {
+    src.textContent = '等待视频载入…';
+    src.classList.remove('bad');
+    last.textContent = '—';
+    return;
+  }
+  if (!st.enabled) {
+    src.textContent = '字幕精灵未开启';
+    src.classList.remove('bad');
+    last.textContent = '—';
+    return;
+  }
+  if (st.mode === 'api') {
+    src.textContent = `API 字幕加载成功（${st.count} 条）`;
+    src.classList.remove('bad');
+  } else if (st.mode === 'dom') {
+    src.textContent = '接口无字幕，已降级为网页抓取';
+    src.classList.add('bad');
+  } else {
+    src.textContent = '未识别到字幕';
+    src.classList.add('bad');
+  }
+  last.textContent = st.lastText || '—';
+}
+
+async function pollSubStatus() {
+  try {
+    renderSubStatus(await window.api.subtitleStatus());
+  } catch {
+    /* 主进程还没就绪 */
+  }
+}
+
 /** 每秒拉一次；切到别的页时也照常跑，代价只有一次 IPC */
 function startHealthPoll() {
   const tick = async () => {
@@ -791,6 +856,9 @@ function startHealthPoll() {
   };
   tick();
   setInterval(tick, 1000);
+  // 字幕状态和识别健康度一起刷
+  pollSubStatus();
+  setInterval(pollSubStatus, 1000);
 }
 
 async function syncPlaceButton() {
@@ -799,6 +867,67 @@ async function syncPlaceButton() {
   } catch (_) {
     // 老版主进程没有查询接口时保持默认文案，不影响其它设置
   }
+}
+
+function wireSubtitle() {
+  $('setSubUseApi').addEventListener('change', (e) => {
+    state.boot.settings.subtitleUseApi = e.target.checked;
+    window.api.save({ subtitleUseApi: e.target.checked });
+    toast(e.target.checked ? '优先使用官方字幕接口' : '只用网页抓取');
+    setTimeout(pollSubStatus, 600);
+  });
+
+  $('setSubMergeOverlap').addEventListener('change', (e) => {
+    state.boot.settings.subtitleMergeOverlap = e.target.checked;
+    window.api.save({ subtitleMergeOverlap: e.target.checked });
+  });
+
+  $('setSubHideOnPause').addEventListener('change', (e) => {
+    state.boot.settings.subtitleHideOnPause = e.target.checked;
+    window.api.save({ subtitleHideOnPause: e.target.checked });
+  });
+
+  $('setSubAutoOpen').addEventListener('change', (e) => {
+    state.boot.settings.subtitleAutoOpen = e.target.checked;
+    window.api.save({ subtitleAutoOpen: e.target.checked });
+    toast(e.target.checked ? '会自动点开播放器字幕' : '不会改动播放器字幕按钮');
+  });
+
+  $('setSubHideNative').addEventListener('change', (e) => {
+    state.boot.settings.subtitleHideNative = e.target.checked;
+    window.api.save({ subtitleHideNative: e.target.checked });
+    toast(e.target.checked ? '已隐藏播放器原生字幕' : '原生字幕恢复显示');
+  });
+
+  const btn = $('btnSubRefetch');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = '读取中…';
+    try {
+      const r = await window.api.subtitleRefetch();
+      if (!r || !r.ok) {
+        const why =
+          r && r.reason === 'no-video'
+            ? '还没有载入视频'
+            : r && r.reason === 'api-off'
+              ? '官方字幕接口已关闭，先打开上面的开关'
+              : '读取失败';
+        toast(why, true);
+      } else if (r.count) {
+        toast(`已读取 ${r.count} 条字幕`);
+      } else {
+        toast('该视频没有可用字幕轨，继续使用网页抓取', true);
+      }
+    } catch {
+      toast('读取失败', true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+      pollSubStatus();
+    }
+  });
 }
 
 function wireBearing() {

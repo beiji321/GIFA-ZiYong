@@ -232,7 +232,7 @@
                 </p>
 
                 <!-- 识别健康度：把「箭头不显示」从黑盒变成可读数字 -->
-                <div class="health" id="bearingHealth">
+                <div class="health">
                   <div class="health-row">
                     <span class="health-label">识别状态</span>
                     <span class="health-val" id="healthSummary">等待浮窗启动…</span>
@@ -330,6 +330,24 @@
                     <small>点击直接落到游戏里，浮窗只做显示</small>
                   </span>
                   <span class="switch"><input type="checkbox" id="setClickThrough" /></span>
+                </label>
+
+                <label class="setting" for="setCloseToTray">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>关闭启动器时最小化到托盘</strong>
+                    <small>关掉后点 X 直接退出整个程序</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setCloseToTray" /></span>
+                </label>
+
+                <label class="setting" for="setTrayClickFloat">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>托盘单击切换浮窗</strong>
+                    <small>关掉则单击显示启动器（双击始终显示启动器）</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setTrayClickFloat" /></span>
                 </label>
 
                 <div class="setting">
@@ -437,8 +455,68 @@
                 </label>
                 <p class="tip">
                   开启后会自动点一下播放器右下角的「字幕」按钮（仅当视频确实有字幕时才点）。
-                  字幕文字浮在屏幕底部，3 秒没有新字幕就淡出，鼠标可以直接穿透到游戏里。
+                  字幕文字浮在屏幕底部，按视频进度同步，鼠标可以直接穿透到游戏里。
                 </p>
+
+                <label class="setting" for="setSubUseApi">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-resume"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>优先使用官方字幕接口</strong>
+                    <small>能拿到带精确时间戳的字幕轨，暂停和拖动都准；关掉则只抓网页文字</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubUseApi" /></span>
+                </label>
+
+                <label class="setting" for="setSubHideNative">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>隐藏播放器原生字幕</strong>
+                    <small>只留字幕精灵这一条；关掉则原生小字幕和精灵同时显示</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubHideNative" /></span>
+                </label>
+
+                <label class="setting" for="setSubMergeOverlap">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>合并同一时刻的多行字幕</strong>
+                    <small>关掉后只显示最新一条，句子更短</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubMergeOverlap" /></span>
+                </label>
+
+                <label class="setting" for="setSubHideOnPause">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>暂停时隐藏字幕</strong>
+                    <small>关掉则暂停后字幕保持显示（默认）</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubHideOnPause" /></span>
+                </label>
+
+                <label class="setting" for="setSubAutoOpen">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>自动点开播放器字幕按钮</strong>
+                    <small>关掉后不改动播放器；只有官方接口能用时才有字幕</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubAutoOpen" /></span>
+                </label>
+
+                <!-- 字幕来源状态：优先官方字幕接口，拉不到时降级为网页抓取 -->
+                <div class="health">
+                  <div class="health-row">
+                    <span class="health-label">字幕来源</span>
+                    <span class="health-val" id="subSource">等待视频载入…</span>
+                  </div>
+                  <div class="health-row">
+                    <span class="health-label">最近识别</span>
+                    <span class="health-val dim" id="subLastText">—</span>
+                  </div>
+                  <div class="health-row">
+                    <button id="btnSubRefetch" class="health-btn">重新自动读取字幕</button>
+                  </div>
+                </div>
 
                 <!-- ------------------------------------------------- 字幕外观 -->
                 <div class="setting">

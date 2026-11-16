@@ -190,6 +190,11 @@ function createWebview() {
       window.api.action('fullscreen', !!(e.args && e.args[0]));
       return;
     }
+    if (e.channel === 'subtitle-time') {
+      // 官方字幕模式：访客页按播放进度报时间，主进程查表决定显示哪一句
+      window.api.subtitleTime(e.args && e.args[0]);
+      return;
+    }
     if (e.channel === 'bearing') {
       onGuestBearing(e.args && e.args[0]);
       return;
@@ -296,6 +301,14 @@ function syncSubtitleToGuest() {
     cmd: 'subtitle',
     // 只要字幕条或转向提醒有一个开着，就得抓字幕（转向判断依赖它）
     on: !!(state.boot.settings.enableSubtitleSprite || state.boot.settings.enableTurnReminder),
+    // 字幕停留时长：由访客页按**视频进度**判断过期（暂停不推进、倍速正确）
+    hold: Number(state.boot.settings.subtitleHold) || 3,
+    // 字幕精灵 + 「隐藏原生字幕」都开着时，让访客页把原生字幕变透明
+    hideNative: !!state.boot.settings.enableSubtitleSprite && state.boot.settings.subtitleHideNative !== false,
+    // 是否允许自动点开播放器字幕按钮
+    autoOpen: state.boot.settings.subtitleAutoOpen !== false,
+    // 暂停时是否隐藏字幕（DOM 兜底路径用；API 路径由主进程处理）
+    hideOnPause: state.boot.settings.subtitleHideOnPause === true,
     // 弹幕抓取和字幕抓取共用一次下发：两者都由webview-preload里的观察器负责
     danmaku: !!state.boot.settings.enableDanmakuProjection
   });
@@ -881,6 +894,11 @@ function wireUi() {
     sendVolume();
   });
 
+  // 官方字幕模式开关：主进程拉到字幕轨后通知，转发给访客页按进度报时间
+  window.api.onSubtitleApi((st) => {
+    sendPlayer({ cmd: 'subtitle-api', on: !!(st && st.on) });
+  });
+
   // 贴边吸附：主进程按窗口位置告诉我们哪几条边该亮
   window.api.onSnapEdges((payload) => {
     const edges = (payload && payload.edges) || [];
@@ -1132,24 +1150,42 @@ function nearestDirName(deg) {
  * 抽方位原子。返回 Set，元素是 '东'/'西'/'南'/'北' 的子集。
  * 七步清洗，顺序不能换（尤其「切分」必须在「归一化」之前）。
  */
-function directionAtoms(text) {
+/**
+ * 把一句话拆成「带句内位置的方位片段」。
+ *
+ *   「先往东然后往北」        → [{f:0.00, 东}, {f:0.50, 北}]
+ *   「然后来西南方向地图左下角」→ [{f:0.00, 西南}]
+ *   「我们走吧然后往东」       → [{f:0.60, 东}]
+ *
+ * fraction 是这一小段在整句里的字符位置占比，用来决定它该在什么时候点亮。
+ *
+ * 注意「再」用前瞻切分：只吃掉「再」，保留后面的「往/向/朝」。
+ * 否则「再往东北一点」会被切成「东北一点」，「往」这个上下文就丢了，
+ * 后面的上下文校验会把它当裸字直接跳过。
+ */
+function directionSegments(text) {
   const raw = String(text || '').replace(/\s+/g, '').slice(0, 500);
-  if (!raw) return new Set();
+  if (!raw) return [];
 
-  // 1) 一句里有多个指令时只看**第一个真正含方向的片段**：
-  //    「先往东然后往北」→ 东（不该被读成东北）
-  //    「然后来西南方向地图左下角」→ 西南（整句以「然后」开头，不能取空串）
-  //    「我们走吧然后往东」→ 东（第一段没方向就往后找）
-  // 注意「再」用前瞻切分：只吃掉「再」，保留后面的「往/向/朝」。
-  // 否则「再往东北一点」会被切成「东北一点」，「往」这个方向上下文就丢了，
-  // 后面第 5 步的上下文校验会把它判成裸字直接跳过。
-  const phrases = raw.split(/然后|接着|随后|再(?=往|向|朝|走|去)/);
-  for (const phrase of phrases) {
-    const hit = atomsInPhrase(phrase);
-    if (hit.size) return hit;
+  const parts = raw.split(/然后|接着|随后|再(?=往|向|朝|走|去)/);
+  const out = [];
+  let cursor = 0;
+  for (const part of parts) {
+    if (!part) continue;
+    const at = raw.indexOf(part, cursor);
+    const start = at < 0 ? cursor : at;
+    cursor = start + part.length;
+    const atoms = atomsInPhrase(part);
+    if (!atoms.size) continue;
+    out.push({
+      // 夹到 0.95：最后一段也不该排到句子结束之后
+      fraction: Math.min(0.95, start / Math.max(1, raw.length)),
+      atoms
+    });
   }
-  return new Set();
+  return out;
 }
+
 
 /** 在**单个**片段里抽方位原子（七步清洗的后六步） */
 function atomsInPhrase(text) {
@@ -1209,16 +1245,50 @@ function atomsToCompass(active) {
   return deg;
 }
 
-function detectCompassDir(text) {
-  const deg = atomsToCompass(directionAtoms(text));
-  if (deg === null) return;
+/** 每来一句新字幕就 +1；延时任务发现 token 变了就放弃，避免旧句子的方向串到新句子 */
+let compassToken = 0;
 
+/** 真正点亮一个方位（带同方位去抖） */
+function fireCompassCue(deg) {
   const now = Date.now();
   // 800ms 内同一方位不重复点亮（一句话会被字幕面板反复推送几次）
   if (Math.abs(deg - lastCompassCue.deg) < 1 && now - lastCompassCue.at < 800) return;
   lastCompassCue = { deg, at: now };
-
   window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg) });
+}
+
+/**
+ * 一句字幕里可能有多条方向指令，按句内位置依次点亮。
+ *
+ *   「先往东然后往北」→ 立刻亮东，约半句之后亮北
+ *
+ * 时长怎么估：我们没有字幕的精确 from/to（那是官方字幕接口才有的），
+ * 只能按字数估口播时长 —— 中文攻略口播约 5 字/秒，取 0.18 秒/字，
+ * 夹在 1.2~8 秒之间。误差肯定有，但「同一句里第二个方向要不要亮」
+ * 这件事本身比精确时刻更重要。
+ */
+function detectCompassDir(text) {
+  const segs = directionSegments(text);
+  if (!segs.length) return;
+
+  const token = ++compassToken;
+  const len = String(text || '').replace(/\s+/g, '').length;
+  const est = Math.min(8, Math.max(1.2, len * 0.18));
+
+  for (const seg of segs) {
+    const deg = atomsToCompass(seg.atoms);
+    if (deg === null) continue; // 自相矛盾的方向直接跳过
+    const delay = Math.round(seg.fraction * est * 1000);
+    if (delay <= 0) {
+      fireCompassCue(deg);
+      continue;
+    }
+    setTimeout(() => {
+      // 这中间来了新字幕，说明这句已经过时，别再点亮旧方向
+      if (token !== compassToken) return;
+      fireCompassCue(deg);
+    }, delay);
+  }
 }
 
 function showSubtitleSprite(payload) {

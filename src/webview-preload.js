@@ -812,8 +812,8 @@ function angDiff(a, b) {
  *   5. 上升边（逆时针一侧更白）在中轴 −45°，下降边在 +45°。两条都在最好；
  *      只剩一条（另一条被图标压住）也能定向，因为边的**极性**已经说明扇形在哪一侧
  *
- * 500 帧离线对照（scripts/vision-probe/cone-edge-regress.js）：新法输出的两条边
- * 与肉眼可见的扇形边重合；圆心偏 8px、降到 1/5 分辨率时中轴漂移 p90 仍 < 4°。
+ * 500 帧离线对照的结论：两条边与肉眼可见的扇形边重合；
+ * 圆心偏 8px、降到 1/5 分辨率时中轴漂移 p90 仍 < 4°。
  */
 
 function analyzeCone(img, size, step) {
@@ -2479,7 +2479,6 @@ const SUB_PANEL_SELECTORS = [
   '[class*="subtitle-panel"]',
   '[class*="subtitle"][class*="text"]'
 ];
-const SUB_PANEL_SEL = SUB_PANEL_SELECTORS[0];
 
 const SUBTITLE = {
   on: false,
@@ -2488,7 +2487,32 @@ const SUBTITLE = {
   clicked: false,      // 本轮视频是否已经点过
   lastText: '',
   url: location.href,
-  pollTimer: null
+  pollTimer: null,
+  /**
+   * 字幕的「视频时间」状态。
+   *
+   * 为什么不用墙上时间：字幕该显示多久取决于视频进度，不是真实时钟。
+   *   · 暂停时 currentTime 不推进 → 字幕保持不动（这正是我们要的）
+   *   · 一句说了 6 秒 → 6 秒后才收；说了 1 秒 → 1 秒就收
+   * 所以把「最后一句到达时的视频秒」记下来，用一个 250ms 的轻量 ticker
+   * 比对 currentTime 判断是否过期。
+   */
+  lastChangeAt: -1,   // 视频秒；-1 表示还没收到过
+  hold: 3,            // 秒，来自设置
+  ticker: null,
+  hidden: false,      // 已经通知过隐藏，避免重复发
+  /**
+   * 官方字幕模式。主进程成功拉到字幕轨后置 true：
+   *   · 不再抓 DOM（避免同一句话被两条路径各显示一次）
+   *   · 改按播放进度上报时间，由主进程查表决定显示哪一句
+   * 拉不到字幕轨时保持 false，退回原来的 DOM 抓取。
+   */
+  apiMode: false,
+  timeTimer: null,
+  hideNative: false,  // 是否把 B 站原生字幕变透明
+  autoOpen: true,     // 是否允许自动点开播放器字幕按钮
+  hideOnPause: false, // 暂停时是否隐藏字幕（DOM 模式用）
+  pausedHide: false   // 当前这次隐藏是不是因为暂停，恢复播放要补回去
 };
 
 /** 临时观察器（AI 语言菜单等），关闭开关时要一并断开 */
@@ -2502,9 +2526,7 @@ function subtitleButton() {
   }
 }
 
-/** 面板里当前这一句：取最后一个非空节点（B 站会同时保留多行） */
-/**
- * 播放器界面上的固定文案，不是台词。
+/** 播放器界面上的固定文案，不是台词。
  * 我们为了自动开字幕会点一次字幕按钮，B 站会弹出「字幕设置」面板，
  * 面板里的标题也命中宽泛选择器，结果被当成一句字幕显示出来 ——
  * 就是用户看到的那个黑框「字幕设置」。
@@ -2535,6 +2557,7 @@ function insidePlayerUI(el) {
   }
 }
 
+/** 面板里当前这一句：取最后一个非空节点（B 站会同时保留多行） */
 function currentSubtitleText() {
   for (const sel of SUB_PANEL_SELECTORS) {
     let nodes;
@@ -2555,47 +2578,19 @@ function currentSubtitleText() {
       if (SUB_UI_TEXTS.has(t) || insidePlayerUI(el)) continue;
       // 过短又像是按钮标签的（2 字以内且没有句子特征）也跳过
       if (t.length <= 2 && /^(字幕|设置|中文|英文|日文)$/.test(t)) continue;
-      slog(
-        `[subtitle] 命中 ${sel}，节点=`,
-        el.tagName.toLowerCase(),
-        'class=',
-        el.getAttribute('class'),
-        '文本=',
-        t
-      );
       return t;
     }
   }
   return '';
 }
 
-/** 调试：把当前面板里所有候选节点的结构打出来，方便对选择器 */
-function dumpSubtitlePanel() {
-  const report = [];
-  for (const sel of SUB_PANEL_SELECTORS) {
-    let nodes = [];
-    try {
-      nodes = [...document.querySelectorAll(sel)];
-    } catch {
-      /* ignore */
-    }
-    report.push(
-      `${sel} → ${nodes.length} 个` +
-        (nodes.length
-          ? '：' +
-            nodes
-              .slice(-3)
-              .map((n) => `${n.tagName.toLowerCase()}.${n.getAttribute('class') || ''}`)
-              .join(' | ')
-          : '')
-    );
-  }
-  slog('[subtitle] 候选选择器命中情况:', report);
-}
-
 function pushSubtitle(text) {
+  if (SUBTITLE.apiMode) return; // 官方字幕模式：文本由主进程按时间查表下发
   if (!text || text === SUBTITLE.lastText) return;
   SUBTITLE.lastText = text;
+  // 记下「这句是在视频第几秒出现的」，后续按视频进度判断过期
+  SUBTITLE.lastChangeAt = video && Number.isFinite(video.currentTime) ? video.currentTime : -1;
+  SUBTITLE.hidden = false;
   slog('[subtitle] → host:', text);
   try {
     ipcRenderer.sendToHost('subtitle', { text });
@@ -2744,16 +2739,137 @@ function waitForSubtitleButton() {
 }
 
 /** 盯字幕面板的文字变化，把当前句发给浮窗 */
+/**
+ * 按**视频进度**判断当前字幕是否该收起来。
+ *
+ * 每 250ms 一次，只在字幕开关打开时跑。代价可以忽略（一次 currentTime 读取 +
+ * 一次数值比较），换来的是暂停/拖动/倍速下字幕时长都正确。
+ */
+/**
+ * 官方字幕模式：每 200ms 把播放进度报给主进程。
+ *
+ * 为什么由访客页报而不是主进程轮询：只有这里能直接读 video.currentTime，
+ * 暂停 / 拖动 / 倍速都是天然正确的，不需要额外同步状态。
+ */
+function startSubtitleTimeFeed() {
+  if (SUBTITLE.timeTimer) return;
+  SUBTITLE.timeTimer = setInterval(() => {
+    if (!SUBTITLE.on || !SUBTITLE.apiMode || !video) return;
+    const t = video.currentTime;
+    if (!Number.isFinite(t)) return;
+    try {
+      ipcRenderer.sendToHost('subtitle-time', { t, paused: !!video.paused });
+    } catch {
+      /* 页面正在卸载 */
+    }
+  }, 200);
+}
+
+function stopSubtitleTimeFeed() {
+  if (!SUBTITLE.timeTimer) return;
+  clearInterval(SUBTITLE.timeTimer);
+  SUBTITLE.timeTimer = null;
+}
+
+function startSubtitleTicker() {
+  if (SUBTITLE.ticker) return;
+  SUBTITLE.ticker = setInterval(() => {
+    if (!SUBTITLE.on || !video) return;
+    if (SUBTITLE.apiMode) return; // 官方字幕模式下由主进程查表，这里不猜
+    if (SUBTITLE.lastChangeAt < 0) return;
+    // 拖动进度：把去重记录清掉，否则拖回同一句时会被当成「重复」而不显示
+    if (video.seeking) {
+      SUBTITLE.lastText = '';
+      SUBTITLE.lastChangeAt = -1;
+      SUBTITLE.hidden = false;
+      return;
+    }
+    // 暂停：默认保持显示（currentTime 不推进，差值也不会增长）；
+    // 开了「暂停时隐藏」就主动收起，并记下来，恢复播放时补回去。
+    if (video.paused) {
+      if (SUBTITLE.hideOnPause && !SUBTITLE.pausedHide && SUBTITLE.lastText) {
+        SUBTITLE.pausedHide = true;
+        try {
+          ipcRenderer.sendToHost('subtitle', { off: true });
+        } catch {
+          /* 页面正在卸载 */
+        }
+      }
+      return;
+    }
+    // 恢复播放：把因暂停藏起来的那句补回去（面板文字没变，不会自己重推）
+    if (SUBTITLE.pausedHide) {
+      SUBTITLE.pausedHide = false;
+      SUBTITLE.lastText = '';
+      pushSubtitle(currentSubtitleText());
+    }
+    const t = video.currentTime;
+    if (!Number.isFinite(t)) return;
+    const hold = Math.min(10, Math.max(1, Number(SUBTITLE.hold) || 3));
+    if (t - SUBTITLE.lastChangeAt <= hold) return;
+    if (SUBTITLE.hidden) return;
+    SUBTITLE.hidden = true;
+    /* 注意**不要**清 lastText：观察器下一次 tick 会把面板里同一句再推一次，
+     * lastText 被清空的话就会被当成新字幕重新显示，字幕会一闪一闪。
+     * 新字幕到达时 pushSubtitle 会自己更新 lastText 并把 hidden 置回 false。 */
+    try {
+      ipcRenderer.sendToHost('subtitle', { off: true });
+    } catch {
+      /* 页面正在卸载 */
+    }
+  }, 250);
+}
+
+function stopSubtitleTicker() {
+  if (!SUBTITLE.ticker) return;
+  clearInterval(SUBTITLE.ticker);
+  SUBTITLE.ticker = null;
+}
+
+/* ---------------------------------------------- 隐藏 B 站原生字幕
+ *
+ * 我们点开播放器字幕按钮才能抓到文字，于是屏幕上会同时出现
+ * 「播放器自己的小字幕」和「字幕精灵的大字幕」两条。
+ * 这里把原生那条**变透明**（不是 display:none）：
+ *   · 视觉上看不见了
+ *   · 元素和文本仍在，textContent 照样能读到
+ *
+ * 注意：GenshinImpactVT 没有这一步 —— 它走官方接口拿字幕，
+ * 从不打开播放器字幕按钮，所以原生字幕压根不显示。
+ * 我们的 DOM 兜底路径必须点开按钮，所以才需要这一层。
+ */
+
+const HIDE_NATIVE_STYLE_ID = 'gifa-hide-native-subtitle';
+
+function setNativeSubtitleHidden(on) {
+  const exist = document.getElementById(HIDE_NATIVE_STYLE_ID);
+  if (!on) {
+    if (exist) exist.remove();
+    return;
+  }
+  if (exist) return;
+  const el = document.createElement('style');
+  el.id = HIDE_NATIVE_STYLE_ID;
+  el.textContent = `
+    .bpx-player-subtitle-panel-text,
+    .bpx-player-subtitle-panel-text *,
+    [class*="subtitle-panel"][class*="text"],
+    [class*="subtitle-panel"][class*="text"] * {
+      color: transparent !important;
+      -webkit-text-fill-color: transparent !important;
+      text-shadow: none !important;
+      -webkit-text-stroke: 0 !important;
+      background: transparent !important;
+    }
+  `;
+  document.documentElement.appendChild(el);
+}
+
 function watchSubtitlePanel() {
   if (SUBTITLE.panelObserver) return;
-  let dumped = false;
   const tick = () => {
     if (!SUBTITLE.on) return;
     const text = currentSubtitleText();
-    if (!text && !dumped) {
-      dumped = true;
-      dumpSubtitlePanel();
-    }
     pushSubtitle(text);
   };
   SUBTITLE.panelObserver = new MutationObserver(tick);
@@ -2767,6 +2883,7 @@ function watchSubtitlePanel() {
 
 /** 断开所有观察器（关闭开关时调用，必须真的全部断开） */
 function stopSubtitle() {
+  stopSubtitleTicker();
   for (const ob of observers) {
     try {
       ob.disconnect();
@@ -2795,6 +2912,9 @@ function stopSubtitle() {
 function resetSubtitleForNewVideo() {
   SUBTITLE.lastText = '';
   SUBTITLE.clicked = false;
+  SUBTITLE.lastChangeAt = -1;
+  SUBTITLE.hidden = false;
+  SUBTITLE.pausedHide = false;
   if (!SUBTITLE.on) return;
   waitForSubtitleButton();
   watchSubtitlePanel();
@@ -2804,33 +2924,23 @@ function resetSubtitleForNewVideo() {
  * 调试用：把当前页面里所有 class 含 "subtitle" 的元素打出来，
  * 方便对照 B 站实际 DOM 调整选择器（F12 控制台可直接看）。
  */
-function dumpSubtitleClasses(tag) {
-  try {
-    const found = new Set();
-    for (const el of document.querySelectorAll('*')) {
-      const cls = el.getAttribute && el.getAttribute('class');
-      if (!cls || !/subtitle/i.test(cls)) continue;
-      for (const c of cls.split(/\s+/)) {
-        if (/subtitle/i.test(c)) found.add(`${c} <${el.tagName.toLowerCase()}>`);
-      }
-    }
-    slog(`[subtitle][${tag}] 含 subtitle 的 class 共 ${found.size} 个：`, [...found]);
-    const btn = subtitleButton();
-    slog(
-      `[subtitle][${tag}] 主按钮=${btn ? '存在' : '不存在'}`,
-      `面板节点=${document.querySelectorAll(SUB_PANEL_SEL).length}`,
-      `语言项=${document.querySelectorAll(SUB_LANG_SEL).length}`,
-      `AI项=${document.querySelectorAll('[data-lan="ai-zh"]').length}`
-    );
-  } catch (err) {
-    slog('[subtitle] dump 失败', err && err.message);
-  }
-}
 
-function setSubtitle(on) {
-  SUBTITLE.on = !!on;
+function setSubtitle(opts) {
+  const on = !!opts.on;
+  if (Number.isFinite(Number(opts.hold)) && Number(opts.hold) > 0) {
+    SUBTITLE.hold = Math.min(10, Math.max(1, Number(opts.hold)));
+  }
+  // 只有字幕精灵 + 开关都开着才藏原生字幕：只开转向提醒时不该动播放器
+  if (opts.hideNative !== undefined) SUBTITLE.hideNative = !!opts.hideNative;
+  if (opts.autoOpen !== undefined) SUBTITLE.autoOpen = !!opts.autoOpen;
+  if (opts.hideOnPause !== undefined) SUBTITLE.hideOnPause = !!opts.hideOnPause;
+
+  SUBTITLE.on = on;
   if (!on) {
     stopSubtitle();
+    stopSubtitleTicker();
+    stopSubtitleTimeFeed();
+    setNativeSubtitleHidden(false);
     try {
       ipcRenderer.sendToHost('subtitle', { text: '', off: true });
     } catch {
@@ -2838,14 +2948,15 @@ function setSubtitle(on) {
     }
     return;
   }
+  startSubtitleTicker();
+  setNativeSubtitleHidden(SUBTITLE.hideNative);
   // www 是常规视频页，player 是嵌入播放器页；两个都可能带字幕按钮
   if (!/(^|\.)bilibili\.com$/i.test(location.hostname)) return;
   SUBTITLE.url = location.href;
-  dumpSubtitleClasses('enable');
-  waitForSubtitleButton();
-  watchSubtitlePanel();
+
+  // SPA 换片不一定有导航事件：轮询 URL 兜底，变了就重来一轮。
+  // 这条和字幕来源无关，API / DOM 两种模式都要跑。
   if (!SUBTITLE.pollTimer) {
-    // SPA 换片不一定有导航事件：轮询 URL 兜底，变了就重来一轮
     SUBTITLE.pollTimer = setInterval(() => {
       if (!SUBTITLE.on) return;
       if (location.href === SUBTITLE.url) return;
@@ -2853,6 +2964,12 @@ function setSubtitle(on) {
       resetSubtitleForNewVideo();
     }, 1000);
   }
+  // 官方字幕模式已经有数据了，再点按钮只会让原生字幕闪一下，白挂一个观察器
+  if (SUBTITLE.apiMode) return;
+  // 用户明确关掉了自动点开：不动播放器，只等官方接口接管
+  if (!SUBTITLE.autoOpen) return;
+  waitForSubtitleButton();
+  watchSubtitlePanel();
 }
 
 function apply(msg) {
@@ -2891,7 +3008,36 @@ function apply(msg) {
     return;
   }
   if (msg.cmd === 'subtitle') {
-    setSubtitle(!!msg.on);
+    setSubtitle(msg);
+    return;
+  }
+  if (msg.cmd === 'subtitle-api') {
+    const on = !!msg.on;
+    if (on === SUBTITLE.apiMode) return;
+    SUBTITLE.apiMode = on;
+    if (on) {
+      stopSubtitleTicker();
+      startSubtitleTimeFeed();
+      // 已经有接口字幕了，别再点播放器按钮、别再挂面板观察器
+      if (SUBTITLE.btnObserver) {
+        SUBTITLE.btnObserver.disconnect();
+        SUBTITLE.btnObserver = null;
+      }
+      if (SUBTITLE.panelObserver) {
+        SUBTITLE.panelObserver.disconnect();
+        SUBTITLE.panelObserver = null;
+      }
+    } else {
+      stopSubtitleTimeFeed();
+      if (SUBTITLE.on) {
+        startSubtitleTicker();
+        // 退回 DOM 抓取：这时才需要点按钮和观察面板
+        if (SUBTITLE.autoOpen) {
+          waitForSubtitleButton();
+          watchSubtitlePanel();
+        }
+      }
+    }
     return;
   }
   if (msg.cmd === 'bearing') {

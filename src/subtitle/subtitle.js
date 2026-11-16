@@ -111,7 +111,11 @@ function applyConfig(cfg) {
 
   // 停留时长 / 最大宽度 / 字重 / 圆角
   const hold = Number(cfg.hold);
-  holdSeconds = Number.isFinite(hold) && hold > 0 ? Math.min(10, Math.max(1, hold)) : 3;
+  /* hold <= 0 = 交给访客页按**视频时间**驱动隐藏。
+   * 为什么改成外部驱动：原来的固定 3 秒是按墙上时间算的 ——
+   * 视频暂停时计时器照跑，一句还没说完的字幕会被吃掉；
+   * 而一句说了 6 秒的字幕又会在第 3 秒提前消失。 */
+  holdSeconds = Number.isFinite(hold) && hold > 0 ? Math.min(10, Math.max(1, hold)) : 0;
 
   const maxW = Number(cfg.maxWidth);
   root.style.setProperty('--sub-max-width', `${Number.isFinite(maxW) ? Math.min(100, Math.max(30, maxW)) : 88}vw`);
@@ -129,6 +133,12 @@ function showText(text) {
   el.textContent = text;
   el.classList.add('show');
   clearTimeout(hideTimer);
+  if (holdSeconds <= 0) {
+    /* 外部驱动模式：不按墙上时间倒计时，等访客页发 off。
+     * 留一条 30 秒的兜底，万一 off 丢了（视频结束、页面崩）也不会永远挂着。 */
+    hideTimer = setTimeout(() => el.classList.remove('show'), 30000);
+    return;
+  }
   hideTimer = setTimeout(() => el.classList.remove('show'), holdSeconds * 1000);
 }
 

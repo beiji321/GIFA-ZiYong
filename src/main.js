@@ -5,7 +5,19 @@
  * 职责：无边框置顶窗口、全局快捷键、B 站视频解析、设置持久化
  */
 
-const { app, BrowserWindow, globalShortcut, ipcMain, powerSaveBlocker, screen, session, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  globalShortcut,
+  ipcMain,
+  nativeImage,
+  powerSaveBlocker,
+  screen,
+  session,
+  shell
+} = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync, spawn } = require('node:child_process');
@@ -163,7 +175,6 @@ function relaunchElevated() {
  */
 const DATA_DIR_NAME = 'data';
 const INSTALLED_FLAG = 'installed.flag';
-const PORTABLE_FLAG = 'portable.flag';
 const MIGRATE_FROM_FILE = 'migrate-from.txt';
 const MIGRATED_FLAG = '.migrated';
 // settings.json 内含 ROI 标定、窗口位置、观看记录；两张 png 是识别调试截图。
@@ -463,7 +474,6 @@ const DEFAULT_SETTINGS = {
   opacity: 1,
   mode: 'web',
   volume: 100,
-  muxed: false,
   lastText: '',
   lastPart: 1,
   // 「上次看到」：光有 lastText/lastPart 不够 —— 用户记不住的是「哪个视频、第几 P」，
@@ -474,8 +484,25 @@ const DEFAULT_SETTINGS = {
   lastWatchedAt: 0,
   // 下次启动直接把浮窗起来继续播，不用每次重粘链接
   resumeOnLaunch: true,
+  // 关闭启动器时最小化到托盘（false = 点 X 直接退出整个程序）。
+  // 托盘图标在某些机器上不显示，那种情况必须能关掉这项，否则窗口一藏就找不回来。
+  closeToTray: true,
+  // 托盘单击行为：'launcher' 显示启动器（默认） | 'float' 切换浮窗
+  trayClickAction: 'launcher',
   // 字幕精灵：自动点开 B 站播放器字幕并把文本镜像到浮窗底部
   enableSubtitleSprite: false,
+  // 优先用官方字幕接口（带精确时间戳，暂停/拖动都准）。
+  // 关掉就只走 DOM 抓取。
+  subtitleUseApi: true,
+  // 隐藏播放器原生字幕：避免「原生小字幕 + 精灵大字幕」两条同时出现。
+  // 只影响显示，不影响抓取（元素还在 DOM 里）。
+  subtitleHideNative: true,
+  // 同一时刻有多行字幕时合并显示；关掉只取最新一条
+  subtitleMergeOverlap: true,
+  // 暂停时隐藏字幕；默认保持显示
+  subtitleHideOnPause: false,
+  // 自动点开播放器字幕按钮。关掉后不改动播放器，只有官方接口能给字幕
+  subtitleAutoOpen: true,
   // 视觉绿弧（镜头朝向）：低画质下极易乱飘，默认关闭。
   // 关掉时访客页直接不跑扇形识别，省 CPU。
   enableVisionGreenArc: false,
@@ -1157,6 +1184,100 @@ function createWindow() {
   });
 }
 
+/* ---------------------------------------------------------------- 系统托盘
+ *
+ * 设计参考 GenshinImpactVT 的 window_controls.py（QSystemTrayIcon + 右键菜单）。
+ * 图标用 build/icon.ico，菜单里带「关闭启动器时最小化到托盘」的勾选项。
+ *
+ * 注意：托盘必须**以管理员身份运行**才会显示 —— Shell_NotifyIcon 要往
+ * Explorer 的托盘窗口发消息，非提权进程发不过去，而且失败是静默的
+ * （Tray 创建成功但托盘区什么都不出现）。正式包 manifest 是
+ * requireAdministrator，所以打包版没这个问题；开发态请用 start_dev.bat。
+ */
+
+let tray = null;
+
+function trayIcon() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.ico'));
+  if (icon.isEmpty()) console.log('图标加载失败');
+  return icon;
+}
+
+/** 把启动器叫到前台（不存在就重建） */
+function showConsoleWindow() {
+  if (consoleWin && !consoleWin.isDestroyed()) {
+    if (consoleWin.isMinimized()) consoleWin.restore();
+    consoleWin.show();
+    consoleWin.focus();
+    return;
+  }
+  createConsole();
+}
+
+/** 托盘菜单里的「退出软件」：绕开 closeToTray，直接收干净 */
+function quitFromTray() {
+  quittingFromConsole = true;
+  for (const w of [win, overlayWin, loginWin, subtitleWin, danmakuWin, consoleWin]) {
+    try {
+      if (w && !w.isDestroyed()) w.destroy();
+    } catch {
+      /* 关窗失败不影响退出 */
+    }
+  }
+  app.quit();
+}
+
+function rebuildTrayMenu() {
+  if (!tray || tray.isDestroyed()) return;
+  const floatAlive = !!(win && !win.isDestroyed());
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示启动器', click: () => showConsoleWindow() },
+      {
+        label: floatAlive ? '隐藏 / 显示浮窗' : '浮窗未启动',
+        enabled: floatAlive,
+        click: () => toggleVisible()
+      },
+      { type: 'separator' },
+      {
+        label: '关闭启动器时最小化到托盘',
+        type: 'checkbox',
+        checked: settings.closeToTray !== false,
+        click: (item) => {
+          settings.closeToTray = !!item.checked;
+          persist();
+          // 控制台里也有同一个开关，改完要同步过去，否则两边显示不一致
+          broadcast('settings:changed', settings);
+        }
+      },
+      { type: 'separator' },
+      { label: '退出软件', click: () => quitFromTray() }
+    ])
+  );
+}
+
+function createTray() {
+  if (tray && !tray.isDestroyed()) return tray;
+  tray = new Tray(trayIcon());
+  tray.setToolTip('原神跟跑助手 · 单击显示启动器');
+  rebuildTrayMenu();
+  tray.on('click', () => {
+    if (settings.trayClickAction === 'float') toggleVisible();
+    else showConsoleWindow();
+  });
+  tray.on('double-click', () => showConsoleWindow());
+  return tray;
+}
+
+function destroyTray() {
+  if (!tray || tray.isDestroyed()) {
+    tray = null;
+    return;
+  }
+  tray.destroy();
+  tray = null;
+}
+
 /* ---------------------------------------------------------------- 启动器 */
 
 function sendTo(w, channel, payload) {
@@ -1170,7 +1291,10 @@ function broadcast(channel, payload) {
 }
 
 function notifyFloatState() {
-  sendTo(consoleWin, 'float:state', { running: !!(win && !win.isDestroyed()) });
+  const running = !!(win && !win.isDestroyed());
+  sendTo(consoleWin, 'float:state', { running });
+  // 托盘菜单里的「隐藏/显示浮窗」要跟着浮窗是否存在切换可用状态
+  rebuildTrayMenu();
 }
 
 /** 启动器窗口：16:9、居中、按工作区留边等比缩放（小屏/125% 缩放也不出界） */
@@ -1247,6 +1371,15 @@ function createConsole() {
   consoleWin.once('ready-to-show', () => {
     consoleWin.show();
     notifyFloatState();
+  });
+
+  /* 关启动器：有托盘且开关打开时收进托盘，否则走原来的「退出整个应用」。
+   * 用 close 而不是 closed，因为要在窗口真正销毁前拦住它。 */
+  consoleWin.on('close', (e) => {
+    if (quittingFromConsole) return;
+    if (settings.closeToTray === false) return;
+    e.preventDefault();
+    consoleWin.hide();
   });
 
   consoleWin.on('closed', () => {
@@ -1739,6 +1872,111 @@ function applySnap() {
   return true;
 }
 
+/* ------------------------------------------------------------ 字幕数据源
+ *
+ * 走官方播放器接口拿字幕轨，再拉 CDN 上的 JSON：
+ *   /x/player/wbi/v2?bvid=..&cid=..  → data.subtitle.subtitles[]（含 subtitle_url）
+ *   <subtitle_url>                   → { body: [{from, to, content}] }
+ *
+ * 为什么不抓 DOM：
+ *   · cue 自带精确的 from/to，字幕和播放进度严格对齐，暂停 / 拖动天然正确
+ *   · 同一时刻的多行字幕可以合并显示
+ *   · 不依赖播放器 DOM 结构，B站改版不会失效
+ * DOM 抓取保留为兜底：没有字幕轨 / 未登录 / 接口变更时仍然能用。
+ */
+
+let subtitleCues = [];   // [{from, to, text}]，按 from 升序
+let lastApiSubtitleText = ''; // 上一次推给字幕窗的文本，避免每帧重复下发
+let lastDomSubtitleText = ''; // DOM 抓取模式下最后一句话，供控制台显示
+let subtitleCid = 0;     // 与 subtitleCues 对应的 cid
+let subtitleLoading = 0; // 正在请求的 cid，防并发重复拉
+/**
+ * 换片代数。每次载入新视频 +1；请求返回时若代数已变，说明这个结果属于
+ * 上一个视频，必须丢掉 —— 否则快速切 P 时，先发出的旧请求晚回来，
+ * 会把新视频的字幕覆盖成上一个视频的。
+ */
+let subtitleGen = 0;
+
+async function fetchSubtitleCues(bvid, cid, gen) {
+  if (!cid || !bvid) return [];
+  if (subtitleCid === cid && subtitleCues.length) return subtitleCues;
+  if (subtitleLoading === cid) return subtitleCues;
+  subtitleLoading = cid;
+  const myGen = gen === undefined ? subtitleGen : gen;
+  /** 只有代数没变才落地；返回 false 表示这是过期结果 */
+  const commit = (cues) => {
+    if (myGen !== subtitleGen) return false;
+    subtitleCues = cues;
+    subtitleCid = cid;
+    return true;
+  };
+  try {
+    const res = await biliFetch(
+      `https://api.bilibili.com/x/player/wbi/v2?bvid=${encodeURIComponent(bvid)}&cid=${cid}`
+    );
+    const json = await res.json();
+    const data = (json && json.data) || {};
+    const subs = data.subtitle && data.subtitle.subtitles;
+    if (!Array.isArray(subs) || !subs.length) {
+      // 分清两种「没有字幕」：没登录 vs 这个视频本来就没字幕轨
+      console.log(
+        '[subtitle] 接口没有字幕轨（need_login_subtitle=%s），回退 DOM 抓取',
+        !!data.need_login_subtitle
+      );
+      return commit([]) ? [] : null;
+    }
+    // 优先中文正式轨，其次 AI 中文，最后任意含 zh 的
+    const pick =
+      subs.find((x) => /^zh(-Hans)?$/i.test(x.lan || '')) ||
+      subs.find((x) => /^ai-zh/i.test(x.lan || '')) ||
+      subs.find((x) => /zh/i.test(x.lan || ''));
+    if (!pick || !pick.subtitle_url) {
+      return commit([]) ? [] : null;
+    }
+    let url = String(pick.subtitle_url);
+    if (url.startsWith('//')) url = 'https:' + url;
+    const r2 = await biliFetch(url, { Accept: 'application/json' });
+    const doc = await r2.json();
+    const body = doc && Array.isArray(doc.body) ? doc.body : [];
+    const cues = [];
+    for (const row of body) {
+      if (!row) continue;
+      const from = Number(row.from);
+      const to = Number(row.to);
+      const text = String(row.content || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || !text) continue;
+      cues.push({ from, to, text: text.slice(0, 500) });
+    }
+    cues.sort((a, b) => a.from - b.from);
+    if (!commit(cues)) return null; // 换片了，这个结果作废
+    console.log('[subtitle] 已加载字幕 %d 条（cid=%s，轨=%s）', cues.length, cid, pick.lan);
+    return cues;
+  } catch (err) {
+    console.warn('[subtitle] 拉取失败，回退到 DOM 抓取：', err.message);
+    return commit([]) ? [] : null;
+  } finally {
+    subtitleLoading = 0;
+  }
+}
+
+/**
+ * 取某一时刻的全部字幕。
+ * 这里就是「重叠字幕合并」：把所有 from <= t < to 的 cue 都取出来，
+ * 去重后按顺序拼接 —— 同时有两行对白时两行都会显示。
+ */
+function subtitleAt(t) {
+  const out = [];
+  for (const c of subtitleCues) {
+    if (c.from > t) break; // 已按 from 升序，后面的更晚
+    if (t < c.to) out.push(c.text);
+  }
+  // 合并：同一时刻的多行对白拼成一行；不合并：只取最新一条
+  if (settings.subtitleMergeOverlap === false) return out[out.length - 1].slice(0, 500);
+  return [...new Set(out)].join(' ').slice(0, 500);
+}
+
 /* ---------------------------------------------------------- 字幕层窗口 */
 
 /**
@@ -1873,17 +2111,6 @@ function destroySubtitleWindow() {
 
 /* -------------------------------------------------- 字幕外观配置与下发 */
 
-const SUBTITLE_STYLE_DEFAULTS = {
-  subtitleScale: 100,
-  subtitleColor: '#ffffff',
-  subtitleStroke: 'outline',
-  subtitlePos: 'center',
-  subtitleOffset: 230,
-  subtitleBgOpacity: 70,
-  subtitleKeepRatio: true,
-  subtitleFade: true
-};
-
 const SUB_POS_LIST = ['center', 'left', 'right'];
 const SUB_STROKE_LIST = ['none', 'outline', 'shadow'];
 
@@ -1926,11 +2153,14 @@ function subtitleStyleSnapshot() {
     color: settings.subtitleColor,
     stroke: settings.subtitleStroke,
     pos: settings.subtitlePos,
+    // hold 传 0：字幕窗不再按墙上时间自动隐藏，改由主进程按视频进度下发 off。
+    // 否则暂停时计时器照跑，一句没说完的字幕会被提前吃掉。
+    // 真正的停留时长 subtitleHold 由访客页的 ticker 使用，不经这里。
+    hold: 0,
     offset: settings.subtitleOffset,
     bgOpacity: settings.subtitleBgOpacity,
     keepRatio: settings.subtitleKeepRatio,
     fade: settings.subtitleFade,
-    hold: settings.subtitleHold,
     maxWidth: settings.subtitleMaxWidth,
     weight: settings.subtitleWeight,
     radius: settings.subtitleRadius
@@ -2271,7 +2501,6 @@ function setBearingEnabled(on) {
     lastBearing = null;
   }
 
-  if (win && !win.isDestroyed()) win.webContents.send('bearing:state', settings.bearing);
   persist();
   // 箭头开/关会影响弹幕层的挖空区域
   pushDanmakuConfig();
@@ -2727,7 +2956,6 @@ function registerIpc() {
     };
   });
 
-  ipcMain.handle('bili:nav', () => fetchNav());
 
   /* ---- 提权重启：游戏内热键要管理员身份才行（UIPI），由用户按需触发 ---- */
   ipcMain.handle('app:relaunch-elevated', async () => {
@@ -2745,6 +2973,27 @@ function registerIpc() {
 
   /* ---- 字幕精灵：浮窗收到访客页文本后转给全屏字幕层 ---- */
 
+  /* ---- 官方字幕：按播放进度查表（API 模式） ---- */
+  ipcMain.on('subtitle:time', (_e, payload = {}) => {
+    if (!settings.enableSubtitleSprite) return;
+    if (!subtitleCues.length) return; // 没有接口字幕，走 DOM 抓取那条路
+    // 暂停时按开关决定要不要清屏
+    if (payload && payload.paused && settings.subtitleHideOnPause) {
+      if (lastApiSubtitleText) {
+        lastApiSubtitleText = '';
+        hideSubtitleText();
+      }
+      return;
+    }
+    const t = Number(payload && payload.t);
+    if (!Number.isFinite(t)) return;
+    const text = subtitleAt(t);
+    if (text === lastApiSubtitleText) return;
+    lastApiSubtitleText = text;
+    if (text) showSubtitleText(text);
+    else hideSubtitleText();
+  });
+
   ipcMain.on('subtitle:update', (_e, payload = {}) => {
     if (!settings.enableSubtitleSprite) {
       hideSubtitleText();
@@ -2756,7 +3005,41 @@ function registerIpc() {
     }
     const text = String((payload && payload.text) || '').trim();
     if (!text) return;
+    lastDomSubtitleText = text;
     showSubtitleText(text);
+  });
+
+  /* ---- 字幕状态：控制台「B站设置」页轮询 ---- */
+  ipcMain.handle('subtitle:status', () => {
+    const api = subtitleCues.length > 0;
+    return {
+      mode: api ? 'api' : lastDomSubtitleText ? 'dom' : 'none',
+      count: subtitleCues.length,
+      cid: subtitleCid,
+      // 官方字幕模式取主进程查表的结果，DOM 模式取访客页推上来的最后一句
+      lastText: api ? lastApiSubtitleText : lastDomSubtitleText,
+      enabled: !!settings.enableSubtitleSprite,
+      apiEnabled: settings.subtitleUseApi !== false
+    };
+  });
+
+  /* ---- 手动重读：丢掉缓存再请求一次官方字幕轨 ---- */
+  ipcMain.handle('subtitle:refetch', async () => {
+    if (!settings.subtitleUseApi) return { ok: false, reason: 'api-off' };
+    const bvid = settings.lastVideoId;
+    const cid = currentCid;
+    if (!bvid || !cid) return { ok: false, reason: 'no-video' };
+    subtitleCid = 0;
+    subtitleCues = [];
+    subtitleGen += 1;
+    const gen = subtitleGen;
+    lastApiSubtitleText = '';
+    const cues = await fetchSubtitleCues(bvid, cid, gen);
+    if (cues === null || gen !== subtitleGen) return { ok: false, reason: 'stale' };
+    if (win && !win.isDestroyed()) {
+      sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+    }
+    return { ok: true, count: cues.length };
   });
 
   /* ---- 全屏弹幕：浮窗把访客页抓到的一条弹幕转给弹幕层 ---- */
@@ -2872,8 +3155,7 @@ function registerIpc() {
     persist();
     pushDanmakuConfig();
     pushRadarConfig();
-    if (win && !win.isDestroyed()) win.webContents.send('bearing:state', settings.bearing);
-  });
+    });
 
   /* ---- 字幕点亮的绝对方位：浮窗解析出「东北/往东/右下角」后转给 overlay ---- */
   ipcMain.on('compass:cue', (_e, cue) => {
@@ -2992,6 +3274,7 @@ function registerIpc() {
       settings.enableVisionGreenArc = !!patch.enableVisionGreenArc;
     }
     if (patch.clickThrough !== undefined) setClickThrough(patch.clickThrough);
+    if (patch.closeToTray !== undefined) settings.closeToTray = !!patch.closeToTray;
     if (patch.snapAdjustment !== undefined) {
       settings.snapAdjustment = Math.max(-20, Math.min(20, Math.round(Number(patch.snapAdjustment) || 0)));
       // 窗口正好贴着边时立刻按新值重贴，做到「边拖滑块边看效果」
@@ -3006,6 +3289,51 @@ function registerIpc() {
       settings.enableSubtitleSprite = !!patch.enableSubtitleSprite;
       // 转向提醒还开着的话，字幕层窗口要留着给大箭头用
       if (!settings.enableSubtitleSprite && !settings.enableTurnReminder) hideSubtitleText();
+      // 视频已经载入后才打开字幕开关：补拉一次官方字幕轨
+      if (settings.enableSubtitleSprite && settings.subtitleUseApi && settings.lastVideoId && currentCid) {
+        subtitleGen += 1;
+        const gen = subtitleGen;
+        fetchSubtitleCues(settings.lastVideoId, currentCid, gen).then((cues) => {
+          if (!cues || gen !== subtitleGen) return;
+          if (win && !win.isDestroyed()) {
+            sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+          }
+        });
+      }
+    }
+    if (patch.subtitleUseApi !== undefined) {
+      settings.subtitleUseApi = !!patch.subtitleUseApi;
+      // 关掉接口：清缓存，让访客页回到 DOM 抓取
+      if (!settings.subtitleUseApi) {
+        subtitleCues = [];
+        subtitleCid = 0;
+        lastApiSubtitleText = '';
+        sendTo(win, 'subtitle:api', { on: false, count: 0 });
+      } else if (settings.enableSubtitleSprite && settings.lastVideoId && currentCid) {
+        // 打开接口：立刻补拉一次
+        subtitleCid = 0;
+        subtitleGen += 1;
+        const gen = subtitleGen;
+        fetchSubtitleCues(settings.lastVideoId, currentCid, gen).then((cues) => {
+          if (!cues || gen !== subtitleGen) return;
+          sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+        });
+      }
+    }
+    if (patch.subtitleHideNative !== undefined) {
+      settings.subtitleHideNative = !!patch.subtitleHideNative;
+    }
+    if (patch.subtitleMergeOverlap !== undefined) {
+      settings.subtitleMergeOverlap = !!patch.subtitleMergeOverlap;
+    }
+    if (patch.subtitleHideOnPause !== undefined) {
+      settings.subtitleHideOnPause = !!patch.subtitleHideOnPause;
+    }
+    if (patch.subtitleAutoOpen !== undefined) {
+      settings.subtitleAutoOpen = !!patch.subtitleAutoOpen;
+    }
+    if (patch.trayClickAction !== undefined) {
+      settings.trayClickAction = patch.trayClickAction === 'float' ? 'float' : 'launcher';
     }
     if (patch.subtitle) {
       applySubtitleStylePatch(patch.subtitle);
@@ -3270,6 +3598,23 @@ function registerIpc() {
     resetDanmakuWindow();
     hideSubtitleText();
     pushTurnHint(null);
+    // 字幕：清掉上一个视频的 cue，再按新 cid 拉官方字幕轨
+    subtitleCues = [];
+    subtitleCid = 0;
+    subtitleGen += 1;
+    const gen = subtitleGen;
+    lastApiSubtitleText = '';
+    lastDomSubtitleText = '';
+    if (settings.enableSubtitleSprite && settings.subtitleUseApi && cid && id) {
+      fetchSubtitleCues(id, cid, gen).then((cues) => {
+        if (!cues || gen !== subtitleGen) return; // 过期结果，丢掉
+        if (win && !win.isDestroyed()) {
+          sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+        }
+      });
+    } else if (win && !win.isDestroyed()) {
+      sendTo(win, 'subtitle:api', { on: false, count: 0 });
+    }
     if (settings.enableDanmakuProjection) {
       resetDanmakuWindow();
       if (cid) fetchDanmakuList(cid);
@@ -3296,13 +3641,7 @@ if (!gotLock) {
 } else {
   app.on('second-instance', () => {
     // 再次启动 exe 时把启动器叫回来，而不是只动浮窗
-    if (consoleWin && !consoleWin.isDestroyed()) {
-      if (consoleWin.isMinimized()) consoleWin.restore();
-      consoleWin.show();
-      consoleWin.focus();
-    } else {
-      createConsole();
-    }
+    showConsoleWindow();
   });
 
   app.whenReady().then(async () => {
@@ -3323,6 +3662,7 @@ if (!gotLock) {
       /* ignore */
     }
     registerIpc();
+    createTray(); // 先建托盘：即使启动器被收进托盘，也要有个入口能叫回来
     createConsole(); // 先出启动器，配置好了再点「启动跟跑」
 
     // 外接屏拔插 / 改分辨率：字幕层要重新铺满，否则会只盖住半个屏幕
@@ -3361,6 +3701,7 @@ if (!gotLock) {
 
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', () => {
+    destroyTray();
     // 退出路径上再同步刷一次盘，兜住「主窗已销毁、close 事件没赶上」的情况
     persistNow();
     globalShortcut.unregisterAll();
