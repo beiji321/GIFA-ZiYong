@@ -3090,6 +3090,24 @@ function apply(msg) {
       video.volume = clamp(Number(msg.value) || 0, 0, 1);
       video.muted = video.volume === 0;
       break;
+    case 'playback': {
+      // 长按加速优先：temporaryPlaybackRate 有值时用它，松开回到常规倍速
+      const rate = Number(
+        msg.temporaryPlaybackRate != null ? msg.temporaryPlaybackRate : msg.playbackRate
+      );
+      if (Number.isFinite(rate) && rate > 0) {
+        try {
+          video.playbackRate = clamp(rate, 0.25, 3);
+        } catch {
+          /* 部分直播流不允许改倍速 */
+        }
+      }
+      if (Number.isFinite(Number(msg.volume))) {
+        video.volume = clamp(Number(msg.volume) / 100, 0, 1);
+      }
+      if (typeof msg.muted === 'boolean') video.muted = msg.muted;
+      break;
+    }
     default:
       break;
   }

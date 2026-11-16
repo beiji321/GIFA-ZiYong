@@ -368,6 +368,10 @@ function fillSettings(s) {
   $('setPin').checked = !!s.pinned;
   $('setClickThrough').checked = s.clickThrough === true;
   $('setCloseToTray').checked = s.closeToTray !== false;
+  $('setHoverFade').checked = s.hoverFadeEnabled !== false;
+  $('setMuted').checked = s.muted === true;
+  $('setPlaybackRate').value = String(s.playbackRate ?? 1);
+  $('setHoldRate').value = String(s.holdPlaybackRate ?? 2);
   $('setTrayClickFloat').checked = s.trayClickAction === 'float';
   // 老 settings.json 没这个字段，默认视为开启
   $('setResumeOnLaunch').checked = s.resumeOnLaunch !== false;
@@ -516,6 +520,31 @@ function wireSettings() {
   });
 
   $('setPin').addEventListener('change', (e) => window.api.action('pin', e.target.checked));
+
+  $('setHoverFade').addEventListener('change', (e) => {
+    state.boot.settings.hoverFadeEnabled = e.target.checked;
+    window.api.save({ hoverFadeEnabled: e.target.checked });
+    toast(e.target.checked ? '纯净模式下会自动淡出' : '纯净模式下保持不透明');
+  });
+
+  $('setMuted').addEventListener('change', (e) => {
+    state.boot.settings.muted = e.target.checked;
+    window.api.playbackUpdate({ muted: e.target.checked });
+  });
+
+  $('setPlaybackRate').addEventListener('change', (e) => {
+    const rate = Number(e.target.value);
+    state.boot.settings.playbackRate = rate;
+    window.api.playbackUpdate({ playbackRate: rate });
+    toast(`常规倍速 ${rate}×`);
+  });
+
+  $('setHoldRate').addEventListener('change', (e) => {
+    const rate = Number(e.target.value);
+    state.boot.settings.holdPlaybackRate = rate;
+    window.api.save({ holdPlaybackRate: rate });
+    toast(`长按倍速 ${rate}×`);
+  });
 
   $('setTrayClickFloat').addEventListener('change', (e) => {
     const action = e.target.checked ? 'float' : 'launcher';

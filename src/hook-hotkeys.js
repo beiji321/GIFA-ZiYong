@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 系统级热键钩子（鼠标侧键 + 单键）。
+ * 系统级热键钩子（鼠标侧键 + 单键 + 倍速动作）。
  *
  * 为什么不用 Electron 的 globalShortcut 处理这两类：
  *
@@ -14,26 +14,26 @@
  * 事件照常继续传递给前台程序，游戏里的同名按键、浏览器里的侧键前进/后退都不受影响。
  * 代价是「不拦截」，因此单键仍然会在游戏里生效 —— 界面里已经写清楚了。
  *
- * 其余带修饰键的组合（Alt+Space 等）继续交给 globalShortcut，那条路更稳，
- * 也不会被输入法之类的东西干扰。
+ * 倍速动作也走钩子：长按动作需要配对释放，循环动作需要按物理按键去重。
+ * 其余带修饰键的组合（Alt+Space 等）继续交给 globalShortcut。
  */
 
 const MOUSE_ACC = /^Mouse([45])$/i;
-
-/**
- * 「按住鼠标右键 + 侧键」的组合，加速器写法：RMB+Mouse4 / RMB+Mouse5。
- * 单独一个侧键仍是 Mouse4 / Mouse5，两者可以同时存在且互不干扰。
- */
-const RMB_MOUSE_ACC = /^(?:RMB|RightMouse|MouseRight)\+Mouse([45])$/i;
+const HOOK_ACTIONS = new Set(['holdSpeed', 'cycleSpeed']);
+const MODIFIER_OF = {
+  ctrl: 1, control: 1, commandorcontrol: 1, cmdorctrl: 1,
+  alt: 2, option: 2, shift: 4,
+  super: 8, meta: 8, command: 8, cmd: 8, win: 8, windows: 8
+};
+const MODIFIER_KEYS = {
+  1: ['Ctrl', 'CtrlRight'],
+  2: ['Alt', 'AltRight'],
+  4: ['Shift', 'ShiftRight'],
+  8: ['Meta', 'MetaRight']
+};
 
 /** uiohook 的 button 编码：1=左 2=右 3=中 4=侧键后退 5=侧键前进 */
 const BUTTON_OF = { Mouse4: 4, Mouse5: 5 };
-
-/**
- * 右键是否按着。仅用于判断「右键+侧键」，**不拦截**右键：
- * uiohook 是纯被动监听，事件照常传给前台程序，游戏里的右键瞄准/交互完全不受影响。
- */
-let isRightDown = false;
 
 /** Electron 加速器名 → uiohook 键名（其余同名直接用） */
 const KEY_ALIAS = {
@@ -43,6 +43,9 @@ const KEY_ALIAS = {
   Down: 'ArrowDown',
   Esc: 'Escape',
   Return: 'Enter',
+  Scrolllock: 'ScrollLock',
+  Capslock: 'CapsLock',
+  Numlock: 'NumLock',
   '-': 'Minus',
   '=': 'Equal',
   '[': 'BracketLeft',
@@ -64,10 +67,10 @@ let running = false;
 let onTrigger = null;
 let shouldIgnore = null;
 
-/** 'mouse:4' / 'key:36' → 动作名 */
 const bindings = new Map();
-/** 按住不放时系统会连发 keydown，用它节流，避免暂停/播放疯狂翻转 */
-const lastFire = new Map();
+const pressed = new Set();
+const blocked = new Set();
+let activeHold = null;
 
 function load() {
   if (loaded) return available;
@@ -76,202 +79,266 @@ function load() {
     const mod = require('uiohook-napi');
     uiohook = mod.uIOhook || null;
     UiohookKey = mod.UiohookKey || null;
-    available = !!uiohook && typeof uiohook.start === 'function' && !!UiohookKey;
+    available = !!uiohook && !!UiohookKey &&
+      ['on', 'off', 'start', 'stop'].every((method) => typeof uiohook[method] === 'function');
   } catch (err) {
     console.warn('[hook] 全局钩子不可用：', err.message);
     available = false;
     uiohook = null;
+    UiohookKey = null;
   }
   return available;
 }
 
-/** 该加速器是否归钩子管：鼠标侧键，或任何不带修饰键的单键 */
-function isHookAccelerator(acc) {
-  const s = String(acc || '').trim();
-  if (!s) return false;
-  if (MOUSE_ACC.test(s)) return true;
-  if (RMB_MOUSE_ACC.test(s)) return true;
-  return !s.includes('+');
+/** 该加速器是否归钩子管：倍速动作、鼠标侧键或不带修饰键的单键 */
+function isHookAccelerator(acc, action) {
+  const accelerator = String(acc || '').trim();
+  if (!accelerator) return false;
+  return HOOK_ACTIONS.has(action) || MOUSE_ACC.test(accelerator) || !accelerator.includes('+');
 }
 
 /** 单键 → uiohook keycode；认不出来返回 0 */
 function keycodeOf(acc) {
   const raw = String(acc || '').trim();
   if (!raw || !UiohookKey) return 0;
-  const name = KEY_ALIAS[raw] || raw;
-  // 字母统一成大驼峰（UiohookKey 里是 A~Z），F 键、数字、NumpadX 原本就一致
+  const modifier = MODIFIER_OF[raw.toLowerCase()];
+  const name = (Object.hasOwn(KEY_ALIAS, raw) && KEY_ALIAS[raw]) ||
+    (Number.isInteger(modifier) && MODIFIER_KEYS[modifier][0]) || raw;
   const norm = name.length === 1 ? name.toUpperCase() : name;
   const code = UiohookKey[norm];
   return Number.isFinite(code) ? code : 0;
 }
 
-function fire(action, token) {
-  if (!action) return;
-  const now = Date.now();
-  if (now - (lastFire.get(token) || 0) < 200) return;
-  lastFire.set(token, now);
-  console.log(`[hook] ${token} → ${action}`);
+function modifierOfCode(code) {
+  for (const [modifier, names] of Object.entries(MODIFIER_KEYS)) {
+    if (names.some((name) => UiohookKey[name] === code)) return Number(modifier);
+  }
+  return 0;
+}
+
+function modifiersOf(event) {
+  return (event.ctrlKey ? 1 : 0) | (event.altKey ? 2 : 0) |
+    (event.shiftKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+}
+
+function bindingOf(accelerator, action) {
+  const parts = accelerator.split('+').map((part) => part.trim());
+  const key = parts.pop();
+  let modifiers = 0;
+  for (const part of parts) {
+    const modifier = MODIFIER_OF[part.toLowerCase()];
+    if (!Number.isInteger(modifier) || (modifiers & modifier)) return null;
+    modifiers |= modifier;
+  }
+  const mouse = key.match(MOUSE_ACC);
+  if (mouse) {
+    return {
+      action,
+      token: `mouse:${BUTTON_OF[`Mouse${mouse[1]}`]}`,
+      modifiers: HOOK_ACTIONS.has(action) ? modifiers : 'any'
+    };
+  }
+  const code = keycodeOf(key);
+  if (!code) return null;
+  if (HOOK_ACTIONS.has(action)) modifiers |= modifierOfCode(code);
+  return { action, token: `key:${code}`, modifiers };
+}
+
+function fire(action, token, phase) {
+  if (!action || typeof onTrigger !== 'function') return;
+  console.log(`[hook] ${token} → ${action}${phase ? ` (${phase})` : ''}`);
   try {
-    onTrigger(action);
+    if (phase) onTrigger(action, phase);
+    else onTrigger(action);
   } catch (err) {
     console.warn('[hook] 触发失败', err);
   }
 }
 
-function onMouseDown(e) {
-  // 右键只记录状态，绝不 return 之外做任何事（不吞事件）
-  if (e.button === 2) {
-    isRightDown = true;
-    return;
-  }
-  if (e.button !== 4 && e.button !== 5) return;
-
-  // 右键按着时优先匹配「右键+侧键」；没配这个组合就回落到单独侧键
-  const combo = isRightDown ? bindings.get(`mouse:${e.button}+rmb`) : null;
-  const action = combo || bindings.get(`mouse:${e.button}`);
-  if (!action) return;
-
-  const token = combo ? `mouse:${e.button}+rmb` : `mouse:${e.button}`;
-  if (shouldIgnore && shouldIgnore()) {
-    console.log(`[hook] ${token} 被忽略（正在输入或录制）`);
-    return;
-  }
-  fire(action, token);
+function cancelHeld() {
+  if (!activeHold) return false;
+  const held = activeHold;
+  activeHold = null;
+  fire(held.action, held.token, 'up');
+  return true;
 }
 
-/** 松开右键：清状态。同样不拦截，事件照常下发 */
-function onMouseUp(e) {
-  if (e.button === 2) isRightDown = false;
+function onDown(token, event) {
+  if (blocked.has(token) || pressed.has(token)) return;
+  pressed.add(token);
+  const binding = bindings.get(`${token}:${modifiersOf(event)}`) || bindings.get(`${token}:any`);
+  if (!binding || (shouldIgnore && shouldIgnore())) return;
+  if (binding.action === 'holdSpeed') {
+    if (activeHold) return;
+    activeHold = binding;
+    fire(binding.action, token, 'down');
+  } else {
+    fire(binding.action, token);
+  }
 }
 
-function onKeyDown(e) {
-  // 带修饰键的是组合键，交给 globalShortcut，这里不重复处理
-  if (e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
-  const action = bindings.get(`key:${e.keycode}`);
-  if (!action) return;
-  if (shouldIgnore && shouldIgnore()) {
-    console.log(`[hook] 键码 ${e.keycode} 被忽略（正在输入或录制）`);
+function onMouseDown(event) {
+  onDown(`mouse:${event.button}`, event);
+}
+
+function onKeyDown(event) {
+  onDown(`key:${event.keycode}`, event);
+}
+
+function onMouseUp(event) {
+  const token = `mouse:${event.button}`;
+  pressed.delete(token);
+  blocked.delete(token);
+  if (activeHold && activeHold.token === token) cancelHeld();
+}
+
+function onKeyUp(event) {
+  const token = `key:${event.keycode}`;
+  pressed.delete(token);
+  blocked.delete(token);
+  if (!activeHold) return;
+  if (activeHold.token === token) {
+    cancelHeld();
     return;
   }
-  fire(action, `key:${e.keycode}`);
+  const modifier = modifierOfCode(event.keycode);
+  if (!(activeHold.modifiers & modifier)) return;
+  const stillPressed = MODIFIER_KEYS[modifier].some((name) => {
+    const modifierToken = `key:${UiohookKey[name]}`;
+    return pressed.has(modifierToken) || blocked.has(modifierToken);
+  });
+  if (!stillPressed && !(modifiersOf(event) & modifier)) cancelHeld();
+}
+
+const HOOK_LISTENERS = {
+  mousedown: onMouseDown,
+  mouseup: onMouseUp,
+  keydown: onKeyDown,
+  keyup: onKeyUp
+};
+
+function detachListeners() {
+  for (const [event, listener] of Object.entries(HOOK_LISTENERS)) {
+    try {
+      uiohook.off(event, listener);
+    } catch (err) {
+      console.warn('[hook] 移除监听失败', err);
+    }
+  }
 }
 
 function start() {
-  if (running || !available) return;
-  uiohook.on('mousedown', onMouseDown);
-  uiohook.on('mouseup', onMouseUp);
-  uiohook.on('keydown', onKeyDown);
-  uiohook.start();
-  running = true;
-  console.log(
-    '[hook] 全局钩子已启动，已绑定：',
-    [...bindings.entries()].map(([t, a]) => `${t}→${a}`).join(' ') || '（无）'
-  );
+  if (running) return true;
+  if (!available) return false;
+  try {
+    for (const [event, listener] of Object.entries(HOOK_LISTENERS)) uiohook.on(event, listener);
+    if (uiohook.start() === false) throw new Error('原生钩子未启动');
+    running = true;
+    console.log(
+      '[hook] 全局钩子已启动，已绑定：',
+      [...bindings.values()].map((binding) => `${binding.token}→${binding.action}`).join(' ') || '（无）'
+    );
+    return true;
+  } catch (err) {
+    console.warn('[hook] 启动钩子失败', err.message);
+    detachListeners();
+    try {
+      uiohook.stop();
+    } catch (stopError) {
+      console.warn('[hook] 停止钩子出错', stopError);
+    }
+    cancelHeld();
+    pressed.clear();
+    running = false;
+    return false;
+  }
 }
 
 function stop() {
+  cancelHeld();
+  pressed.clear();
+  blocked.clear();
   if (!running) return;
+  running = false;
+  detachListeners();
   try {
-    uiohook.off('mousedown', onMouseDown);
-    uiohook.off('mouseup', onMouseUp);
-    uiohook.off('keydown', onKeyDown);
     uiohook.stop();
   } catch (err) {
     console.warn('[hook] 停止钩子出错', err);
   }
-  running = false;
 }
 
 /**
- * 重新挂载钩子（保留已有监听与映射）。
+ * 重新挂载钩子（保留已有映射）。
  *
  * Windows 在进程被降级成「后台/效率模式」时可能把低级钩子悄悄摘掉，
  * 这时 `running` 仍是 true，界面也显示「监听已启动」，但按键再也进不来。
  * 窗口恢复/浮窗重新显示时补挂一次，成本只有几十毫秒，比让用户重启程序划算。
  */
 function rearm() {
-  if (!running || !available) return false;
-  try {
-    uiohook.stop();
-    uiohook.start();
-    console.log('[hook] 全局钩子已重新挂载');
-    return true;
-  } catch (err) {
-    console.warn('[hook] 重新挂载失败', err.message);
-    return false;
-  }
+  const shouldRestart = running && available;
+  const blockedTokens = new Set([...blocked, ...pressed]);
+  if (activeHold) blockedTokens.add(activeHold.token);
+  stop();
+  for (const token of blockedTokens) blocked.add(token);
+  if (!shouldRestart) return false;
+  const restarted = start();
+  if (restarted) console.log('[hook] 全局钩子已重新挂载');
+  return restarted;
 }
 
 /**
  * 按最新热键配置重建映射。
  * @param {object} hotkeys 动作 → 加速器
- * @param {(action:string)=>void} trigger 触发回调
- * @param {()=>boolean} ignore 返回 true 时忽略事件（自己的窗口在前台，别抢输入）
+ * @param {(action:string, phase?:string)=>void} trigger 触发回调
+ * @param {()=>boolean} ignore 返回 true 时忽略新的按下事件
  * @returns {{ needed: boolean, ok: boolean, keys: string[] }}
- *          needed=是否有钩子类绑定；ok=钩子是否真的跑起来了；keys=认不出的键位
+ *          needed=是否有钩子类绑定；ok=钩子启动是否成功；keys=认不出的键位
  */
 function apply(hotkeys, trigger, ignore) {
+  cancelHeld();
+  pressed.clear();
   if (trigger) onTrigger = trigger;
   if (ignore) shouldIgnore = ignore;
   bindings.clear();
 
-  // 先把原生模块和键码表加载好：keycodeOf 依赖 UiohookKey，
-  // 放到循环之后加载的话，第一次调用会全部映射失败（都变成「不认识的键」）
-  const available = load();
-
+  const nativeAvailable = load();
   const unknown = [];
   let needHook = false;
 
   for (const [action, acc] of Object.entries(hotkeys || {})) {
-    const s = String(acc || '').trim();
-    if (!s) continue;
-
-    const mRmb = s.match(RMB_MOUSE_ACC);
-    if (mRmb) {
-      needHook = true;
-      bindings.set(`mouse:${BUTTON_OF[`Mouse${mRmb[1]}`]}+rmb`, action);
-      continue;
-    }
-
-    const m = s.match(MOUSE_ACC);
-    if (m) {
-      needHook = true;
-      bindings.set(`mouse:${BUTTON_OF[`Mouse${m[1]}`]}`, action);
-      continue;
-    }
-    if (!isHookAccelerator(s)) continue; // 带修饰键的走 globalShortcut
-
+    const accelerator = String(acc || '').trim();
+    if (!isHookAccelerator(accelerator, action)) continue;
     needHook = true;
-    const code = keycodeOf(s);
-    if (!code) {
-      unknown.push(s);
+    if (!nativeAvailable) continue;
+    const binding = bindingOf(accelerator, action);
+    if (!binding) {
+      unknown.push(accelerator);
       continue;
     }
-    bindings.set(`key:${code}`, action);
+    bindings.set(`${binding.token}:${binding.modifiers}`, binding);
   }
 
   if (!needHook) {
     stop();
     return { needed: false, ok: true, keys: unknown };
   }
-  if (!available) return { needed: true, ok: false, keys: unknown };
+  if (!nativeAvailable) {
+    stop();
+    return { needed: true, ok: false, keys: unknown };
+  }
   if (!bindings.size) {
     stop();
     return { needed: true, ok: true, keys: unknown };
   }
 
-  start();
-  return { needed: true, ok: true, keys: unknown };
+  return { needed: true, ok: start(), keys: unknown };
 }
 
 /** 给界面用的可读名称 */
 function describe(acc) {
-  const s = String(acc || '');
-  const rmb = RMB_MOUSE_ACC.test(s);
-  if (/^Mouse4$/i.test(s)) return '鼠标侧键（后退）';
-  if (/^Mouse5$/i.test(s)) return '鼠标侧键（前进）';
-  if (rmb && /\+Mouse4$/i.test(s)) return '右键 + 鼠标侧键（后退）';
-  if (rmb && /\+Mouse5$/i.test(s)) return '右键 + 鼠标侧键（前进）';
+  if (/^Mouse4$/i.test(acc)) return '鼠标侧键（后退）';
+  if (/^Mouse5$/i.test(acc)) return '鼠标侧键（前进）';
   return acc;
 }
 
@@ -279,4 +346,4 @@ function isRunning() {
   return running;
 }
 
-module.exports = { apply, isHookAccelerator, describe, isRunning, rearm };
+module.exports = { apply, isHookAccelerator, describe, isRunning, rearm, cancelHeld };

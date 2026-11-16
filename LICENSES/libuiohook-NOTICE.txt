@@ -1,0 +1,41 @@
+libUIOHook: Cross-platform keyboard and mouse hooking from userland.
+Copyright (C) 2006-2023 Alexander Barker. All Rights Reserved.
+https://github.com/kwhat/libuiohook/
+SPDX-License-Identifier: LGPL-3.0-or-later
+
+libUIOHook is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+libUIOHook is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with this program. If not, see https://www.gnu.org/licenses/.
+
+The complete LGPLv3 text is supplied as LGPL-3.0.txt. It supplements
+GNU GPLv3, supplied in the same directory as LICENSE-GIFA.txt.
+Official license text: https://www.gnu.org/licenses/lgpl-3.0.txt
+
+GIFA uses libUIOHook through uiohook-napi 1.5.5. uiohook-napi's own
+JavaScript and native binding are MIT licensed; libUIOHook retains the
+separate LGPL-3.0-or-later terms above. The unmodified Windows x64
+prebuilt binary comes from the exact uiohook-napi npm package pinned in
+GIFA's package-lock.json. GIFA does not modify or rebuild this library.
+
+Corresponding library and binding source, including the bundled
+libuiohook sources and build scripts, is in the exact npm package:
+https://registry.npmjs.org/uiohook-napi/-/uiohook-napi-1.5.5.tgz
+Upstream binding project: https://github.com/SnosMe/uiohook-napi
+GIFA source and build scripts: https://github.com/FinalLawer/GIFA
+
+Use the tag or commit identified with the GIFA release and run npm ci
+to obtain the pinned package including its complete source and build
+scripts. The native module is loaded from resources/app.asar.unpacked/
+node_modules/uiohook-napi/prebuilds/win32-x64/uiohook-napi.node and may
+be replaced by an interface-compatible build. No native-module hash
+check prevents replacement. The .node binary contains the linked
+libUIOHook code; rebuilding it uses the sources in the package above.

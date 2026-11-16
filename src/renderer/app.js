@@ -218,6 +218,16 @@ function createWebview() {
     state.guestReady = true;
     requestRatioRefit(120);
     sendVolume();
+    window.api.playbackGet().then((st) => {
+      if (!st) return;
+      sendPlayer({
+        cmd: 'playback',
+        playbackRate: st.playbackRate,
+        volume: st.volume,
+        muted: st.muted,
+        temporaryPlaybackRate: st.temporaryPlaybackRate
+      });
+    });
     sendPlayer({ cmd: 'clean', on: true });
     syncBearingToGuest();
     maybeAutoDump();
@@ -892,6 +902,23 @@ function wireUi() {
     if (!next.enableSubtitleSprite) hideSubtitleSprite();
     if (!next.enableDanmakuProjection) window.api.danmakuTime({ t: 0, seek: true });
     sendVolume();
+  });
+
+  // 播放控制：主进程推来倍速/静音/长按加速状态，转给访客页应用
+  window.api.onPlaybackState((st) => {
+    if (!st) return;
+    sendPlayer({
+      cmd: 'playback',
+      playbackRate: st.playbackRate,
+      volume: st.volume,
+      muted: st.muted,
+      temporaryPlaybackRate: st.temporaryPlaybackRate
+    });
+  });
+
+  // 热键操作的屏幕提示（倍速切换、长按加速等）
+  window.api.onNotice((text) => {
+    if (text) toast(text, 2200);
   });
 
   // 官方字幕模式开关：主进程拉到字幕轨后通知，转发给访客页按进度报时间

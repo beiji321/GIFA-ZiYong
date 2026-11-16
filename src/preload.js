@@ -41,6 +41,11 @@ contextBridge.exposeInMainWorld('api', {
   // 官方字幕模式：主进程拉到字幕轨后通知浮窗，浮窗再让访客页按进度报时间
   onSubtitleApi: (cb) => ipcRenderer.on('subtitle:api', (_e, s) => cb(s)),
   subtitleTime: (payload) => ipcRenderer.send('subtitle:time', payload),
+  // 播放控制：倍速 / 静音 / 长按加速
+  playbackGet: () => ipcRenderer.invoke('playback:get'),
+  playbackUpdate: (patch) => ipcRenderer.invoke('playback:update', patch),
+  onPlaybackState: (cb) => ipcRenderer.on('playback:state', (_e, s) => cb(s)),
+  onNotice: (cb) => ipcRenderer.on('app:notice', (_e, text) => cb(text)),
   // 字幕来源状态 + 手动重读
   subtitleStatus: () => ipcRenderer.invoke('subtitle:status'),
   subtitleRefetch: () => ipcRenderer.invoke('subtitle:refetch'),

@@ -23,6 +23,7 @@ const fs = require('node:fs');
 const { execFileSync, spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const hookHotkeys = require('./hook-hotkeys');
+const { mergeHotkeys, prepareHotkeyUpdate } = require('./hotkey-config');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -385,8 +386,15 @@ const DEFAULT_HOTKEYS = {  togglePlay: 'Alt+Space',
   nextPart: 'Alt+Down',
   toggleVisible: 'Alt+H',
   toggleOpacity: 'Alt+O',
-  toggleClean: 'Alt+Z'
+  toggleClean: 'Alt+Z',
+  cycleSpeed: 'Alt+S',
+  holdSpeed: 'F8'
 };
+
+/** 常规倍速循环表 */
+const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+/** 长按临时倍速可选值 */
+const HOLD_PLAYBACK_RATES = [1.5, 2, 3];
 
 const HOTKEY_META = [
   { key: 'togglePlay', label: '播放 / 暂停' },
@@ -396,7 +404,9 @@ const HOTKEY_META = [
   { key: 'nextPart', label: '下一分 P' },
   { key: 'toggleVisible', label: '隐藏 / 显示浮窗' },
   { key: 'toggleOpacity', label: '半透明 开 / 关' },
-  { key: 'toggleClean', label: '纯净模式 开 / 关' }
+  { key: 'toggleClean', label: '纯净模式 开 / 关' },
+  { key: 'cycleSpeed', label: '切换倍速' },
+  { key: 'holdSpeed', label: '长按临时加速' }
 ];
 
 /**
@@ -474,6 +484,12 @@ const DEFAULT_SETTINGS = {
   opacity: 1,
   mode: 'web',
   volume: 100,
+  muted: false,
+  // 常规倍速（循环切换用）与长按临时倍速
+  playbackRate: 1,
+  holdPlaybackRate: 2,
+  // 沉浸模式下鼠标移开后窗口淡出
+  hoverFadeEnabled: true,
   lastText: '',
   lastPart: 1,
   // 「上次看到」：光有 lastText/lastPart 不够 —— 用户记不住的是「哪个视频、第几 P」，
@@ -602,6 +618,7 @@ let consoleWin = null;  // 启动器（所有设置都在这里）
 let loginWin = null;
 let quittingFromConsole = false; // 关启动器 = 退出整个应用，防止 closed 事件重入
 let failedHotkeys = [];
+let holdSpeedActive = false; // 长按加速是否正在生效
 let saveTimer = null;
 // 渲染层上报的输入状态：打字时不该触发单键热键，但「窗口在前台」不等于在打字
 let typingInField = false;
@@ -630,13 +647,13 @@ function loadSettings() {
     // 已废弃字段：togglePass 热键（穿透改为控制台里的独立开关）。
     // 旧配置里残留的条目直接丢掉，否则会被 spread 带回来，
     // 让「设置里有个没人用的键位」一直存在。
-    if (raw.hotkeys) delete raw.hotkeys.togglePass;
+
 
     settings = {
       ...structuredClone(DEFAULT_SETTINGS),
       ...raw,
       bounds: { ...DEFAULT_SETTINGS.bounds, ...(raw.bounds || {}) },
-      hotkeys: { ...DEFAULT_HOTKEYS, ...(raw.hotkeys || {}) },
+      hotkeys: mergeHotkeys(DEFAULT_HOTKEYS, raw.hotkeys),
       bearing: {
         ...DEFAULT_SETTINGS.bearing,
         ...rawBearing,
@@ -1053,8 +1070,10 @@ function createWindow() {
 
   win.once('ready-to-show', () => {
     win.showInactive(); // 不抢游戏焦点
+    publishPlaybackSettings();
     // 恢复用户上次的穿透设置（纯净模式不持久化，这里只按开关来）
     applyMousePass();
+    syncHoverFade();
     if (settings.opacity < 1) win.setOpacity(settings.opacity);
     // applyRatioLock 内部先 await 量准 chromeHeight，再对齐并抖动一次
     applyRatioLock();
@@ -1174,6 +1193,10 @@ function createWindow() {
 
   win.on('closed', () => {
     win = null;
+    cancelHoldSpeed();
+    clearInterval(hoverTimer);
+    hoverTimer = null;
+    hoverFaded = false;
     // 健康度快照属于「当前这次识别」，浮窗关了就不该再显示旧数字
     lastBearingStats = null;
     // 主窗关了，叠加层和字幕层不能独自留下，否则 window-all-closed 不触发、进程退不掉
@@ -2539,7 +2562,97 @@ function sendPlayerAction(action) {
 }
 
 /** 热键动作的唯一入口：键盘加速器和鼠标侧键都走这里 */
-function handleHotkey(key) {
+/* ------------------------------------------------------------ 播放控制 */
+
+/** 从设置里取出播放相关的三个值，顺便做范围收敛 */
+function playbackSettings(s = settings) {
+  const volume = Number.isFinite(s.volume) ? Math.min(100, Math.max(0, s.volume)) : 100;
+  return {
+    volume,
+    muted: typeof s.muted === 'boolean' ? s.muted : volume === 0,
+    playbackRate: Number.isFinite(s.playbackRate) ? Math.min(3, Math.max(0.25, s.playbackRate)) : 1
+  };
+}
+
+/** 合并一次改动，返回是否真的变了 */
+function updatePlaybackSettings(patch = {}) {
+  const next = playbackSettings(settings);
+  if (Number.isFinite(patch.volume)) {
+    next.volume = Math.min(100, Math.max(0, patch.volume));
+    // 拖音量时正值取消静音；只切静音不会丢掉原来的音量
+    next.muted = next.volume === 0;
+  }
+  if (typeof patch.muted === 'boolean') next.muted = patch.muted;
+  if (Number.isFinite(patch.playbackRate)) {
+    next.playbackRate = Math.min(3, Math.max(0.25, patch.playbackRate));
+  }
+  const changed = Object.keys(next).some((k) => settings[k] !== next[k]);
+  Object.assign(settings, next);
+  return changed;
+}
+
+/** 给界面看的完整状态（含长按是否生效） */
+function playbackState() {
+  return {
+    ...playbackSettings(settings),
+    holdPlaybackRate: settings.holdPlaybackRate,
+    holdActive: holdSpeedActive,
+    temporaryPlaybackRate: holdSpeedActive ? settings.holdPlaybackRate : null
+  };
+}
+
+/** 把播放状态推给浮窗（再转给访客页）和启动器 */
+function publishPlaybackSettings() {
+  broadcast('playback:state', playbackState());
+}
+
+function showNotice(text) {
+  broadcast('app:notice', String(text || ''));
+}
+
+/** 循环切换常规倍速 */
+function cyclePlaybackRate() {
+  const i = PLAYBACK_RATES.indexOf(settings.playbackRate);
+  const playbackRate = PLAYBACK_RATES[(i + 1) % PLAYBACK_RATES.length];
+  updatePlaybackSettings({ playbackRate });
+  persist();
+  publishPlaybackSettings();
+  broadcast('settings:changed', settings);
+  showNotice(
+    `常规倍速 ${playbackRate}×` +
+      (holdSpeedActive ? `（长按中 ${settings.holdPlaybackRate}×，松开恢复）` : '')
+  );
+  return playbackRate;
+}
+
+/** 长按临时加速：按下提高倍速，松开恢复 */
+function setHoldSpeed(on) {
+  const next = !!on && !!win && !win.isDestroyed();
+  if (next === holdSpeedActive) return;
+  holdSpeedActive = next;
+  publishPlaybackSettings();
+  showNotice(
+    next
+      ? `临时 ${settings.holdPlaybackRate}× · 松开恢复 ${settings.playbackRate}×`
+      : `已恢复 ${settings.playbackRate}×`
+  );
+}
+
+/** 浮窗被关掉时清掉长按状态，否则下次起来还停在加速档 */
+function cancelHoldSpeed() {
+  if (!holdSpeedActive) return;
+  holdSpeedActive = false;
+  publishPlaybackSettings();
+}
+
+function handleHotkey(key, phase) {
+  // 长按加速要区分按下/抬起；其余动作只在按下时触发一次
+  if (key === 'holdSpeed') {
+    setHoldSpeed(phase !== 'up');
+    return;
+  }
+  if (phase === 'up') return;
+  if (key === 'cycleSpeed') return cyclePlaybackRate();
   if (key === 'toggleVisible') return toggleVisible();
   if (key === 'toggleOpacity') return setOpacity(settings.opacity > 0.95 ? 0.65 : 1);
   sendPlayerAction(key);
@@ -2557,6 +2670,17 @@ function toggleVisible() {
 
 /** 纯净模式当前是否开启（不持久化：每次启动都是关闭） */
 let cleanMode = false;
+
+/* ---- 悬停淡出 ----
+ * 纯净模式下鼠标移出浮窗就降低不透明度，移回来恢复。
+ * 用轮询光标位置而不是 DOM hover 事件：纯净模式整窗鼠标穿透，
+ * 页面根本收不到 hover，只有主进程能拿到真实光标坐标。
+ */
+const HOVER_FADE_OPACITY = 0.35;
+let hoverTimer = null;
+let hoverFaded = false;      // 当前是否处于「鼠标在外面」的淡出状态
+let hoverCandidate = false;  // 候选状态，用来做 120ms 去抖
+let hoverCandidateAt = 0;
 
 /**
  * 鼠标穿透开关（控制台「浮窗 → 鼠标穿透」）。
@@ -2599,12 +2723,53 @@ function setCleanMode(on) {
   cleanMode = next;
   // 进纯净模式强制穿透；退出时恢复用户自己的开关状态（而不是一律关闭）
   applyMousePass();
+  syncHoverFade();
   return next;
+}
+
+/** 按「淡出中 / 正常」决定实际不透明度 */
+function applyOpacityForState() {
+  if (!win || win.isDestroyed()) return;
+  const target = hoverFaded ? Math.min(settings.opacity, HOVER_FADE_OPACITY) : settings.opacity;
+  win.setOpacity(target);
+}
+
+function updateHoverFade() {
+  if (!win || win.isDestroyed()) return;
+  const point = screen.getCursorScreenPoint();
+  const b = win.getBounds();
+  const inside =
+    cleanMode &&
+    settings.hoverFadeEnabled &&
+    win.isVisible() &&
+    !win.isMinimized() &&
+    point.x >= b.x &&
+    point.x < b.x + b.width &&
+    point.y >= b.y &&
+    point.y < b.y + b.height;
+  if (inside !== hoverCandidate) {
+    hoverCandidate = inside;
+    hoverCandidateAt = Date.now();
+  }
+  if (inside === hoverFaded || Date.now() - hoverCandidateAt < 120) return;
+  hoverFaded = inside;
+  applyOpacityForState();
+}
+
+/** 开关纯净模式或改设置时重建轮询 */
+function syncHoverFade() {
+  clearInterval(hoverTimer);
+  hoverTimer = null;
+  hoverCandidate = false;
+  hoverCandidateAt = Date.now();
+  hoverFaded = false;
+  applyOpacityForState();
+  if (cleanMode && settings.hoverFadeEnabled) hoverTimer = setInterval(updateHoverFade, 60);
 }
 
 function setOpacity(v) {
   settings.opacity = Math.min(1, Math.max(0.3, Number(v) || 1));
-  if (win && !win.isDestroyed()) win.setOpacity(settings.opacity);
+  applyOpacityForState();
   persist();
   if (win && !win.isDestroyed()) win.webContents.send('win:state', { opacity: settings.opacity });
 }
@@ -2618,7 +2783,7 @@ function registerHotkeys() {
     if (!acc) continue;
     // 鼠标侧键和单键不进 globalShortcut：前者不支持，后者会把键全局吞掉。
     // 这两类统一交给低级钩子被动监听。
-    if (hookHotkeys.isHookAccelerator(acc)) continue;
+    if (hookHotkeys.isHookAccelerator(acc, key)) continue;
 
     let ok = false;
     try {
@@ -2654,7 +2819,7 @@ function registerHotkeys() {
   if (hookState.needed && !hookState.ok) {
     for (const { key } of HOTKEY_META) {
       const acc = settings.hotkeys[key];
-      if (hookHotkeys.isHookAccelerator(acc)) failedHotkeys.push({ key, accelerator: acc, hook: true });
+      if (hookHotkeys.isHookAccelerator(acc, key)) failedHotkeys.push({ key, accelerator: acc, hook: true });
     }
   }
   for (const acc of hookState.keys) {
@@ -3332,6 +3497,14 @@ function registerIpc() {
     if (patch.subtitleAutoOpen !== undefined) {
       settings.subtitleAutoOpen = !!patch.subtitleAutoOpen;
     }
+    if (patch.holdPlaybackRate !== undefined) {
+      const rate = Number(patch.holdPlaybackRate);
+      if (HOLD_PLAYBACK_RATES.includes(rate)) settings.holdPlaybackRate = rate;
+    }
+    if (patch.hoverFadeEnabled !== undefined) {
+      settings.hoverFadeEnabled = !!patch.hoverFadeEnabled;
+      syncHoverFade();
+    }
     if (patch.trayClickAction !== undefined) {
       settings.trayClickAction = patch.trayClickAction === 'float' ? 'float' : 'launcher';
     }
@@ -3401,41 +3574,30 @@ function registerIpc() {
   });
 
   ipcMain.handle('hotkeys:update', (_e, next = {}) => {
-    const valid = {};
-    for (const [k, v] of Object.entries(next)) {
-      if (Object.prototype.hasOwnProperty.call(DEFAULT_HOTKEYS, k) && typeof v === 'string' && v.trim()) {
-        valid[k] = v.trim();
-      }
-    }
-
     const prev = { ...settings.hotkeys };
-    const same = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+    // prepareHotkeyUpdate 负责：归一化（ctrl+alt+h → Ctrl+Alt+H）、
+    // 新键被占用时和对方互换、真冲突时整体拒绝。
+    const prepared = prepareHotkeyUpdate(prev, next);
 
-    // 冲突处理：新键已被别的动作占用时，把两者**互换**。
-    // 以前是直接覆盖，导致对方注册失败、悄悄丢了键位 —— 用户看到的就是「改了没反应」。
-    const swaps = [];
-    for (const [k, v] of Object.entries(valid)) {
-      for (const [other, acc] of Object.entries(prev)) {
-        if (other === k || !same(acc, v)) continue;
-        swaps.push({ target: k, partner: other, partnerAcc: prev[k] });
-      }
+    if (prepared.rejected.length) {
+      return {
+        hotkeys: prev,
+        failed: [],
+        rejected: prepared.rejected,
+        swapped: [],
+        hookRunning: hookHotkeys.isRunning()
+      };
     }
 
-    settings.hotkeys = { ...prev, ...valid };
-    for (const s of swaps) settings.hotkeys[s.partner] = s.partnerAcc;
-
+    settings.hotkeys = prepared.hotkeys;
     let failed = registerHotkeys();
 
-    // 新键注册不上（被系统或其他程序占用）→ 把这一项回滚到旧键。
-    // 关键：不能让它「新键没成、旧键也没了」，那等于改一次少一个热键。
-    const rejected = Object.keys(valid).filter((k) => failed.some((f) => f.key === k));
+    // 新键注册不上（被系统或其他程序占用）→ 整体回滚。
+    // 不能让它「新键没成、旧键也没了」，那等于改一次少一个热键。
+    const changed = Object.keys(prepared.hotkeys).filter((k) => prepared.hotkeys[k] !== prev[k]);
+    const rejected = changed.filter((k) => failed.some((f) => f.key === k));
     if (rejected.length) {
-      for (const k of rejected) {
-        settings.hotkeys[k] = prev[k];
-        // 因为互换被改动过对家，也要一起还原
-        const s = swaps.find((x) => x.target === k);
-        if (s) settings.hotkeys[s.partner] = prev[s.partner];
-      }
+      settings.hotkeys = { ...prev };
       failed = registerHotkeys();
     }
 
@@ -3444,9 +3606,21 @@ function registerIpc() {
       hotkeys: settings.hotkeys,
       failed,
       rejected,
-      swapped: swaps.map((s) => s.partner),
+      swapped: prepared.swapped,
       hookRunning: hookHotkeys.isRunning()
     };
+  });
+
+  /* ---- 播放控制：倍速 / 静音 / 长按加速 ---- */
+  ipcMain.handle('playback:get', () => playbackState());
+
+  ipcMain.handle('playback:update', (_e, patch = {}) => {
+    if (updatePlaybackSettings(patch)) {
+      persist();
+      publishPlaybackSettings();
+      broadcast('settings:changed', settings);
+    }
+    return playbackState();
   });
 
   ipcMain.handle('hotkeys:reset', () => {
