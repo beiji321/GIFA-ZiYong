@@ -50,8 +50,18 @@ const KEY_ALIASES = new Map([
 
 function normalizeAccelerator(value) {
   if (typeof value !== 'string') return '';
-  const accelerator = value.trim();
+  let accelerator = value.trim();
   if (!accelerator) return '';
+
+  // 右键 + 侧键：RMB 是鼠标前缀，不是键盘修饰键。
+  // 不先摘掉的话它会被当成一个「主键」，后面的 Mouse5 再撞上主键判定，
+  // 整条直接归一化成空串 —— 界面上录进去了，主进程当作没改，表现就是「怎么都设不进去」。
+  let rmb = false;
+  const rmbPrefix = /^RMB\+(.+)$/i.exec(accelerator);
+  if (rmbPrefix) {
+    rmb = true;
+    accelerator = rmbPrefix[1].trim();
+  }
 
   const parts = accelerator === '+' ? ['Plus'] : accelerator.split('+').map((part) => part.trim());
   if (parts.length > 1 && parts.at(-1) === '' && parts.at(-2) === '') {
@@ -81,7 +91,11 @@ function normalizeAccelerator(value) {
 
   const orderedModifiers = MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier));
   if (!primaryKey) return parts.length === 1 ? orderedModifiers[0] || '' : '';
-  return [...orderedModifiers, primaryKey].join('+');
+  const normalized = [...orderedModifiers, primaryKey].join('+');
+
+  // RMB 前缀只对侧键有意义，其余组合一律判无效，避免出现 RMB+Alt+Space 这种怪值
+  if (rmb) return /^Mouse[45]$/.test(normalized) ? `RMB+${normalized}` : '';
+  return normalized;
 }
 
 function mergeHotkeys(defaults, saved) {

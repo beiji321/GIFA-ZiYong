@@ -19,6 +19,17 @@
 </head>
 <body>
   <canvas id="cv"></canvas>
-  <script src="./overlay.js"></script>
+  <script>
+    // 两套渲染各自独立成文件，互不干扰：
+    //   overlay.js —— 上游原版（圆环 + 箭头）
+    //   radar.js   —— 魔改扩展（四轴罗盘 + 字幕方位点亮 + 自绘拖动）
+    // 由主进程通过 ?radar=1 指定用哪套。
+    (function () {
+      var radar = /(?:^|[?&])radar=1(?:&|$)/.test(location.search);
+      var el = document.createElement('script');
+      el.src = radar ? './radar.js' : './overlay.js';
+      document.body.appendChild(el);
+    })();
+  </script>
 </body>
 </html>

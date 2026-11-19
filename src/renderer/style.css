@@ -735,3 +735,76 @@ body:not(.ui) #controls {
     transition: none !important;
   }
 }
+/* 魔改扩展：16:9 锁定按钮 —— 同一按钮里两枚图标，按 .locked 切换显示 */
+#btnRatio .i-ratio-locked,
+#btnRatio.locked .i-ratio-open {
+  display: none;
+}
+#btnRatio.locked .i-ratio-locked {
+  display: block;
+}
+#btnRatio.locked {
+  color: var(--accent, #49b2fc);
+  background: rgba(73, 178, 252, 0.16);
+}
+#btnRatio.locked:hover {
+  background: rgba(73, 178, 252, 0.28);
+  color: var(--accent, #49b2fc);
+}
+/* 锁定时底角缩放手柄点亮一下：还能拖，只是会等比缩放 */
+body.ratio-locked #grip {
+  filter: drop-shadow(0 0 3px var(--accent, #49b2fc));
+  opacity: 1;
+}
+
+/* 魔改扩展：贴边吸附提示线（照搬旧版） */
+/* ------------------------------------------------------ 贴边吸附提示线
+   4 条绝对定位的发光细线，贴哪条边亮哪条；贴角时两条同时亮。
+   平时 opacity: 0，不占视觉也不吃点击（pointer-events: none）。 */
+
+.snap-line {
+  position: absolute;
+  z-index: 65;
+  pointer-events: none;
+  opacity: 0;
+  background: rgba(0, 153, 255, 0.95);
+  box-shadow:
+    0 0 6px 2px rgba(0, 153, 255, 0.9),
+    0 0 16px 5px rgba(0, 153, 255, 0.4);
+  transition: opacity 0.14s ease;
+}
+
+.snap-line.show {
+  opacity: 1;
+}
+
+#snapL,
+#snapR {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+
+#snapL {
+  left: 0;
+}
+
+#snapR {
+  right: 0;
+}
+
+#snapT,
+#snapB {
+  left: 0;
+  right: 0;
+  height: 4px;
+}
+/* 魔改扩展：缩放冻结 —— 冻结期间关掉过渡，舞台铺黑底盖住边缘一像素的缝 */
+#stage webview.resize-freeze {
+  will-change: transform;
+  transition: none;
+  transform-origin: top left;
+}
+#stage.resizing {
+  background: #000;
+}

@@ -790,3 +790,42 @@ button.small { flex: 0 0 auto; height: 28px; padding: 0 11px; font-size: 12px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* ---------------------------------------------- 魔改扩展：字幕弹幕页
+ *
+ * 上游的分页是纯 CSS 的：.pane 默认 display:none，靠
+ * 「#tab-xxx:checked ~ #shell .pane-xxx」这条链显示。
+ * 新增一页就必须补上对应规则，否则点进去是一片空白。
+ * 这里用独立规则追加，不改上游已有的选择器列表。
+ */
+#tab-media:checked ~ #shell .pane-media { display: block; animation: pane-in 0.18s ease; }
+
+#tab-media:checked ~ #shell .nav-item[for="tab-media"] {
+  background: var(--nav-hover);
+  color: var(--fg);
+}
+#tab-media:checked ~ #shell .nav-item[for="tab-media"] .ico { color: var(--accent); }
+#tab-media:checked ~ #shell .nav-item[for="tab-media"]::before {
+  opacity: 1;
+  transform: scaleY(1);
+}
+#tab-media:focus-visible ~ #shell .nav-item[for="tab-media"] { outline: 2px solid var(--accent); }
+/* 魔改扩展：颜色选择器（上游没有这个控件） */
+.setting-ctrl input[type="color"] {
+  width: 46px;
+  height: 26px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.setting-ctrl input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+.setting-ctrl input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 4px; }
+/* 魔改扩展：识别健康度读数 */
+.health-line {
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.health-line.bad { color: #ff8a80; }

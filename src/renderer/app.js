@@ -83,6 +83,10 @@ async function init() {
   state.pages = [];
   applyImmersionState(!!(state.boot.floatState && state.boot.floatState.immersion));
 
+  // 魔改扩展：按设置初始化 16:9 锁定按钮的状态
+  $('btnRatio').classList.toggle('locked', s.ratioLocked === true);
+  document.body.classList.toggle('ratio-locked', s.ratioLocked === true);
+
   createWebview();
   wireUi();
   wireHotkeys();
@@ -147,6 +151,31 @@ function createWebview() {
       window.api.action('fullscreen', !!(e.args && e.args[0]));
       return;
     }
+    /* ---- 魔改扩展：字幕精灵相关通道 ---- */
+    if (e.channel === 'guest-log') {
+      // 访客页的调试日志转进浮窗控制台（F12 直接看）
+      console.log('[guest]', (e.args && e.args[0]) || '');
+      return;
+    }
+    if (e.channel === 'subtitle-time') {
+      // 官方字幕模式下访客页每 200ms 报一次播放进度（比心跳更细）
+      window.api.subtitleTime(e.args && e.args[0]);
+      return;
+    }
+    if (e.channel === 'subtitle') {
+      const p = e.args && e.args[0];
+      window.api.subtitle(p || {});
+      // 同一条字幕顺带判一次转向和绝对方位：
+      //   detectTurn   → 相对指令（左转/右转），画面边缘弹大箭头
+      //   detectCompassDir → 绝对方位（往东/东北），雷达模式点亮对应扇形
+      if (p && !p.off && p.text) {
+        detectTurn(p.text);
+        detectCompassDir(p.text);
+        // 智能防遮挡：这句在讲地图 / 锚点 / 传送，说明要看画面，别淡掉
+        if (/地图|锚点|传送/.test(p.text)) window.api.avoidHide();
+      }
+      return;
+    }
     if (e.channel === 'bearing') {
       onGuestBearing(e.args && e.args[0]);
       return;
@@ -170,6 +199,13 @@ function createWebview() {
     state.guestReady = true;
     sendPlayer({ cmd: 'clean', on: true });
     syncBearingToGuest();
+    syncSubtitleToGuest();
+    syncDanmakuHideToGuest();
+    // 魔改扩展：比例锁定状态可能从控制台改的，按钮要跟上
+    if (next.ratioLocked !== undefined) {
+      $('btnRatio').classList.toggle('locked', !!next.ratioLocked);
+      document.body.classList.toggle('ratio-locked', !!next.ratioLocked);
+    }
     maybeAutoDump();
     if (state.autoPlay) {
       sendPlayer({ cmd: 'play' });
@@ -241,12 +277,56 @@ function roisFor(id) {
   return Array.isArray(b.rois) ? b.rois : [];
 }
 
+/**
+ * 把字幕相关设置下发给访客页。
+ *
+ * 只有「字幕精灵」或「转向提醒」开着才需要访客页干活；两个都关就整体关掉，
+ * 顺带让访客页把注入的原生字幕透明样式撤掉。
+ */
+function syncSubtitleToGuest() {
+  const st = state.boot && state.boot.settings;
+  if (!st) return;
+  const sprite = !!st.enableSubtitleSprite;
+  sendPlayer({
+    cmd: 'subtitle',
+    on: sprite || !!st.enableTurnReminder,
+    // 停留时长：由访客页按视频进度判断过期（暂停不推进、倍速正确）
+    hold: Number(st.subtitleHold) || 3,
+    // 字幕精灵 + 「隐藏原生字幕」都开着时才把播放器那条变透明
+    hideNative: sprite && st.subtitleHideNative !== false,
+    // 是否允许自动点开播放器字幕按钮
+    autoOpen: st.subtitleAutoOpen !== false
+  });
+}
+
+/** 主进程拉到官方字幕轨后通知，转发给访客页切换模式 */
+/**
+ * 隐藏播放器原生弹幕。
+ *
+ * 投影层开着 + 开关开着才藏；否则播放器那条照常显示，
+ * 不然用户会以为「弹幕没了」。
+ */
+function syncDanmakuHideToGuest() {
+  const st = state.boot && state.boot.settings;
+  if (!st) return;
+  sendPlayer({
+    cmd: 'danmaku-hide',
+    on: !!st.enableDanmakuProjection && st.danmakuHideNative !== false
+  });
+}
+
+function syncSubtitleApiToGuest(st) {
+  sendPlayer({ cmd: 'subtitle-api', on: !!(st && st.on) });
+}
+
 function syncBearingToGuest(extra) {
   const b = state.boot.settings.bearing || {};
   sendPlayer({
     cmd: 'bearing',
     on: !!b.enabled,
     rois: roisFor(state.id),
+    // 视觉绿弧开关：关掉时访客页跳过扇形识别，每帧省一次大窗口扫描
+    greenArc: state.boot.settings.enableVisionGreenArc === true,
     ...(extra || {})
   });
 }
@@ -283,7 +363,10 @@ function onGuestBearing(p) {
     viewConfidence: p.viewConfidence || 0,
     viewSource: p.viewSource || '',
     viewWidth: p.viewWidth || 0,
-    hold: !!p.hold
+    hold: !!p.hold,
+    // 魔改扩展：识别健康度随每帧一起上报，主进程拿它算成功率。
+    // 不带上这个字段，控制台的「识别/最近/原因」永远是空的。
+    stats: p.stats || null
   });
 }
 
@@ -677,6 +760,13 @@ function applyState(v) {
   $('timeText').textContent = `${fmt(v.current)} / ${fmt(v.duration)}`;
 
   if (v.title && v.title !== '哔哩哔哩') $('videoTitle').textContent = v.title;
+
+  // 魔改扩展：把播放进度转给主进程 —— 字幕按它查表，弹幕按它切片。
+  // 复用上游已有的心跳（timeupdate 触发），不再单独开定时器。
+  if (v.found) {
+    window.api.subtitleTime({ t: v.current, paused: !v.playing });
+    reportDanmakuTime(v);
+  }
 }
 
 function paintProgress(cur, total) {
@@ -715,6 +805,12 @@ function wireUi() {
     savePlaybackPreference({ muted: !state.boot.settings.muted });
   });
   $('btnSpeed').addEventListener('click', () => window.api.action('cycle-speed'));
+  // 魔改扩展：16:9 比例锁定
+  $('btnRatio').addEventListener('click', async () => {
+    const locked = await window.api.action('ratio-lock');
+    $('btnRatio').classList.toggle('locked', !!locked);
+    document.body.classList.toggle('ratio-locked', !!locked);
+  });
   window.api.onNotice((text) => {
     if (text) toast(text);
   });
@@ -758,7 +854,32 @@ function wireUi() {
     if (!next) return;
     state.boot.settings = next;
     syncBearingToGuest();
+    syncSubtitleToGuest();
+    syncDanmakuHideToGuest();
+    // 关掉开关时立刻清屏，不等停留时长走完
+    if (!next.enableSubtitleSprite) hideSubtitleSprite();
+    if (!next.enableTurnReminder) hideTurnHint();
   });
+
+  // 魔改扩展：缩放冻结 —— 拖窗口边缘时把 webview 按旧尺寸 transform 拉伸，
+  // 避免它每帧重新布局导致边缘闪黑边
+  window.api.onResizePhase((payload) => {
+    if (payload && payload.active) beginResizeFreeze();
+    else endResizeFreeze();
+  });
+
+  // 魔改扩展：贴边吸附提示线
+  window.api.onSnapEdges((payload) => {
+    const edges = (payload && payload.edges) || [];
+    const map = { left: 'snapL', right: 'snapR', top: 'snapT', bottom: 'snapB' };
+    for (const [edge, id] of Object.entries(map)) {
+      const el = $(id);
+      if (el) el.classList.toggle('show', edges.includes(edge));
+    }
+  });
+
+  // 主进程拉到官方字幕轨后通知：转发给访客页切换成「按时间查表」模式
+  window.api.onSubtitleApi((st) => syncSubtitleApiToGuest(st));
 
   // 全屏时标题栏/控制条浮层化（设置入口在启动器里，这里只是为了不挡画面）
   window.api.onWinState((s) => {
@@ -899,6 +1020,9 @@ function applyImmersionState(on) {
     closeCalib();
     state.seeking = false;
   }
+  // 魔改扩展：chrome 高度从 64 变成 0（或反过来），让主进程重新量一次并对齐比例，
+  // 否则沉浸模式下 16:9 视频会上下留黑边
+  window.api.action('ratio-refit');
 }
 
 /* -------------------------------------------------------------- 快捷键 */
@@ -992,4 +1116,391 @@ function toast(text, ms = 2400) {
   el.classList.add('show');
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+/* ================================================================ 魔改扩展
+ * 转向提醒：字幕里出现「左转 / 往东」这类词时，在画面边缘弹一个大箭头。
+ * 整段独立，不引用上游的私有状态。
+ */
+
+const TURN_RULES = [
+  { dir: 'left', group: 'lr', label: '左', re: /(左转|向左|往左|左前|左侧|左边|左拐|左方|靠左)/ },
+  { dir: 'right', group: 'lr', label: '右', re: /(右转|向右|往右|右前|右侧|右边|右拐|右方|靠右)/ },
+  // 抬头 / 低头 也算「上」「下」：都是让你把视线或人往上下挪，不必分两套提示
+  {
+    dir: 'up',
+    group: 'ud',
+    label: '上',
+    re: /(抬头|抬一下头|往上看|向上看|看上面|看上方|上面看|向前|往前|直行|直走|一直走|前行|上楼|往上|向上)/
+  },
+  {
+    dir: 'down',
+    group: 'ud',
+    label: '下',
+    re: /(低头|低一下头|往下看|向下看|看下面|看下方|下面看|向后|往后|后退|倒退|掉头|回头|下楼|往下|向下)/
+  }
+];
+
+let lastTurnAt = 0;
+let lastTurnDir = '';
+
+/** 命中「左」或「右」就发给字幕层；同一方向 1.2 秒内不重复弹 */
+function detectTurn(text) {
+  if (!state.boot || !state.boot.settings.enableTurnReminder) return;
+
+  // 分开启用：只匹配开启的那一组（左右 / 上下）
+  const lr = state.boot.settings.turnEnableLR !== false;
+  const ud = state.boot.settings.turnEnableUD !== false;
+  if (!lr && !ud) return;
+
+  const hit = TURN_RULES.find((r) => {
+    if (r.group === 'lr' && !lr) return false;
+    if (r.group === 'ud' && !ud) return false;
+    return r.re.test(text);
+  });
+  if (!hit) return;
+
+  const now = Date.now();
+  if (hit.dir === lastTurnDir && now - lastTurnAt < 1200) return;
+  lastTurnDir = hit.dir;
+  lastTurnAt = now;
+  console.log('[turn] 命中', hit.dir, '←', text);
+  // 只发单字，UI 里不再拼「转」之类的后缀
+  window.api.turn({ dir: hit.dir, label: hit.label, text });
+}
+
+function hideSubtitleSprite() {
+  window.api.subtitle({ off: true });
+}
+
+/** 收起转向提示（换片 / 关开关时用） */
+function hideTurnHint() {
+  lastTurnDir = '';
+  lastTurnAt = 0;
+  window.api.turn({ off: true });
+}
+
+/* ------------------------------------------------ 魔改扩展：缩放冻结
+ *
+ * 拖窗口边缘时，webview 每帧都要重新布局，边缘会闪黑边。
+ * 做法：冻结时记下 webview 的旧尺寸，用 transform 把它拉伸铺满新的 stage，
+ * 松手后再恢复真实尺寸让 Chromium 重排一次。
+ */
+
+let freezeRect = null;
+let freezeTimer = null;
+
+function beginResizeFreeze() {
+  if (!wv) return;
+  if (!freezeRect) {
+    freezeRect = { width: wv.offsetWidth || 1, height: wv.offsetHeight || 1 };
+    wv.classList.add('resize-freeze');
+    const stage = $('stage');
+    if (stage) stage.classList.add('resizing');
+  }
+  paintResizeFreeze();
+  clearTimeout(freezeTimer);
+  freezeTimer = setTimeout(endResizeFreeze, 180);
+}
+
+function endResizeFreeze() {
+  clearTimeout(freezeTimer);
+  freezeTimer = null;
+  freezeRect = null;
+  if (!wv) return;
+  wv.classList.remove('resize-freeze');
+  wv.style.width = '';
+  wv.style.height = '';
+  wv.style.transform = '';
+  const stage = $('stage');
+  if (stage) stage.classList.remove('resizing');
+}
+
+function paintResizeFreeze() {
+  const stage = $('stage');
+  if (!wv || !freezeRect || !stage) return;
+  const w = stage.clientWidth || 1;
+  const h = stage.clientHeight || 1;
+  wv.style.width = `${freezeRect.width}px`;
+  wv.style.height = `${freezeRect.height}px`;
+  wv.style.transform = `scale(${w / freezeRect.width}, ${h / freezeRect.height})`;
+}
+
+/* ================================================================ 魔改扩展
+ * 字幕方位解析：从字幕里认出「往东 / 东北 / 地图左下角」这类指令，
+ * 转成绝对方位角发给叠加层（雷达模式下点亮对应扇形）。
+ * 上游叠加层没有雷达，收到 cue 也不会响应，所以这套解析可以常开。
+ */
+
+const DIR_NAMES = [
+  { deg: 0, label: '北' },
+  { deg: 45, label: '东北' },
+  { deg: 90, label: '东' },
+  { deg: 135, label: '东南' },
+  { deg: 180, label: '南' },
+  { deg: 225, label: '西南' },
+  { deg: 270, label: '西' },
+  { deg: 315, label: '西北' }
+];
+
+function nearestDirName(deg) {
+  let best = DIR_NAMES[0];
+  let bestD = 999;
+  for (const d of DIR_NAMES) {
+    const diff = Math.abs(((deg - d.deg + 540) % 360) - 180);
+    if (diff < bestD) {
+      bestD = diff;
+      best = d;
+    }
+  }
+  return best.label;
+}
+
+/**
+ * 抽方位原子。返回 Set，元素是 '东'/'西'/'南'/'北' 的子集。
+ * 七步清洗，顺序不能换（尤其「切分」必须在「归一化」之前）。
+ */
+/**
+ * 把一句话拆成「带句内位置的方位片段」。
+ *
+ *   「先往东然后往北」        → [{f:0.00, 东}, {f:0.50, 北}]
+ *   「然后来西南方向地图左下角」→ [{f:0.00, 西南}]
+ *   「我们走吧然后往东」       → [{f:0.60, 东}]
+ *
+ * fraction 是这一小段在整句里的字符位置占比，用来决定它该在什么时候点亮。
+ *
+ * 注意「再」用前瞻切分：只吃掉「再」，保留后面的「往/向/朝」。
+ * 否则「再往东北一点」会被切成「东北一点」，「往」这个上下文就丢了，
+ * 后面的上下文校验会把它当裸字直接跳过。
+ */
+function directionSegments(text) {
+  const raw = String(text || '').replace(/\s+/g, '').slice(0, 500);
+  if (!raw) return [];
+
+  const parts = raw.split(/然后|接着|随后|再(?=往|向|朝|走|去)/);
+  const out = [];
+  let cursor = 0;
+  for (const part of parts) {
+    if (!part) continue;
+    const at = raw.indexOf(part, cursor);
+    const start = at < 0 ? cursor : at;
+    cursor = start + part.length;
+    const atoms = atomsInPhrase(part);
+    if (!atoms.size) continue;
+    out.push({
+      // 夹到 0.95：最后一段也不该排到句子结束之后
+      fraction: Math.min(0.95, start / Math.max(1, raw.length)),
+      atoms
+    });
+  }
+  return out;
+}
+
+
+/** 在**单个**片段里抽方位原子（七步清洗的后六步） */
+function atomsInPhrase(text) {
+  let s = String(text || '');
+  if (!s) return new Set();
+
+  // 2) 剔除含方位字但根本不是方向的词（「这东西不错」「东北虎」）
+  s = s.replace(/东西南北|东西(?:方)?|北京|南京|东京|西瓜|东北虎|东风|南瓜/g, '');
+
+  // 3) 口语说法归一化：北偏东 / 东偏北 → 东北
+  s = s.replace(/北偏东|东偏北/g, '东北');
+  s = s.replace(/南偏东|东偏南/g, '东南');
+  s = s.replace(/北偏西|西偏北/g, '西北');
+  s = s.replace(/南偏西|西偏南/g, '西南');
+
+  // 4) 否定句不触发：「不要往东」「别往南走」。
+  //    原来那套硬正则会把「不要往东」点亮成东，直接指反方向。
+  s = s.replace(
+    /(?:不要|别|不能|不是|不往|不向|不朝)[^，。；！？,;!?]{0,6}?[东西南北](?:[东西南北])?(?:方向|边|方)?/g,
+    ''
+  );
+
+  // 5) 匹配 1~2 个方位字，但**要求上下文**，避免「上面有个宝箱」这类裸字误触发
+  const found = new Set();
+  const re = /[东西南北]{1,2}/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const word = m[0];
+    const before = s.slice(Math.max(0, m.index - 4), m.index);
+    const after = s.slice(m.index + word.length, m.index + word.length + 4);
+    const ok =
+      s === word ||
+      s === '正' + word ||
+      /往|向|朝|面|转|偏/.test(before) ||
+      /^(方向|边|方|侧|面|角|走|前进|这边)/.test(after);
+    if (!ok) continue;
+    for (const ch of word) found.add(ch);
+  }
+  return found;
+}
+
+
+/**
+ * 原子集合 → 罗盘角（0=北、顺时针）。
+ * 冲突（东西同时出现 / 南北同时出现）或空集返回 null。
+ */
+function atomsToCompass(active) {
+  if (!active || !active.size) return null;
+  if (active.has('东') && active.has('西')) return null;
+  if (active.has('南') && active.has('北')) return null;
+  const x = (active.has('东') ? 1 : 0) - (active.has('西') ? 1 : 0);
+  const y = (active.has('南') ? 1 : 0) - (active.has('北') ? 1 : 0);
+  if (!x && !y) return null;
+  // atan2(x, -y)：正北 = 0°，正东 = 90°，正南 = 180°，正西 = 270°
+  let deg = (Math.atan2(x, -y) * 180) / Math.PI;
+  if (deg < 0) deg += 360;
+  return deg;
+}
+
+/** 每来一句新字幕就 +1；延时任务发现 token 变了就放弃，避免旧句子的方向串到新句子 */
+let compassToken = 0;
+/** 上一次点亮的方位与时间，用于同方位去抖（800ms 内不重复点亮） */
+let lastCompassCue = { deg: -1, at: 0 };
+/** 上一次处理过的字幕原文：同一句被反复推送时不再重复点亮 */
+let lastCompassText = '';
+
+/** 真正点亮一个方位（带同方位去抖） */
+function fireCompassCue(deg) {
+  const now = Date.now();
+  // 同一方位在停留时间内不重复点亮。
+  // 按文字去重不够：AI 字幕会逐字上屏，同一句话每次都是不同的字符串，
+  // 每次都算「新字幕」就每次都点亮一次，看着就是不停闪。按角度去重才可靠。
+  if (Math.abs(deg - lastCompassCue.deg) < 1 && now - lastCompassCue.at < 3000) return;
+  lastCompassCue = { deg, at: now };
+  // 留一行日志：F12 打开浮窗控制台就能看到每次点亮，
+  // 判断「闪两下」到底是同方位重复触发还是两个不同方位交替。
+  console.log('[compass] 点亮', Math.round(deg), nearestDirName(deg), '←', lastCompassText.slice(0, 40));
+  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg) });
+}
+
+/**
+ * 一句字幕里可能有多条方向指令，按句内位置依次点亮。
+ *
+ *   「先往东然后往北」→ 立刻亮东，约半句之后亮北
+ *
+ * 时长怎么估：我们没有字幕的精确 from/to（那是官方字幕接口才有的），
+ * 只能按字数估口播时长 —— 中文攻略口播约 5 字/秒，取 0.18 秒/字，
+ * 夹在 1.2~8 秒之间。误差肯定有，但「同一句里第二个方向要不要亮」
+ * 这件事本身比精确时刻更重要。
+ */
+/**
+ * 去掉括号里的补充说明。
+ *
+ * 「东方向 地图右边（西方向 地图左边）」括号里是对同一位置的复述，
+ * 但它带着「西」字，和前面的「东」一起送进 atomsToCompass 会被判成
+ * 自相矛盾，整句直接不亮 —— 明明字幕说得很清楚，雷达却没反应。
+ */
+function stripParens(text) {
+  return String(text || '').replace(/[（(][^）)]*[）)]/g, '');
+}
+
+/** 地图方位 → 角度。小地图固定北朝上，所以右边就是东。 */
+const MAP_POS_DEG = {
+  上: 0, 右上: 45, 右: 90, 右下: 135,
+  下: 180, 左下: 225, 左: 270, 左上: 315
+};
+
+/**
+ * 认「地图右边 / 地图左下角 / 小地图上方」这类位置说法。
+ * 顺序有意义：右上要排在右前面，否则「右上」会被当成「右」。
+ */
+function mapPositionSegments(text) {
+  const raw = String(text || '').replace(/\s+/g, '').slice(0, 500);
+  if (!raw) return [];
+
+  const re = /(?:小?地图)(?:的)?(右上|右下|左上|左下|上|下|左|右)(?:边|侧|角|方向|方位|位置)?/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(raw))) {
+    const deg = MAP_POS_DEG[m[1]];
+    if (typeof deg !== 'number') continue;
+    out.push({ fraction: Math.min(0.95, m.index / Math.max(1, raw.length)), deg });
+  }
+  return out;
+}
+
+function detectCompassDir(text) {
+  // 播放器会把同一句字幕反复推送（面板每次刷新都算一次），
+  // 每次推送都点亮的话，开头那段双闪动画就会反复播，看起来像「闪两下」。
+  // 同一句只认第一次。
+  const key = String(text || '').replace(/\s+/g, '');
+  if (!key || key === lastCompassText) return;
+  lastCompassText = key;
+
+  // 优先认地图位置：字幕里出现「地图右边」时它就是权威描述，
+  // 同一句里的「东方向」通常只是复述，两边一起点亮会互相打架。
+  const mapSegs = mapPositionSegments(stripParens(text));
+  const segs = mapSegs.length
+    ? mapSegs
+    : directionSegments(text)
+        .map((seg) => ({ fraction: seg.fraction, deg: atomsToCompass(seg.atoms) }))
+        .filter((seg) => seg.deg !== null); // 自相矛盾的方向直接跳过
+
+  if (!segs.length) return;
+
+  const token = ++compassToken;
+  const len = String(text || '').replace(/\s+/g, '').length;
+  /* 按方位在句子里的位置做一点推迟，让点亮大致跟上语音。
+   * 但上限必须压住：原来最长 8 秒，字幕早就翻到下一句了圈还没亮，
+   * 用户感知就是「雷达慢半拍」。现在最多 2 秒，短句基本是立刻。 */
+  const est = Math.min(2, Math.max(0.6, len * 0.12));
+
+  for (const seg of segs) {
+    const delay = Math.round(seg.fraction * est * 1000);
+    if (delay <= 0) {
+      fireCompassCue(seg.deg);
+      continue;
+    }
+    setTimeout(() => {
+      // 这中间来了新字幕，说明这句已经过时，别再点亮旧方向
+      if (token !== compassToken) return;
+      fireCompassCue(seg.deg);
+    }, delay);
+  }
+}
+
+/* ------------------------------------------ 魔改扩展：弹幕时间上报
+ *
+ * 不能直接把心跳里的 current 转发出去 —— 那样拖动进度条时不会带 seek 标记，
+ * 弹幕层还按旧队列继续飘，看起来就是「拖完弹幕全乱」。
+ *
+ * 三条规则：
+ *   · 播放/暂停立刻上报（不能被节流吞掉，否则暂停后还要再飘一秒）
+ *   · 进度跳变 > 2 秒判定为拖动，带 seek 标记让弹幕层清队重排
+ *   · 其余情况 1 秒节流，避免每帧都发 IPC
+ */
+
+let lastDmTime = -1;
+let lastDmReport = 0;
+let lastDmPlaying = null;
+
+function reportDanmakuTime(v) {
+  if (!state.boot || !state.boot.settings.enableDanmakuProjection) return;
+  if (!v || !v.found || !Number.isFinite(v.current)) return;
+
+  const now = Date.now();
+
+  if (lastDmPlaying !== v.playing) {
+    lastDmPlaying = v.playing;
+    lastDmTime = v.current;
+    lastDmReport = now;
+    window.api.danmakuTime({ t: v.current, playing: !!v.playing });
+    return;
+  }
+
+  const jumped = lastDmTime >= 0 && Math.abs(v.current - lastDmTime) > 2;
+  if (jumped) {
+    lastDmTime = v.current;
+    lastDmReport = now;
+    window.api.danmakuTime({ t: v.current, seek: true, playing: !!v.playing });
+    return;
+  }
+
+  lastDmTime = v.current;
+  if (now - lastDmReport < 1000) return;
+  lastDmReport = now;
+  window.api.danmakuTime({ t: v.current, playing: !!v.playing });
 }

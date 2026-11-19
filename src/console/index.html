@@ -16,6 +16,7 @@
     <input class="nav-radio" type="radio" name="nav" id="tab-bearing" />
     <input class="nav-radio" type="radio" name="nav" id="tab-window" />
     <input class="nav-radio" type="radio" name="nav" id="tab-hotkeys" />
+    <input class="nav-radio" type="radio" name="nav" id="tab-media" />
 
     <!-- 线性图标：内联 SVG symbol，不依赖字体或外部资源（CSP 只允许 self） -->
     <svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -27,7 +28,11 @@
       <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9" /><circle cx="15" cy="7" r="2" /><circle cx="9" cy="17" r="2" /></symbol>
       <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></symbol>
       <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4l9 16H3z" /><path d="M12 10v4M12 17h.01" /></symbol>
-      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z" /></symbol>
+    <symbol id="i-map" viewBox="0 0 24 24"><path d="M3 6l6-3 6 3 6-3v15l-6 3-6-3-6 3z" /><path d="M9 3v15M15 6v15" /></symbol>
+    <symbol id="i-swords" viewBox="0 0 24 24"><path d="M4 4l10 10M4 4v4M4 4h4" /><path d="M20 4L10 14M20 4v4M20 4h-4" /><path d="M6 18l3-3M18 18l-3-3" /></symbol>
+    <symbol id="i-resize" viewBox="0 0 24 24"><rect x="3" y="3" width="12" height="12" rx="1.5" /><path d="M9 21h12V9" /></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></symbol>
       <symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3zM12 14v7" /></symbol>
       <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 6.5 12 6.5 21.5 12 21.5 12 18 17.5 12 17.5 2.5 12 2.5 12z" /><circle cx="12" cy="12" r="2.5" /></symbol>
       <symbol id="i-cursor" viewBox="0 0 24 24"><path d="M5 3l14 8-6.5 1.5L9.5 19z" /></symbol>
@@ -57,6 +62,9 @@
           </label>
           <label class="nav-item" for="tab-hotkeys" title="快捷键">
             <svg class="ico"><use href="#i-keyboard"></use></svg><span>快捷键</span>
+          </label>
+          <label class="nav-item" for="tab-media" title="字幕弹幕">
+            <svg class="ico"><use href="#i-video"></use></svg><span>字幕弹幕</span>
           </label>
         </nav>
 
@@ -172,6 +180,7 @@
                   <span class="grow"></span>
                   <span id="floatState" class="badge off">浮窗未启动</span>
                   <button id="btnStop" class="small" disabled>关闭浮窗</button>
+                  <button id="btnOpenData" class="small ghost" title="打开设置与标定所在的目录">数据目录</button>
                 </div>
               </div>
             </section>
@@ -222,6 +231,38 @@
                   </span>
                 </div>
 
+                <label class="setting" for="setOverlayRadar">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>圈上加四轴方位</strong>
+                    <small>开 = 圆环上多画北/东/南/西四轴，字幕里出现方位时点亮对应方向；关 = 只画圆环、红箭头、绿弧（原版画法）</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setOverlayRadar" /></span>
+                </label>
+
+                <label class="setting" for="setGreenArc">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>镜头朝向绿弧</strong>
+                    <small>从视频小地图上估算镜头朝向</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setGreenArc" /></span>
+                </label>
+
+                <label class="setting" for="setAlertEnabled">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>放大提醒</strong>
+                    <small>方位标定亮起时，把你游戏小地图那块抓一帧放大显示；雷达灭了它也跟着灭</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setAlertEnabled" /></span>
+                </label>
+
+                <div class="tool-row">
+                  <span class="tool-label">位置</span>
+                  <button id="btnAlertPlace" class="small">拖动提醒窗位置</button>
+                </div>
+
                 <!-- 主流程只有两步，单独做成大按钮；排查工具降一级放在下面 -->
                 <div class="setting setting-stack">
                   <span class="setting-ico"><svg class="ico"><use href="#i-target"></use></svg></span>
@@ -231,6 +272,19 @@
                     <button id="btnPlace" class="step-btn">② 拖到我的游戏小地图上</button>
                     <button id="btnAutoCenter" class="step-btn span2">③ 自动定心（点一下，程序自己对准圆心并记住）</button>
                   </div>
+                </div>
+
+                <div class="tool-row">
+                  <span class="tool-label">识别</span>
+                  <span class="health-line" id="healthSummary">等待视频载入…</span>
+                </div>
+                <div class="tool-row">
+                  <span class="tool-label">最近</span>
+                  <span class="health-line" id="healthLastOk">—</span>
+                </div>
+                <div class="tool-row">
+                  <span class="tool-label">原因</span>
+                  <span class="health-line" id="healthReason">—</span>
                 </div>
 
                 <div class="tool-row">
@@ -309,6 +363,60 @@
 
             <section class="card">
               <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-shield"></use></svg></span>
+                <div class="card-heading">
+                  <h2>沉浸模式防遮挡</h2>
+                  <p>纯视频沉浸（Alt+I）下，自动判断什么时候不该把窗口淡掉</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="setting" for="setAvoidHide">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-map"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>讲地图时不淡出</strong>
+                    <small>字幕出现「地图 / 锚点 / 传送」时强制不透明，看完这几秒再恢复</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setAvoidHide" /></span>
+                </label>
+
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>保持时长</strong>
+                    <small>关键词出现后保持不透明多久</small>
+                  </span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setAvoidHold" min="1" max="10" step="1" />
+                    <span class="val" id="avoidHoldVal">4s</span>
+                  </span>
+                </div>
+
+                <label class="setting" for="setCombatFade">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-swords"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>战斗时半透明</strong>
+                    <small>按 Q / R，或左键长按 0.5 秒、2 秒内连点 3 下，自动压暗 3 秒</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setCombatFade" /></span>
+                </label>
+
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>战斗半透明度</strong>
+                    <small>越小越透明（75 = 保留四分之三）</small>
+                  </span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setCombatOpacity" min="10" max="100" step="5" />
+                    <span class="val" id="combatOpacityVal">75%</span>
+                  </span>
+                </div>
+
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
                 <span class="card-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
                 <div class="card-heading">
                   <h2>显示与声音</h2>
@@ -348,6 +456,73 @@
               </div>
               <div class="card-body">
                 <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>常规倍速</strong>
+                    <small>热键 Alt+S 循环切换</small>
+                  </span>
+                  <span class="setting-ctrl">
+                    <select id="setPlaybackRate" class="sel">
+                      <option value="0.5">0.5 倍</option>
+                      <option value="0.75">0.75 倍</option>
+                      <option value="1">1 倍</option>
+                      <option value="1.25">1.25 倍</option>
+                      <option value="1.5">1.5 倍</option>
+                      <option value="2">2 倍</option>
+                      <option value="3">3 倍</option>
+                    </select>
+                  </span>
+                </div>
+
+                <label class="setting" for="setRatioLock">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-resize"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>锁定 16:9 比例</strong>
+                    <small>锁的是视频内容区，不含标题栏和控制条；浮窗底部也有个 16:9 按钮</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setRatioLock" /></span>
+                </label>
+
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-pin"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>贴边吸附微调</strong>
+                    <small>贴边后仍有缝隙就往外推，切边就往回收</small>
+                  </span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setSnapAdjust" min="-20" max="20" step="1" />
+                    <span class="val" id="snapAdjustVal">—</span>
+                  </span>
+                </div>
+
+                <label class="setting" for="setMuted">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-volume"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>静音</strong>
+                    <small>关掉恢复原来的音量</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setMuted" /></span>
+                </label>
+
+                <label class="setting" for="setCloseToTray">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>关闭启动器时最小化到托盘</strong>
+                    <small>关掉后点 X 直接退出整个程序</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setCloseToTray" /></span>
+                </label>
+
+                <label class="setting" for="setTrayClickFloat">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>托盘单击切换浮窗</strong>
+                    <small>关掉则单击显示启动器（双击始终显示启动器）</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setTrayClickFloat" /></span>
+                </label>
+
+                <div class="setting">
                   <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
                   <span class="setting-text"><strong><label for="setHoldRate">长按临时倍速</label></strong><small id="holdRateHint">按住 F8 临时加速，松开恢复常规倍速；临时值不会替换保存的常规倍速。</small></span>
                   <span class="setting-ctrl">
@@ -366,6 +541,349 @@
           </div>
 
           <!-- -------------------------------------------------------- 快捷键 -->
+          <div class="pane pane-media">
+            <div class="pane-head">
+              <h1>字幕弹幕</h1>
+              <p>字幕层和弹幕层都是独立的全屏透明窗口，叠在游戏之上，不接收鼠标。</p>
+            </div>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-video"></use></svg></span>
+                <div class="card-heading">
+                  <h2>字幕</h2>
+                  <p>从 B 站视频里读出字幕，放大显示在屏幕底部</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="setting" for="setSubtitleSprite">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>启用底部字幕精灵</strong>
+                    <small>自动点开播放器字幕，把文本放大显示在画面底部</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubtitleSprite" /></span>
+                </label>
+
+                <label class="setting" for="setSubHideNative">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>隐藏播放器原生字幕</strong>
+                    <small>只留字幕精灵这一条；关掉则原生小字幕和精灵同时显示</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubHideNative" /></span>
+                </label>
+
+                <label class="setting" for="setSubUseApi">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-resume"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>优先使用官方字幕接口</strong>
+                    <small>能拿到带时间戳的字幕轨，暂停和拖动都准；关掉只抓网页文字</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubUseApi" /></span>
+                </label>
+
+                <label class="setting" for="setSubMergeOverlap">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>合并同一时刻的多行字幕</strong>
+                    <small>关掉只显示最新一条，句子更短</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubMergeOverlap" /></span>
+                </label>
+
+                <label class="setting" for="setSubHideOnPause">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>暂停时隐藏字幕</strong>
+                    <small>关掉则暂停后字幕保持显示</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubHideOnPause" /></span>
+                </label>
+
+                <label class="setting" for="setSubAutoOpen">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>自动点开播放器字幕按钮</strong>
+                    <small>关掉后不改动播放器；只有官方接口能用时才有字幕</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubAutoOpen" /></span>
+                </label>
+
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-info"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>字幕来源</strong>
+                    <small id="subSourceText">等待视频载入…</small>
+                  </span>
+                  <span class="setting-ctrl">
+                    <button id="btnSubRefetch" class="ghost">重新读取</button>
+                  </span>
+                </div>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                <div class="card-heading">
+                  <h2>字幕外观</h2>
+                  <p>字号按屏幕高度等比缩放，换分辨率也不会突然变小</p>
+                </div>
+                <button id="btnSubReset" class="small ghost">恢复默认</button>
+              </div>
+              <div class="card-body">
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#sliders"></use></svg></span>
+                  <span class="setting-text"><strong>字号</strong><small>相对默认字号的百分比</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubScale" min="50" max="200" step="5" /><span class="val" id="subScaleVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#resize"></use></svg></span>
+                  <span class="setting-text"><strong>垂直偏移</strong><small>距屏幕底边的像素</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubOffset" min="10" max="500" step="5" /><span class="val" id="subOffsetVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#eye"></use></svg></span>
+                  <span class="setting-text"><strong>背景不透明度</strong><small>0 = 完全透明，只留文字</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubBg" min="0" max="100" step="5" /><span class="val" id="subBgVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#window"></use></svg></span>
+                  <span class="setting-text"><strong>背景圆角</strong><small>像素</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubRadius" min="0" max="24" step="1" /><span class="val" id="subRadiusVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#sliders"></use></svg></span>
+                  <span class="setting-text"><strong>字重</strong><small>越大越粗</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubWeight" min="500" max="900" step="50" /><span class="val" id="subWeightVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#resize"></use></svg></span>
+                  <span class="setting-text"><strong>最大宽度</strong><small>占屏幕宽度的百分比</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubMaxWidth" min="30" max="100" step="2" /><span class="val" id="subMaxWidthVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#clock"></use></svg></span>
+                  <span class="setting-text"><strong>停留时长</strong><small>秒；按视频进度计算</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setSubHold" min="1" max="10" step="1" /><span class="val" id="subHoldVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text"><strong>文字颜色</strong><small>字幕本身的颜色</small></span>
+                  <span class="setting-ctrl"><input type="color" id="setSubColor" /></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-warn"></use></svg></span>
+                  <span class="setting-text"><strong>描边方式</strong><small>深色画面上更清楚</small></span>
+                  <span class="setting-ctrl">
+                    <select id="setSubStroke" class="sel">
+                      <option value="none">无描边</option>
+                      <option value="outline">黑边描边</option>
+                      <option value="shadow">黑色投影</option>
+                    </select>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text"><strong>水平位置</strong><small>靠左 / 居中 / 靠右</small></span>
+                  <span class="setting-ctrl">
+                    <select id="setSubPos" class="sel">
+                      <option value="center">居中</option>
+                      <option value="left">靠左</option>
+                      <option value="right">靠右</option>
+                    </select>
+                  </span>
+                </div>
+                <label class="setting" for="setSubKeepRatio">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-resize"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>字号随屏幕等比缩放</strong>
+                    <small>关掉则固定字号，不随分辨率变化</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubKeepRatio" /></span>
+                </label>
+                <label class="setting" for="setSubFade">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>淡入淡出</strong>
+                    <small>关掉则字幕瞬间出现和消失</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setSubFade" /></span>
+                </label>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-volume"></use></svg></span>
+                <div class="card-heading">
+                  <h2>弹幕</h2>
+                  <p>把 B 站弹幕镜像到一块全屏透明置顶层上飘过</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="setting" for="setDanmaku">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>启用全屏弹幕投影</strong>
+                    <small>弹幕飘在游戏画面上，鼠标完全穿透</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setDanmaku" /></span>
+                </label>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-volume"></use></svg></span>
+                <div class="card-heading">
+                  <h2>弹幕外观</h2>
+                  <p>只影响投影层，不改 B 站播放器里的弹幕</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#resize"></use></svg></span>
+                  <span class="setting-text"><strong>显示区域高度</strong><small>占屏幕高度的百分比</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setDmArea" min="10" max="100" step="5" /><span class="val" id="dmAreaVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#eye"></use></svg></span>
+                  <span class="setting-text"><strong>不透明度</strong><small>百分比</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setDmOpacity" min="0" max="100" step="5" /><span class="val" id="dmOpacityVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#sliders"></use></svg></span>
+                  <span class="setting-text"><strong>字号</strong><small>相对默认字号的百分比</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setDmScale" min="50" max="200" step="5" /><span class="val" id="dmScaleVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#clock"></use></svg></span>
+                  <span class="setting-text"><strong>滚动速度</strong><small>0 最慢，100 最快</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setDmSpeed" min="0" max="100" step="5" /><span class="val" id="dmSpeedVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#sliders"></use></svg></span>
+                  <span class="setting-text"><strong>字重</strong><small>越大越粗</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setDmWeight" min="400" max="900" step="50" /><span class="val" id="dmWeightVal">—</span></span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#sliders"></use></svg></span>
+                  <span class="setting-text"><strong>同屏上限</strong><small>防止过密</small></span>
+                  <span class="setting-ctrl"><input type="range" id="setDmMax" min="10" max="150" step="5" /><span class="val" id="dmMaxVal">—</span></span>
+                </div>
+                <label class="setting" for="setDmHideNative">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>隐藏播放器原生弹幕</strong>
+                    <small>投影开着时把播放器那层藏掉，避免同一批弹幕出现两遍</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setDmHideNative" /></span>
+                </label>
+
+                <label class="setting" for="setDmStroke">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-warn"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>四向黑描边</strong>
+                    <small>浅色画面上更清楚</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setDmStroke" /></span>
+                </label>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                <div class="card-heading">
+                  <h2>转向提醒</h2>
+                  <p>字幕里出现「左转 / 往东」等词时，在画面边缘弹一个大箭头</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="setting" for="setTurnReminder">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>启用转向提醒</strong>
+                    <small>和字幕精灵共用同一个透明层</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setTurnReminder" /></span>
+                </label>
+                <label class="setting" for="setTurnLR">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>左右方向</strong>
+                    <small>左转 / 右转</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setTurnLR" /></span>
+                </label>
+                <label class="setting" for="setTurnUD">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
+                  <span class="setting-text">
+                    <strong>上下方向</strong>
+                    <small>往上 / 往下</small>
+                  </span>
+                  <span class="switch"><input type="checkbox" id="setTurnUD" /></span>
+                </label>
+
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-resize"></use></svg></span>
+                  <span class="setting-text"><strong>贴边距离</strong><small>箭头离屏幕边缘多远</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setTurnOffset" min="10" max="400" step="10" />
+                    <span class="val" id="turnOffsetVal">—</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                  <span class="setting-text"><strong>整体缩放</strong><small>箭头大小</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setTurnScale" min="60" max="200" step="5" />
+                    <span class="val" id="turnScaleVal">—</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
+                  <span class="setting-text"><strong>停留时长</strong><small>秒</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setTurnDuration" min="1" max="10" step="1" />
+                    <span class="val" id="turnDurationVal">—</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text"><strong>不透明度</strong><small>百分比</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setTurnOpacity" min="20" max="100" step="5" />
+                    <span class="val" id="turnOpacityVal">—</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-target"></use></svg></span>
+                  <span class="setting-text"><strong>左右提示的垂直位置</strong><small>占屏幕高度的百分比</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setTurnPosY" min="5" max="95" step="5" />
+                    <span class="val" id="turnPosYVal">—</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-target"></use></svg></span>
+                  <span class="setting-text"><strong>上下提示的水平位置</strong><small>占屏幕宽度的百分比</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setTurnPosX" min="5" max="95" step="5" />
+                    <span class="val" id="turnPosXVal">—</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text"><strong>箭头颜色</strong><small></small></span>
+                  <span class="setting-ctrl"><input type="color" id="setTurnColor" /></span>
+                </div>
+              </div>
+            </section>
+          </div>
+
           <div class="pane pane-hotkeys">
             <div class="pane-head">
               <h1>全局快捷键</h1>

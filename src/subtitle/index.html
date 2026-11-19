@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';"
+    />
+    <title>GIFA 字幕层</title>
+    <link rel="stylesheet" href="subtitle.css" />
+  </head>
+  <body>
+    <!-- 全屏透明窗口，只负责画字幕。鼠标事件由主进程整窗穿透，
+         所以这里的 pointer-events 只是双保险，不承担功能。 -->
+    <!-- 转向提示：贴屏幕左/右边缘垂直居中的一枚发光箭头。
+         刻意做小（100px 宽），只做边缘点缀，不挡画面。 -->
+    <div id="turn" aria-live="assertive">
+      <span class="turn-arrow" id="turnArrow">←</span>
+      <span class="turn-label" id="turnLabel">左</span>
+    </div>
+
+    <div id="sub" role="status" aria-live="polite"></div>
+    <script src="subtitle.js"></script>
+  </body>
+</html>

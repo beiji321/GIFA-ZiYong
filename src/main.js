@@ -5,7 +5,21 @@
  * 职责：无边框置顶窗口、全局快捷键、B 站视频解析、设置持久化
  */
 
-const { app, BrowserWindow, globalShortcut, ipcMain, powerMonitor, powerSaveBlocker, screen, session, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  globalShortcut,
+  ipcMain,
+  nativeImage,
+  powerMonitor,
+  powerSaveBlocker,
+  screen,
+  session,
+  shell,
+  desktopCapturer
+} = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync, spawn } = require('node:child_process');
@@ -417,7 +431,31 @@ function dropLegacySeeds(list) {
 const DEFAULT_SETTINGS = {
   // 内容区 896×504 正好 16:9，加上标题栏 30 + 控制条 34 = 604
   bounds: { width: 896, height: 568, x: null, y: null, aspect: 2 },
+  // 位置的比例表示（0~1），与 bounds.x/y 并存。
+  // 换显示器 / 改分辨率 / 改 DPI 后同一个像素坐标会落到完全不同的相对位置，
+  // 存「相对工作区的比例 + 显示器标识」才能跨设备恢复。
+  windowXRatio: null,
+  windowYRatio: null,
+  windowDisplayId: null,
+  windowDisplayBounds: null,
+  // 贴边吸附造成的出屏溢出，单独存像素，不参与比例换算
+  windowSnapDx: 0,
+  windowSnapDy: 0,
   pinned: true,
+  // 16:9 比例锁定：锁的是「视频内容区」，不含标题栏与控制条
+  ratioLocked: false,
+  // 贴边吸附的手动微调（-20 ~ +20 px）：正值整体外推补缝隙，负值回缩消切边
+  snapAdjustment: 0,
+  // 叠加层渲染方式：false = 上游原版（圆环+箭头），true = 四轴罗盘雷达
+  overlayRadar: false,
+  // 放大提醒：方向变化时把叠加层底下那块（也就是游戏小地图）抓一帧放大显示
+  alertEnabled: false,
+  alertX: null,
+  alertY: null,
+  // 关闭启动器时最小化到托盘（false = 点 X 直接退出整个程序）
+  closeToTray: true,
+  // 托盘单击行为：'launcher' 显示启动器（默认） | 'float' 切换浮窗
+  trayClickAction: 'launcher',
   opacity: 1,
   clickThrough: false,
   mode: 'web',
@@ -426,7 +464,13 @@ const DEFAULT_SETTINGS = {
   playbackRate: 1,
   holdPlaybackRate: 2,
   hoverFadeEnabled: true,
-  muxed: false,
+  /* --- 沉浸模式下的三条防遮挡规则 --- */
+  // 字幕出现「地图 / 锚点 / 传送」时不淡出（要看地图）
+  avoidHideEnabled: true,
+  avoidHideHold: 4,
+  // 检测到战斗动作时临时压暗，别挡住画面
+  combatFadeEnabled: true,
+  combatOpacity: 75,
   lastText: '',
   lastPart: 1,
   // 「上次看到」：光有 lastText/lastPart 不够 —— 用户记不住的是「哪个视频、第几 P」，
@@ -438,6 +482,63 @@ const DEFAULT_SETTINGS = {
   // 下次启动直接把浮窗起来继续播，不用每次重粘链接
   resumeOnLaunch: true,
   hotkeys: { ...DEFAULT_HOTKEYS },
+  // 字幕精灵：自动点开 B 站播放器字幕并把文本镜像到浮窗底部
+  enableSubtitleSprite: false,
+  // 优先用官方字幕接口（带精确时间戳，暂停/拖动都准）。
+  // 关掉就只走 DOM 抓取。
+  subtitleUseApi: true,
+  // 隐藏播放器原生字幕：避免「原生小字幕 + 精灵大字幕」两条同时出现。
+  // 只影响显示，不影响抓取（元素还在 DOM 里）。
+  subtitleHideNative: true,
+  // 同一时刻有多行字幕时合并显示；关掉只取最新一条
+  subtitleMergeOverlap: true,
+  // 暂停时隐藏字幕；默认保持显示
+  subtitleHideOnPause: false,
+  // 自动点开播放器字幕按钮。关掉后不改动播放器，只有官方接口能给字幕
+  subtitleAutoOpen: true,
+  // 视觉绿弧（镜头朝向）：低画质下极易乱飘，默认关闭。
+  // 关掉时访客页直接不跑扇形识别，省 CPU。
+  enableVisionGreenArc: false,
+  // 字幕转向提醒：字幕里出现「左转/右转/往东」等词时弹大箭头
+  enableTurnReminder: true,
+  // 分组开关：左右 / 上下 可以分开启用
+  turnEnableLR: true,
+  turnEnableUD: true,
+  // 转向提示外观：贴边距离(px)、整体缩放(%)、停留时长(秒)、不透明度(%)
+  turnOffset: 400,
+  turnScale: 100,
+  turnDuration: 2,
+  turnOpacity: 85,
+  turnColor: '#49b2fc',
+  // 左右提示的垂直位置（%），上下提示的水平位置（%）
+  turnPosY: 50,
+  turnPosX: 50,
+  // 字幕外观（对应「B站设置 → 底部字幕精灵」的各个控件）
+  subtitleScale: 100,          // 字号 50-200%
+  subtitleColor: '#ffffff',    // 文字颜色
+  subtitleStroke: 'outline',   // none | outline(四向黑边) | shadow(单向投影)
+  subtitlePos: 'center',       // center | left | right
+  subtitleOffset: 230,         // 距屏幕底边 px，10-500（默认按用户实测调到 230）
+  subtitleBgOpacity: 70,       // 背景不透明度 0-100%
+  subtitleKeepRatio: true,     // 等比缩放（随屏幕高度放大）
+  subtitleFade: true,          // 淡入淡出
+  subtitleHold: 3,             // 一句话停留多久（秒）
+  subtitleMaxWidth: 88,        // 字幕最大宽度（% 屏宽）
+  subtitleWeight: 800,         // 字重 500-900
+  subtitleRadius: 8,           // 背景圆角(px)
+  // 全屏弹幕投影：把 B 站弹幕镜像到一块全屏透明置顶层上飘过
+  enableDanmakuProjection: false,
+  // 隐藏播放器原生弹幕：避免同一批弹幕在画面里出现两遍。
+  // 只影响显示，弹幕数据走官方接口，和播放器画不画无关。
+  danmakuHideNative: true,
+  // 弹幕外观：显示区域高度占比(%)、不透明度(%)、字号(%)、速度(0慢~100快)
+  danmakuArea: 50,
+  danmakuOpacity: 80,
+  danmakuScale: 100,
+  danmakuSpeed: 50,
+  danmakuWeight: 700,          // 字重 400-900
+  danmakuMax: 60,              // 同屏弹幕上限（防过密）
+  danmakuStroke: true,         // 四向黑描边
   bearing: {
     enabled: false,
     /**
@@ -455,7 +556,12 @@ const DEFAULT_SETTINGS = {
     // 叠加层：圆环半径（屏幕像素）与圆心屏幕坐标
     radius: 110,
     x: null,
-    y: null
+    y: null,
+    // 圆心的比例表示（相对所在显示器工作区）与显示器标识，跨分辨率恢复用
+    xRatio: null,
+    yRatio: null,
+    displayId: null,
+    displayBounds: null
   }
 };
 
@@ -528,6 +634,16 @@ let hoverFaded = false;
 let hoverTimer = null;
 let hoverCandidate = false;
 let hoverCandidateAt = 0;
+/** 智能防遮挡：在此之前强制不透明（毫秒时间戳） */
+let avoidUntil = 0;
+let avoidTimer = null;
+/** 战斗防遮挡：在此之前压暗 */
+let combatUntil = 0;
+let combatTimer = null;
+/** 左键长按判定用 */
+let combatDownAt = 0;
+/** 连点判定用（最近几次左键点击时间） */
+let combatClicks = [];
 
 /* ------------------------------------------------------------------ 设置 */
 
@@ -713,10 +829,19 @@ function createWindow() {
   if (win && !win.isDestroyed()) {
     win.showInactive();
     applyPin();
+    // 幂等分支也要保证叠加层在场（它可能被单独关掉过）
+    ensureOverlayVisible();
+    // 比例锁定同样要补：关浮窗只是隐藏窗口，再打开走的就是这条分支。
+    // 少了这一句，锁定开着但窗口还按上次的尺寸回来，得手动关开一次开关才生效。
+    if (settings.ratioLocked) applyRatioLock();
     return win;
   }
 
-  const bounds = clampBounds(settings.bounds);
+  // 优先按比例恢复：换过分辨率/DPI 后像素坐标会飘，比例才稳。
+  // restoreWindowRatio 只返回 x/y，必须和原 bounds 合并，否则宽高会丢。
+  const clamped = clampBounds(settings.bounds);
+  const byRatio = restoreWindowRatio(clamped);
+  const bounds = byRatio ? { ...clamped, x: byRatio.x, y: byRatio.y } : clamped;
   // 老的扁条尺寸被纠正过一次就记下来，之后用户自己拉成什么比例都不再干预
   if (settings.bounds.aspect !== 2) {
     settings.bounds = { ...bounds, aspect: 2 };
@@ -777,6 +902,20 @@ function createWindow() {
     win.showInactive(); // 不抢游戏焦点
     applyWindowPresentation();
     notifyFloatState();
+    // 魔改扩展：方位标定开着就把叠加层一起叫起来（含出屏拉回）
+    ensureOverlayVisible();
+    // 魔改扩展：比例锁定开着就按当前宽度对齐一次（要先量到 chromeHeight）
+    if (settings.ratioLocked) {
+      applyRatioLock();
+      // 渲染层的 boot() 是异步的（要先 await app:boot() 再建 webview），
+      // ready-to-show 这一刻标题栏和控制条可能还没渲染出来，
+      // refreshChromeHeight 会量成 0，算出的高度正好少一个 chrome。
+      // 等布局稳定后再对一次 —— 不补这一步，锁着比例但窗口还是错的，
+      // 得手动关开一次开关才生效。
+      setTimeout(() => {
+        if (settings.ratioLocked) applyRatioLock();
+      }, 450);
+    }
   });
 
   // 窗口失焦后重新压制层级（某些窗口会抢到上面）
@@ -787,23 +926,375 @@ function createWindow() {
     const b = win.getBounds();
     // 保留 aspect 标记：用户手动拉过之后就不该在下次启动时被强行改回 16:9
     settings.bounds = { ...settings.bounds, x: b.x, y: b.y, width: b.width, height: b.height, aspect: 2 };
+    saveWindowRatio(b);
     persist();
   };
   win.on('move', rememberBounds);
   win.on('resize', rememberBounds);
 
+  // 魔改扩展：贴边吸附。拖动中实时算会贴哪条边，松手时贴过去
+  win.on('will-move', (_e, newBounds) => {
+    if (!win || win.isDestroyed() || win.isFullScreen()) {
+      showSnapZone(null);
+      return;
+    }
+    showSnapZone(computeSnap(newBounds));
+  });
+  win.on('moved', () => {
+    if (!win || win.isDestroyed()) return;
+    applySnap();
+    showSnapZone(null);
+  });
+  // 魔改扩展：比例锁定后按宽度实时校正高度（ratioGuard 挡住 setBounds 引起的递归）
+  // 魔改扩展：缩放期间通知渲染层冻结 webview（防边缘黑边闪烁）
+  let resizePhaseTimer = null;
+  const markResizing = () => {
+    sendTo(win, 'win:resize-phase', { active: true });
+    clearTimeout(resizePhaseTimer);
+    resizePhaseTimer = setTimeout(() => {
+      sendTo(win, 'win:resize-phase', { active: false });
+    }, 140);
+  };
+  win.on('resize', markResizing);
+
+  win.on('resize', () => {
+    if (!win || win.isDestroyed()) return;
+    if (!settings.ratioLocked || ratioGuard) return;
+    enforceRatio(win.getBounds().width);
+  });
+
   win.on('closed', () => {
     win = null;
+    lastBearingStats = null; // 健康度属于「当前这次识别」，浮窗关了不该显示旧数字
     cancelTemporarySpeed();
     clearInterval(hoverTimer);
     hoverTimer = null;
     immersion = false;
     hoverFaded = false;
-    // 主窗关了，叠加层不能独自留下，否则 window-all-closed 不触发、进程退不掉
+    // 主窗关了，叠加层 / 字幕层 / 弹幕层都不能独自留下，
+    // 否则 window-all-closed 不触发、进程退不掉
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.destroy();
+    destroySubtitleWindow();
+    destroyDanmakuWindow();
     notifyFloatState();
   });
 }
+
+/* -------------------------------------------------------- 16:9 比例锁定
+ *
+ * 锁的是**视频内容区**而不是整个窗口：标题栏 + 控制条那 64px 的 chrome
+ * 不该算进 16:9，否则画面会被压扁一点点，越放大越明显。
+ * chromeHeight 在运行时向渲染层实测（window.innerHeight - #stage.clientHeight），
+ * 这样地址栏展开/收起、不同 DPI 下都能保持精确比例。
+ */
+
+let chromeHeight = 64;
+let ratioGuard = false;    // setBounds 会再触发 resize，用它挡住递归
+let ratioApplying = false; // did-finish-load / ready-to-show 可能先后触发，只跑一次
+
+/** 向渲染层实测 chrome 高度（标题栏 + 控制条） */
+function refreshChromeHeight() {
+  if (!win || win.isDestroyed()) return Promise.resolve(chromeHeight);
+  const js =
+    "(function(){var s=document.getElementById('stage');" +
+    'return s?Math.max(0, window.innerHeight-s.clientHeight):64})()';
+  return win.webContents
+    .executeJavaScript(js, true)
+    .then((h) => {
+      if (Number.isFinite(h) && h >= 0 && h < 400) {
+        // 沉浸模式下 chrome 确实是 0；非沉浸量到 0 只可能是页面还没渲染完，
+        // 采信它会把高度算少一个 chrome，所以保留上一次的可靠值。
+        if (h > 0 || immersion) chromeHeight = Math.round(h);
+      }
+      return chromeHeight;
+    })
+    .catch(() => chromeHeight);
+}
+
+/** 拖拽边缘时按宽度实时校正高度 */
+function enforceRatio(width) {
+  if (!win || win.isDestroyed() || !settings.ratioLocked || win.isFullScreen()) return;
+  if (ratioGuard) return;
+  if (!Number.isFinite(width) || width <= 0) return;
+
+  const w = Math.round(width);
+  const h = Math.round((w * 9) / 16) + chromeHeight;
+  const b = win.getBounds();
+  if (b.width === w && b.height === h) return;
+
+  ratioGuard = true;
+  try {
+    win.setBounds({ x: b.x, y: b.y, width: w, height: h });
+  } finally {
+    // setBounds 的 resize 事件可能是异步派发的，等这一轮走完再解锁
+    setTimeout(() => {
+      ratioGuard = false;
+    }, 0);
+  }
+}
+
+/** 锁定/解锁后立刻对齐一次（内部会先重量 chromeHeight） */
+async function applyRatioLock(force = false) {
+  if (!win || win.isDestroyed()) return;
+  if (ratioApplying) return;
+  ratioGuard = false;
+  // force：沉浸模式隐藏 chrome 后内容区变高，必须强制对齐，
+  // 否则 16:9 视频会在上下留出黑边（用户没开比例锁定也一样要修）
+  if (!settings.ratioLocked && !force) return;
+
+  ratioApplying = true;
+  try {
+    await refreshChromeHeight();
+  } finally {
+    ratioApplying = false;
+  }
+  if (!win || win.isDestroyed() || (!settings.ratioLocked && !force)) return;
+
+  const [w] = win.getContentSize();
+  if (!Number.isFinite(w) || w <= 0) return;
+  const h = Math.round((w * 9) / 16) + chromeHeight;
+
+  ratioGuard = true;
+  try {
+    win.setContentSize(w, h);
+    // 1px 抖动：让 Chromium 认为尺寸真的变了，重新布局一次 webview
+    win.setContentSize(w, h + 1);
+    await new Promise((r) => setTimeout(r, 16));
+    if (!win || win.isDestroyed()) return;
+    win.setContentSize(w, h);
+  } finally {
+    setTimeout(() => {
+      ratioGuard = false;
+    }, 0);
+  }
+}
+
+function setRatioLocked(on) {
+  settings.ratioLocked = !!on;
+  persist();
+  applyRatioLock();
+  broadcast('settings:changed', settings);
+}
+
+/* ------------------------------------------ 位置持久化：比例 + 显示器标识
+ *
+ * 做法参考 BiliMaku 的 SidebarOverlayPlacement（monitor_name + x_ratio/y_ratio）。
+ *
+ * 我们原来只存绝对像素，于是踩了一串坑：贴边吸附要按 DPI 写四边补偿、
+ * 窗口被夹进屏幕后圆心脱开窗口中心、拖上去弹回来 —— 根源都是
+ * 「一个像素坐标要适配多种屏幕几何」。
+ *
+ * 存成比例后，同一个配置在 1080p / 4K / 125% 缩放下都落在相同的相对位置。
+ * 像素字段继续保留：老配置没有比例时用它兜底，且比例换算出的值仍要过一次
+ * 可见性检查（防止换了更小的屏幕后窗口完全落在屏幕外）。
+ */
+
+/** 按 id / 边界找回保存时的显示器；找不到返回 null */
+function findDisplay(displayId, displayBounds) {
+  let all = [];
+  try {
+    all = screen.getAllDisplays();
+  } catch {
+    return null;
+  }
+  // 1. id 精确命中（同一台机器、没换接口时最可靠）
+  if (displayId !== null && displayId !== undefined) {
+    const hit = all.find((d) => String(d.id) === String(displayId));
+    if (hit) return hit;
+  }
+  // 2. 边界近似命中：换过扩展坞/重装后 id 会变，但尺寸位置常常一样
+  if (displayBounds && Number.isFinite(displayBounds.width)) {
+    const tol = 8;
+    const hit = all.find(
+      (d) =>
+        Math.abs(d.bounds.x - displayBounds.x) <= tol &&
+        Math.abs(d.bounds.y - displayBounds.y) <= tol &&
+        Math.abs(d.bounds.width - displayBounds.width) <= tol &&
+        Math.abs(d.bounds.height - displayBounds.height) <= tol
+    );
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** 浮窗：把当前左上角换算成比例写进设置 */
+function saveWindowRatio(b) {
+  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return;
+  let d = null;
+  try {
+    d = screen.getDisplayMatching(b);
+  } catch {
+    return;
+  }
+  if (!d || !d.workArea) return;
+  const area = d.workArea;
+  const spanX = Math.max(1, area.width - b.width);
+  const spanY = Math.max(1, area.height - b.height);
+  const rawX = (b.x - area.x) / spanX;
+  const rawY = (b.y - area.y) / spanY;
+  // 比例只表达「在可移动范围的哪个位置」，夹到 0~1
+  settings.windowXRatio = Math.min(1, Math.max(0, rawX));
+  settings.windowYRatio = Math.min(1, Math.max(0, rawY));
+  // 超出的那部分（贴边吸附的溢出）单独记像素，换分辨率时不该被放大
+  settings.windowSnapDx = Math.round(b.x - (area.x + settings.windowXRatio * spanX));
+  settings.windowSnapDy = Math.round(b.y - (area.y + settings.windowYRatio * spanY));
+  settings.windowDisplayId = d.id;
+  settings.windowDisplayBounds = { ...d.bounds };
+}
+
+/** 浮窗：按比例算出应该放在哪；没有比例时返回 null */
+function restoreWindowRatio(b) {
+  if (!Number.isFinite(settings.windowXRatio) || !Number.isFinite(settings.windowYRatio)) return null;
+  let d = findDisplay(settings.windowDisplayId, settings.windowDisplayBounds);
+  if (!d) {
+    try {
+      d = screen.getPrimaryDisplay();
+    } catch {
+      return null;
+    }
+  }
+  const area = d.workArea;
+  const spanX = Math.max(1, area.width - b.width);
+  const spanY = Math.max(1, area.height - b.height);
+  const dx = Number.isFinite(settings.windowSnapDx) ? settings.windowSnapDx : 0;
+  const dy = Number.isFinite(settings.windowSnapDy) ? settings.windowSnapDy : 0;
+  return {
+    x: Math.round(area.x + settings.windowXRatio * spanX + dx),
+    y: Math.round(area.y + settings.windowYRatio * spanY + dy)
+  };
+}
+
+/** 叠加层：把圆心换算成比例（圆心对工作区整体取比例，与圆大小无关） */
+function saveBearingRatio(cx, cy) {
+  if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+  let d = null;
+  try {
+    d = screen.getDisplayNearestPoint({ x: Math.round(cx), y: Math.round(cy) });
+  } catch {
+    return;
+  }
+  if (!d || !d.workArea) return;
+  const area = d.workArea;
+  settings.bearing.xRatio = (cx - area.x) / Math.max(1, area.width);
+  settings.bearing.yRatio = (cy - area.y) / Math.max(1, area.height);
+  settings.bearing.displayId = d.id;
+  settings.bearing.displayBounds = { ...d.bounds };
+}
+
+/** 叠加层：按比例算出圆心；没有比例时返回 null */
+function restoreBearingRatio() {
+  const b = settings.bearing || {};
+  if (!Number.isFinite(b.xRatio) || !Number.isFinite(b.yRatio)) return null;
+  let d = findDisplay(b.displayId, b.displayBounds);
+  if (!d) {
+    try {
+      d = screen.getPrimaryDisplay();
+    } catch {
+      return null;
+    }
+  }
+  const area = d.workArea;
+  return {
+    x: Math.round(area.x + b.xRatio * area.width),
+    y: Math.round(area.y + b.yRatio * area.height)
+  };
+}
+
+
+/* ---------------------------------------------------------------- 系统托盘
+ *
+ * 设计参考 GenshinImpactVT 的 window_controls.py（QSystemTrayIcon + 右键菜单）。
+ * 图标用 build/icon.ico，菜单里带「关闭启动器时最小化到托盘」的勾选项。
+ *
+ * 注意：托盘必须**以管理员身份运行**才会显示 —— Shell_NotifyIcon 要往
+ * Explorer 的托盘窗口发消息，非提权进程发不过去，而且失败是静默的
+ * （Tray 创建成功但托盘区什么都不出现）。正式包 manifest 是
+ * requireAdministrator，所以打包版没这个问题；开发态请用 start_dev.bat。
+ */
+
+let tray = null;
+
+function trayIcon() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.ico'));
+  if (icon.isEmpty()) console.log('图标加载失败');
+  return icon;
+}
+
+/** 把启动器叫到前台（不存在就重建） */
+function showConsoleWindow() {
+  if (consoleWin && !consoleWin.isDestroyed()) {
+    if (consoleWin.isMinimized()) consoleWin.restore();
+    consoleWin.show();
+    consoleWin.focus();
+    return;
+  }
+  createConsole();
+}
+
+/** 托盘菜单里的「退出软件」：绕开 closeToTray，直接收干净 */
+function quitFromTray() {
+  quittingFromConsole = true;
+  for (const w of [win, overlayWin, loginWin, subtitleWin, danmakuWin, consoleWin]) {
+    try {
+      if (w && !w.isDestroyed()) w.destroy();
+    } catch {
+      /* 关窗失败不影响退出 */
+    }
+  }
+  app.quit();
+}
+
+function rebuildTrayMenu() {
+  if (!tray || tray.isDestroyed()) return;
+  const floatAlive = !!(win && !win.isDestroyed());
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示启动器', click: () => showConsoleWindow() },
+      {
+        label: floatAlive ? '隐藏 / 显示浮窗' : '浮窗未启动',
+        enabled: floatAlive,
+        click: () => toggleVisible()
+      },
+      { type: 'separator' },
+      {
+        label: '关闭启动器时最小化到托盘',
+        type: 'checkbox',
+        checked: settings.closeToTray !== false,
+        click: (item) => {
+          settings.closeToTray = !!item.checked;
+          persist();
+          // 控制台里也有同一个开关，改完要同步过去，否则两边显示不一致
+          broadcast('settings:changed', settings);
+        }
+      },
+      { type: 'separator' },
+      { label: '退出软件', click: () => quitFromTray() }
+    ])
+  );
+}
+
+function createTray() {
+  if (tray && !tray.isDestroyed()) return tray;
+  tray = new Tray(trayIcon());
+  tray.setToolTip('原神跟跑助手 · 单击显示启动器');
+  rebuildTrayMenu();
+  tray.on('click', () => {
+    if (settings.trayClickAction === 'float') toggleVisible();
+    else showConsoleWindow();
+  });
+  tray.on('double-click', () => showConsoleWindow());
+  return tray;
+}
+
+function destroyTray() {
+  if (!tray || tray.isDestroyed()) {
+    tray = null;
+    return;
+  }
+  tray.destroy();
+  tray = null;
+}
+
 
 /* ---------------------------------------------------------------- 启动器 */
 
@@ -823,12 +1314,87 @@ function floatState() {
 
 function notifyFloatState() {
   broadcast('float:state', floatState());
+  // 托盘菜单里的「隐藏 / 显示浮窗」要跟着浮窗是否存在切换可用状态
+  rebuildTrayMenu();
+}
+
+/**
+ * 当前该用多大不透明度。
+ *
+ * 三条规则按优先级叠加，越靠前越强势：
+ *   1. 智能防遮挡 —— 字幕提到地图/锚点，这时候淡掉就看不见了，强制不透明
+ *   2. 战斗防遮挡 —— 检测到 Q/R 或连点，临时压暗
+ *   3. 鼠标避让   —— 鼠标移进窗口才淡到 10%
+ */
+function effectiveOpacity() {
+  const now = Date.now();
+  const base = Number(settings.opacity);
+  const opacity = Number.isFinite(base) ? base : 1;
+  if (now < avoidUntil) return opacity;
+  if (now < combatUntil) {
+    const pct = Number(settings.combatOpacity);
+    return Math.min(opacity, (Number.isFinite(pct) ? pct : 75) / 100);
+  }
+  return hoverFaded ? Math.min(opacity, 0.1) : opacity;
 }
 
 function applyWindowPresentation() {
   if (!win || win.isDestroyed()) return;
   win.setIgnoreMouseEvents(immersion || settings.clickThrough, { forward: true });
-  win.setOpacity(hoverFaded ? Math.min(settings.opacity, 0.1) : settings.opacity);
+  win.setOpacity(effectiveOpacity());
+}
+
+/** 智能防遮挡：字幕里出现看地图类的词 */
+function markAvoidHide() {
+  if (!settings.avoidHideEnabled) return;
+  const hold = Math.max(1, Math.min(30, Number(settings.avoidHideHold) || 4)) * 1000;
+  avoidUntil = Date.now() + hold;
+  applyWindowPresentation();
+  clearTimeout(avoidTimer);
+  avoidTimer = setTimeout(() => {
+    avoidUntil = 0;
+    applyWindowPresentation();
+  }, hold + 30);
+}
+
+/** 战斗防遮挡：Q/R 或连点左键 */
+function markCombat() {
+  if (!settings.combatFadeEnabled || !immersion) return;
+  combatUntil = Date.now() + 3000;
+  applyWindowPresentation();
+  clearTimeout(combatTimer);
+  combatTimer = setTimeout(() => {
+    combatUntil = 0;
+    applyWindowPresentation();
+  }, 3030);
+}
+
+/** 钩子里的原始事件：只关心 Q / R 和左键 */
+function onRawHookEvent(ev) {
+  if (!ev || !settings.combatFadeEnabled || !immersion) return;
+  if (ev.kind === 'key') {
+    const q = hookHotkeys.keycodeOf('Q');
+    const r = hookHotkeys.keycodeOf('R');
+    if ((q && ev.code === q) || (r && ev.code === r)) markCombat();
+    return;
+  }
+  if (ev.kind === 'mouse' && ev.button === 1) {
+    combatDownAt = Date.now();
+    const now = Date.now();
+    combatClicks = combatClicks.filter((t) => now - t < 2000);
+    combatClicks.push(now);
+    // 2 秒内点 3 下
+    if (combatClicks.length >= 3) {
+      combatClicks = [];
+      markCombat();
+    }
+    return;
+  }
+  if (ev.kind === 'mouseup' && ev.button === 1) {
+    // 长按 0.5 秒也算战斗动作
+    if (combatDownAt && Date.now() - combatDownAt >= 500) markCombat();
+    combatDownAt = 0;
+  }
 }
 
 function updateHoverFade() {
@@ -958,6 +1524,15 @@ function createConsole() {
     notifyFloatState();
   });
 
+  // 关启动器：有托盘且开关打开时收进托盘，否则走「退出整个应用」
+  consoleWin.on('close', (e) => {
+    if (quittingFromConsole) return;
+    if (settings.closeToTray === false) return;
+    if (!tray || tray.isDestroyed()) return;
+    e.preventDefault();
+    consoleWin.hide();
+  });
+
   consoleWin.on('closed', () => {
     consoleWin = null;
     // 关启动器就是退出整个应用：跟跑视频窗、方位叠加层、登录窗一起收掉。
@@ -989,6 +1564,9 @@ setInterval(() => {
 let overlayWin = null;
 let overlayPlacing = false;
 let lastBearing = null;
+let overlayDrag = null; // 自绘拖动的起点与初始窗口位置
+// 最近一次识别健康度快照（访客页随 bearing 一起上报）
+let lastBearingStats = null;
 
 function overlaySize() {
   // 半径 ×2 再留 12% 余量，箭头尖端才不会贴到窗口边被裁掉
@@ -997,9 +1575,19 @@ function overlaySize() {
 
 function overlayBounds() {
   const size = overlaySize();
+  // 有比例就按比例算圆心，跨分辨率才不会跑偏
+  const byRatio = restoreBearingRatio();
   const area = screen.getPrimaryDisplay().workArea;
-  const cx = Number.isFinite(settings.bearing.x) ? settings.bearing.x : area.x + 260;
-  const cy = Number.isFinite(settings.bearing.y) ? settings.bearing.y : area.y + 260;
+  const cx = byRatio
+    ? byRatio.x
+    : Number.isFinite(settings.bearing.x)
+      ? settings.bearing.x
+      : area.x + 260;
+  const cy = byRatio
+    ? byRatio.y
+    : Number.isFinite(settings.bearing.y)
+      ? settings.bearing.y
+      : area.y + 260;
   return {
     x: Math.round(cx - size / 2),
     y: Math.round(cy - size / 2),
@@ -1042,6 +1630,7 @@ function createOverlay() {
     const b = overlayWin.getBounds();
     settings.bearing.x = Math.round(b.x + b.width / 2);
     settings.bearing.y = Math.round(b.y + b.height / 2);
+    saveBearingRatio(settings.bearing.x, settings.bearing.y);
     persist();
   });
 
@@ -1049,27 +1638,105 @@ function createOverlay() {
     overlayWin = null;
   });
 
-  overlayWin.loadFile(path.join(__dirname, 'overlay', 'index.html'));
+  // 雷达模式通过 query 指定，两套渲染各自独立成文件
+  overlayWin.loadFile(
+    path.join(__dirname, 'overlay', 'index.html'),
+    settings.overlayRadar ? { search: 'radar=1' } : undefined
+  );
 
   overlayWin.webContents.on('did-finish-load', () => {
     if (!overlayWin || overlayWin.isDestroyed()) return;
     overlayWin.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
     if (lastBearing) overlayWin.webContents.send('bearing', lastBearing);
+    // 雷达模式必须补这一发：radar.js 靠 radar:config 里的 visible 决定画不画，
+    // 不发就一直是「不可见」，整个叠加层等于空白。
+    pushRadarConfig();
+    pushDanmakuConfig();
   });
 
   return overlayWin;
+}
+
+function ensureOverlayReachable() {
+  if (!overlayWin || overlayWin.isDestroyed()) return false;
+  let b = null;
+  try {
+    b = overlayWin.getBounds();
+  } catch {
+    return false;
+  }
+  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return false;
+
+  let d = null;
+  try {
+    d = screen.getDisplayMatching(b);
+  } catch {
+    return false;
+  }
+  if (!d || !d.workArea) return false;
+  const area = d.workArea;
+
+  // 与工作区的相交面积占窗口面积的比例
+  const ix = Math.max(0, Math.min(b.x + b.width, area.x + area.width) - Math.max(b.x, area.x));
+  const iy = Math.max(0, Math.min(b.y + b.height, area.y + area.height) - Math.max(b.y, area.y));
+  const visible = (ix * iy) / Math.max(1, b.width * b.height);
+  if (visible >= 0.2) return false;
+
+  // 沿最近的边夹回工作区（窗口比工作区还大时贴左上角）
+  const nx = Math.max(area.x, Math.min(b.x, area.x + area.width - b.width));
+  const ny = Math.max(area.y, Math.min(b.y, area.y + area.height - b.height));
+  try {
+    overlayWin.setBounds({ x: Math.round(nx), y: Math.round(ny), width: b.width, height: b.height });
+  } catch {
+    return false;
+  }
+  settings.bearing.x = Math.round(nx + b.width / 2);
+  settings.bearing.y = Math.round(ny + b.height / 2);
+  saveBearingRatio(settings.bearing.x, settings.bearing.y);
+  persist();
+  pushDanmakuConfig();
+  pushRadarConfig();
+  console.log(
+    '[overlay] 叠加层跑到屏幕外（可见 %s%%），已拉回 (%s, %s)',
+    Math.round(visible * 100),
+    Math.round(nx),
+    Math.round(ny)
+  );
+  return true;
+}
+
+/**
+ * 方位标定开着就把叠加层叫起来（照搬旧版）。
+ *
+ * 关键在 ensureOverlayReachable：上次的圆心坐标可能落在屏幕外
+ * （换过分辨率 / 改过缩放 / 拔过外接屏），那样窗口建好了也看不见，
+ * 表现就是「必须点一下②再锁定才冒出来」—— 因为放置模式会触发拉回。
+ */
+function ensureOverlayVisible() {
+  if (!settings.bearing.enabled) return;
+  showOverlay();
+  ensureOverlayReachable();
+  pushRadarConfig();
 }
 
 function showOverlay() {
   const w = createOverlay();
   if (w.isVisible()) return w;
 
+  // 透明窗口的 ready-to-show 不一定触发，两个事件都挂上，先到的生效
+  const reveal = () => {
+    if (w.isDestroyed() || w.isVisible()) return;
+    try {
+      w.showInactive();
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  };
   if (w.webContents.isLoading()) {
-    w.once('ready-to-show', () => {
-      if (!w.isDestroyed()) w.showInactive();
-    });
+    w.once('ready-to-show', reveal);
+    w.webContents.once('did-finish-load', reveal);
   } else {
-    w.showInactive();
+    reveal();
   }
   return w;
 }
@@ -1121,6 +1788,1164 @@ function setOverlayRadius(r) {
   }
   persist();
   return settings.bearing.radius;
+}
+
+/* ------------------------------------------------------------ 贴边吸附
+ *
+ * 拖到屏幕边缘 20px 内松手，窗口自动贴到边缘（补偿 Windows 无边框窗口
+ * 那圈看不见的边框），并在拖动过程中用蓝线提示会贴哪条边。
+ * 完全照搬旧版实现 —— 上游基线没有这块。
+ */
+
+const SNAP_THRESHOLD = 20;
+
+// 100% 缩放下的不可见边框基准厚度
+const BASE_OFFSET = 8;
+
+/**
+ * 四边各自的微调量。最终坐标 = 动态基准 ± 对应 ADJUST。
+ *  左 / 上：坐标原点 **减去** 基准，再 **加上** ADJUST（ADJUST 越大越往屏幕里收）
+ *  右 / 下：坐标 + 屏幕尺寸 − 窗口尺寸 **加上** 基准，再 **加上** ADJUST（越大越往外推）
+ * 最新实测（100% 缩放）：上 / 左 / 下 三条边已经严丝合缝，只剩右边有缝。
+ * 当前这组值的实际效果：
+ *   上 y = 0            —— 完美
+ *   左 x = -4           —— 完美
+ *   下 y = 屏高-窗高+8  —— 完美
+ *   右 x = 屏宽-窗宽+16 —— 在动态基准之上再往外推 8px，用来补右边那条缝
+ * 所以现在唯一可能还要动的只有 ADJUST.right。
+ */
+const ADJUST = {
+  top: 8, // 基准 8 被抵消 → y 回到 0，保持完美
+  left: 4, // → x = -8 + 4 = -4，与上一版一致；还切就往 8 加
+  // 右边缘：只剩这一条缝了，单独加大补偿（唯一需要继续微调的数字）
+  // 贴右公式：x = 屏幕x + 屏幕宽 − 窗口宽 + 动态基准 + ADJUST.right
+  // 还缝就继续调大（12、16…）；万一调成切边就往回调小
+  right: 8,
+  bottom: 0 // 同上
+};
+
+/** 当前命中信息 { edges:[...], target:{x,y} } */
+let snapHit = null;
+/** 上一次推给渲染层的边线集合，避免重复发 IPC */
+let lastSnapEdges = null;
+
+/**
+ * 计算当前窗口所在屏的「不可见边框」厚度。
+ *
+ * 主路径：BASE_OFFSET × scaleFactor（100% → 8，125% → 10，150% → 12）。
+ * 兜底：如果 Electron 版本支持 getContentBounds，就用
+ *       (bounds - contentBounds) / 2 反推真实边框，比缩放估算更准。
+ *       两者取「更大的合理值」，但仅当测出来的值不超过基准两倍时才采信，
+ *       避免某些平台上 contentBounds 恒等于 bounds 或返回 0 把补偿算没。
+ */
+function dynamicBorderOffset() {
+  let scale = 1;
+  let display = null;
+  try {
+    display = screen.getDisplayMatching(win && !win.isDestroyed() ? win.getBounds() : screen.getPrimaryDisplay().bounds);
+  } catch {
+    display = null;
+  }
+  if (display && Number.isFinite(display.scaleFactor) && display.scaleFactor > 0) {
+    scale = display.scaleFactor;
+  }
+
+  const dyn = Math.max(0, Math.round(BASE_OFFSET * scale));
+  let frameX = dyn;
+  let frameY = dyn;
+
+  try {
+    const b = win && !win.isDestroyed() ? win.getBounds() : null;
+    const c = win && !win.isDestroyed() && typeof win.getContentBounds === 'function' ? win.getContentBounds() : null;
+    if (b && c && Number.isFinite(c.width) && Number.isFinite(c.height)) {
+      const dx = Math.round((b.width - c.width) / 2);
+      const dy = Math.round((b.height - c.height) / 2);
+      // 只在「测出来的值合理」时采信：大于 0 且不超过基准两倍
+      if (dx > 0 && dx <= dyn * 2) frameX = dx;
+      if (dy > 0 && dy <= dyn * 2) frameY = dy;
+    }
+  } catch {
+    /* 该方法在部分版本/平台上不可用，保持 scaleFactor 的结果 */
+  }
+
+  return { x: frameX, y: frameY, scale, dyn };
+}
+
+/**
+ * 判断窗口是否贴近屏幕某条边。
+ * 返回 { edges: ['left'...], target: {x, y} } 或 null。
+ * edges 可能是两条（贴角），这样渲染层能同时点亮两条线。
+ */
+function computeSnap(newBounds) {
+  if (!newBounds) return null;
+
+  let display = null;
+  try {
+    display = screen.getDisplayMatching(newBounds);
+  } catch {
+    display = null;
+  }
+  if (!display || !display.workArea) return null;
+
+  const area = display.workArea;
+  const width = Math.max(1, Math.round(newBounds.width || 0));
+  const height = Math.max(1, Math.round(newBounds.height || 0));
+  const x = Number.isFinite(newBounds.x) ? Math.round(newBounds.x) : area.x;
+  const y = Number.isFinite(newBounds.y) ? Math.round(newBounds.y) : area.y;
+
+  // 动态基准：按当前屏的缩放比例换算不可见边框厚度（四舍五入防半像素模糊）
+  const dyn = dynamicBorderOffset();
+
+  const nearLeft = x - area.x <= SNAP_THRESHOLD;
+  const nearRight = area.x + area.width - (x + width) <= SNAP_THRESHOLD;
+  const nearTop = y - area.y <= SNAP_THRESHOLD;
+  const nearBottom = area.y + area.height - (y + height) <= SNAP_THRESHOLD;
+
+  const edges = [];
+  const target = { x, y };
+
+  // 四边分开算，公式刻意保持「一眼能看懂」的形状：
+  //   左 / 上 —— 屏幕原点减去偏移；
+  //   右 / 下 —— 屏幕宽高减窗口尺寸，再加上偏移。
+  // 所以 right / bottom 的数值越大，窗口越往外推（补缝隙）；left / top
+  // 的数值越大，越往外切（要拉回来就调小）。
+  // 控制台「吸附微调」滑块：正值整体外推、负值回缩，四边统一叠加
+  const nudge = Number.isFinite(settings.snapAdjustment) ? settings.snapAdjustment : 0;
+
+  if (nearLeft) {
+    edges.push('left');
+    target.x = area.x - dyn.x + ADJUST.left - nudge;
+  } else if (nearRight) {
+    edges.push('right');
+    target.x = area.x + area.width - width + dyn.x + ADJUST.right + nudge;
+  }
+
+  if (nearTop) {
+    edges.push('top');
+    target.y = area.y - dyn.y + ADJUST.top - nudge;
+  } else if (nearBottom) {
+    edges.push('bottom');
+    target.y = area.y + area.height - height + dyn.y + ADJUST.bottom + nudge;
+  }
+
+  if (!edges.length) return null;
+  return { edges, target };
+}
+
+/** 把边线状态推给浮窗渲染层；null / 空数组表示全部熄灭 */
+function pushSnapEdges(edges) {
+  const list = Array.isArray(edges) ? edges : [];
+  const key = list.join(',');
+  if (key === lastSnapEdges) return; // 状态没变，别刷 IPC
+  lastSnapEdges = key;
+  if (!win || win.isDestroyed()) return;
+  sendTo(win, 'snap:edges', { edges: list });
+}
+
+/** 显示 / 收起提示线；hit 为 null 表示收起 */
+function showSnapZone(hit) {
+  snapHit = hit && hit.edges && hit.edges.length ? hit : null;
+  pushSnapEdges(snapHit ? snapHit.edges : []);
+}
+
+/**
+ * 用户拖动「吸附微调」滑块时，如果窗口此刻正贴着某条边，
+ * 立刻按新数值重贴一次 —— 这样能边拖边看效果，不用反复拖窗口。
+ */
+function applySnap() {
+  const hit = snapHit;
+  snapHit = null;
+  if (!hit || !hit.target) return false;
+  if (!win || win.isDestroyed()) return false;
+
+  const target = hit.target;
+  if (!Number.isFinite(target.x) || !Number.isFinite(target.y)) return false;
+
+  let b = null;
+  try {
+    b = win.getBounds();
+  } catch {
+    return false;
+  }
+  if (!b) return false;
+
+  if (b.x === target.x && b.y === target.y) return false;
+
+  try {
+    win.setBounds({ x: target.x, y: target.y, width: b.width, height: b.height });
+    persist();
+    const d = dynamicBorderOffset();
+    console.log(
+      '[snap] 贴边 →',
+      hit.edges.join('+'),
+      target.x,
+      target.y,
+      `| scale=${d.scale} 基准=${d.dyn}px 实用=${d.x}/${d.y}px`
+    );
+  } catch (err) {
+    console.warn('[snap] 贴边失败：', err.message);
+    return false;
+  }
+  return true;
+}
+
+function reapplySnapIfAtEdge() {
+  if (!win || win.isDestroyed()) return;
+  let b = null;
+  try {
+    b = win.getBounds();
+  } catch {
+    return;
+  }
+  if (!b) return;
+
+  // computeSnap 只认 20px 内的窗口；微调后窗口可能已略微离开阈值，
+  // 所以这里按「当前值 + 微调量」放宽一点再判断。
+  const area = screen.getDisplayMatching(b).workArea;
+  const slack = SNAP_THRESHOLD + Math.abs(settings.snapAdjustment) + 12;
+  const nearEdge =
+    b.x - area.x <= slack ||
+    area.x + area.width - (b.x + b.width) <= slack ||
+    b.y - area.y <= slack ||
+    area.y + area.height - (b.y + b.height) <= slack;
+  if (!nearEdge) return;
+
+  const hit = computeSnap(b);
+  if (!hit) return;
+
+  try {
+    win.setBounds({ x: hit.target.x, y: hit.target.y, width: b.width, height: b.height });
+    persist();
+  } catch (err) {
+    console.warn('[snap] 微调重贴失败：', err.message);
+  }
+}
+
+/* ------------------------------------------------------------ 字幕数据源
+ *
+ * 走官方播放器接口拿字幕轨，再拉 CDN 上的 JSON：
+ *   /x/player/wbi/v2?bvid=..&cid=..  → data.subtitle.subtitles[]（含 subtitle_url）
+ *   <subtitle_url>                   → { body: [{from, to, content}] }
+ *
+ * 为什么不抓 DOM：
+ *   · cue 自带精确的 from/to，字幕和播放进度严格对齐，暂停 / 拖动天然正确
+ *   · 同一时刻的多行字幕可以合并显示
+ *   · 不依赖播放器 DOM 结构，B站改版不会失效
+ * DOM 抓取保留为兜底：没有字幕轨 / 未登录 / 接口变更时仍然能用。
+ */
+
+let subtitleCues = [];   // [{from, to, text}]，按 from 升序
+let lastApiSubtitleText = ''; // 上一次推给字幕窗的文本，避免每帧重复下发
+let lastDomSubtitleText = ''; // DOM 抓取模式下最后一句话，供控制台显示
+let subtitleCid = 0;     // 与 subtitleCues 对应的 cid
+let subtitleLoading = 0; // 正在请求的 cid，防并发重复拉
+/**
+ * 换片代数。每次载入新视频 +1；请求返回时若代数已变，说明这个结果属于
+ * 上一个视频，必须丢掉 —— 否则快速切 P 时，先发出的旧请求晚回来，
+ * 会把新视频的字幕覆盖成上一个视频的。
+ */
+let subtitleGen = 0;
+
+async function fetchSubtitleCues(bvid, cid, gen) {
+  if (!cid || !bvid) return [];
+  if (subtitleCid === cid && subtitleCues.length) return subtitleCues;
+  if (subtitleLoading === cid) return subtitleCues;
+  subtitleLoading = cid;
+  const myGen = gen === undefined ? subtitleGen : gen;
+  /** 只有代数没变才落地；返回 false 表示这是过期结果 */
+  const commit = (cues) => {
+    if (myGen !== subtitleGen) return false;
+    subtitleCues = cues;
+    subtitleCid = cid;
+    return true;
+  };
+  try {
+    const res = await biliFetch(
+      `https://api.bilibili.com/x/player/wbi/v2?bvid=${encodeURIComponent(bvid)}&cid=${cid}`
+    );
+    const json = await res.json();
+    const data = (json && json.data) || {};
+    const subs = data.subtitle && data.subtitle.subtitles;
+    if (!Array.isArray(subs) || !subs.length) {
+      // 分清两种「没有字幕」：没登录 vs 这个视频本来就没字幕轨
+      console.log(
+        '[subtitle] 接口没有字幕轨（need_login_subtitle=%s），回退 DOM 抓取',
+        !!data.need_login_subtitle
+      );
+      return commit([]) ? [] : null;
+    }
+    // 优先中文正式轨，其次 AI 中文，最后任意含 zh 的
+    const pick =
+      subs.find((x) => /^zh(-Hans)?$/i.test(x.lan || '')) ||
+      subs.find((x) => /^ai-zh/i.test(x.lan || '')) ||
+      subs.find((x) => /zh/i.test(x.lan || ''));
+    if (!pick || !pick.subtitle_url) {
+      return commit([]) ? [] : null;
+    }
+    let url = String(pick.subtitle_url);
+    if (url.startsWith('//')) url = 'https:' + url;
+    const r2 = await biliFetch(url, { Accept: 'application/json' });
+    const doc = await r2.json();
+    const body = doc && Array.isArray(doc.body) ? doc.body : [];
+    const cues = [];
+    for (const row of body) {
+      if (!row) continue;
+      const from = Number(row.from);
+      const to = Number(row.to);
+      const text = String(row.content || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || !text) continue;
+      cues.push({ from, to, text: text.slice(0, 500) });
+    }
+    cues.sort((a, b) => a.from - b.from);
+    if (!commit(cues)) return null; // 换片了，这个结果作废
+    console.log('[subtitle] 已加载字幕 %d 条（cid=%s，轨=%s）', cues.length, cid, pick.lan);
+    return cues;
+  } catch (err) {
+    console.warn('[subtitle] 拉取失败，回退到 DOM 抓取：', err.message);
+    return commit([]) ? [] : null;
+  } finally {
+    subtitleLoading = 0;
+  }
+}
+
+/**
+ * 取某一时刻的全部字幕。
+ * 这里就是「重叠字幕合并」：把所有 from <= t < to 的 cue 都取出来，
+ * 去重后按顺序拼接 —— 同时有两行对白时两行都会显示。
+ */
+function subtitleAt(t) {
+  const out = [];
+  for (const c of subtitleCues) {
+    if (c.from > t) break; // 已按 from 升序，后面的更晚
+    if (t < c.to) out.push(c.text);
+  }
+  // 合并：同一时刻的多行对白拼成一行；不合并：只取最新一条
+  if (settings.subtitleMergeOverlap === false) return out[out.length - 1].slice(0, 500);
+  return [...new Set(out)].join(' ').slice(0, 500);
+}
+
+/* ---------------------------------------------------------- 字幕层窗口 */
+
+/**
+ * 独立的全屏透明字幕窗口。
+ *
+ * 为什么不做在浮窗里：浮窗可以被拖到任何位置，字幕跟着走就永远沉不到
+ * 屏幕底部。电视字幕要的是相对**屏幕**定位，所以单独开一层铺满全屏、
+ * 整窗鼠标穿透的窗口，只画底部那一行字。
+ *
+ * 关键点：
+ *  · transparent + frame:false + 全屏 bounds，背景完全透明；
+ *  · setIgnoreMouseEvents(true, {forward:true}) —— 鼠标彻底穿透，
+ *    点游戏、拖浮窗都不受影响，这层窗口从不接收输入；
+ *  · skipTaskbar + focusable:false —— 不占任务栏、不抢焦点；
+ *  · alwaysOnTop 'screen-saver' —— 和浮窗同层级，压在游戏之上。
+ */
+let subtitleWin = null;
+
+function subtitleBounds() {
+  // 用 bounds 而不是 workArea：字幕层要覆盖整个屏幕，包括任务栏那一条，
+  // 否则某些布局下底部会被裁掉。
+  const d = screen.getPrimaryDisplay();
+  return { x: d.bounds.x, y: d.bounds.y, width: d.bounds.width, height: d.bounds.height };
+}
+
+function createSubtitleWindow() {
+  if (subtitleWin && !subtitleWin.isDestroyed()) return subtitleWin;
+
+  subtitleWin = new BrowserWindow({
+    ...subtitleBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    title: 'GIFA 字幕层',
+    webPreferences: {
+      preload: path.join(__dirname, 'subtitle', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // 字幕窗只在有文本时才有事做：允许 Chromium 在不可见/空闲时降频，
+      // 避免一个全屏透明层空转着把 CPU 啃掉（玩游戏时尤其明显）
+      backgroundThrottling: true
+    }
+  });
+
+  subtitleWin.setAlwaysOnTop(true, 'screen-saver');
+  // 整窗穿透：字幕层永远不接收鼠标，剪贴板/游戏点击都落在下面的窗口
+  subtitleWin.setIgnoreMouseEvents(true, { forward: true });
+
+  subtitleWin.on('closed', () => {
+    subtitleWin = null;
+  });
+
+  subtitleWin.loadFile(path.join(__dirname, 'subtitle', 'index.html'));
+
+  // 换分辨率 / 缩放 / 切主屏时重新铺满
+  subtitleWin.webContents.on('did-finish-load', () => {
+    if (!subtitleWin || subtitleWin.isDestroyed()) return;
+    subtitleWin.setBounds(subtitleBounds());
+    pushSubtitleConfig();
+    pushTurnConfig();
+  });
+
+  return subtitleWin;
+}
+
+/** 显示器参数变化时把字幕层重新铺满（外接屏拔插、改分辨率都会触发） */
+function refitSubtitleWindow() {
+  if (!subtitleWin || subtitleWin.isDestroyed()) return;
+  try {
+    subtitleWin.setBounds(subtitleBounds());
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/** 显示一句字幕；text 为空表示立刻隐藏 */
+function showSubtitleText(text) {
+  if (!settings.enableSubtitleSprite) return;
+  if (!text) {
+    hideSubtitleText();
+    return;
+  }
+  pushSubtitleToWindow(text);
+}
+
+/**
+ * 把文本推给字幕窗口并确保它可见（不判断开关）。
+ * 抽出来是为了让调试自检也能直接调用，不被 settings 拦住。
+ */
+function pushSubtitleToWindow(text) {
+  const w = createSubtitleWindow();
+  pushSubtitleConfig();
+  const send = () => {
+    if (!w || w.isDestroyed()) return;
+    // 先补外观配置再发文本：窗口刚建好时 did-finish-load 之前的推送会丢
+    w.webContents.send('subtitle:config', subtitleStyleSnapshot());
+    w.webContents.send('subtitle:text', { text: String(text) });
+  };
+
+  // 关键：必须 showInactive 让窗口真正显示。之前只在「不可见」时调，
+  // 而窗口创建时 show:false，did-finish-load 早于这里，容易出现窗口一直隐藏。
+  if (!w.isVisible()) w.showInactive();
+  if (w.webContents.isLoading()) w.webContents.once('did-finish-load', send);
+  else send();
+}
+
+/** 隐藏字幕（不清窗口，下次直接复用，避免反复创建） */
+function hideSubtitleText() {
+  if (!subtitleWin || subtitleWin.isDestroyed()) return;
+  try {
+    subtitleWin.webContents.send('subtitle:text', { off: true });
+    subtitleWin.hide();
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+function destroySubtitleWindow() {
+  if (!subtitleWin || subtitleWin.isDestroyed()) return;
+  subtitleWin.destroy();
+  subtitleWin = null;
+}
+
+/* -------------------------------------------------- 字幕外观配置与下发 */
+
+const SUB_POS_LIST = ['center', 'left', 'right'];
+const SUB_STROKE_LIST = ['none', 'outline', 'shadow'];
+
+/** 校验并写入一组字幕外观字段（非法值直接忽略，保留原值） */
+function applySubtitleStylePatch(patch = {}) {
+  const clamp = (v, min, max, fb) =>
+    Number.isFinite(Number(v)) ? Math.min(max, Math.max(min, Math.round(Number(v)))) : fb;
+
+  if (patch.scale !== undefined)
+    settings.subtitleScale = clamp(patch.scale, 50, 200, settings.subtitleScale);
+  if (patch.offset !== undefined)
+    settings.subtitleOffset = clamp(patch.offset, 10, 500, settings.subtitleOffset);
+  if (patch.bgOpacity !== undefined)
+    settings.subtitleBgOpacity = clamp(patch.bgOpacity, 0, 100, settings.subtitleBgOpacity);
+
+  if (typeof patch.color === 'string' && /^#[0-9a-f]{6}$/i.test(patch.color)) {
+    settings.subtitleColor = patch.color.toLowerCase();
+  }
+  if (typeof patch.stroke === 'string' && SUB_STROKE_LIST.includes(patch.stroke)) {
+    settings.subtitleStroke = patch.stroke;
+  }
+  if (typeof patch.pos === 'string' && SUB_POS_LIST.includes(patch.pos)) {
+    settings.subtitlePos = patch.pos;
+  }
+  if (patch.keepRatio !== undefined) settings.subtitleKeepRatio = !!patch.keepRatio;
+  if (patch.fade !== undefined) settings.subtitleFade = !!patch.fade;
+  if (patch.hold !== undefined) settings.subtitleHold = clamp(patch.hold, 1, 10, settings.subtitleHold);
+  if (patch.maxWidth !== undefined)
+    settings.subtitleMaxWidth = clamp(patch.maxWidth, 30, 100, settings.subtitleMaxWidth);
+  if (patch.weight !== undefined)
+    settings.subtitleWeight = clamp(patch.weight, 500, 900, settings.subtitleWeight);
+  if (patch.radius !== undefined)
+    settings.subtitleRadius = clamp(patch.radius, 0, 24, settings.subtitleRadius);
+}
+
+/** 当前字幕外观的快照，直接给字幕窗口用 */
+function subtitleStyleSnapshot() {
+  return {
+    scale: settings.subtitleScale,
+    color: settings.subtitleColor,
+    stroke: settings.subtitleStroke,
+    pos: settings.subtitlePos,
+    // hold 传 0：字幕窗不再按墙上时间自动隐藏，改由主进程按视频进度下发 off。
+    // 否则暂停时计时器照跑，一句没说完的字幕会被提前吃掉。
+    // 真正的停留时长 subtitleHold 由访客页的 ticker 使用，不经这里。
+    hold: 0,
+    offset: settings.subtitleOffset,
+    bgOpacity: settings.subtitleBgOpacity,
+    keepRatio: settings.subtitleKeepRatio,
+    fade: settings.subtitleFade,
+    maxWidth: settings.subtitleMaxWidth,
+    weight: settings.subtitleWeight,
+    radius: settings.subtitleRadius
+  };
+}
+
+/**
+ * 转向提示：把方向塞给字幕层里的大箭头；null 表示收起。
+ *
+ * 两个容易踩的点：
+ *  1) 字幕条关掉时窗口可能还没建 —— 要按需创建；
+ *  2) 窗口建好但被 hide 了（字幕 3 秒淡出后不会 hide，但关开关会），
+ *     这里必须主动 showInactive，否则箭头画在隐藏窗口里，等于没显示。
+ */
+function applyTurnStylePatch(patch = {}) {
+  const clamp = (v, min, max, fb) =>
+    Number.isFinite(Number(v)) ? Math.min(max, Math.max(min, Math.round(Number(v)))) : fb;
+
+  if (patch.offset !== undefined) settings.turnOffset = clamp(patch.offset, 10, 400, settings.turnOffset);
+  if (patch.scale !== undefined) settings.turnScale = clamp(patch.scale, 60, 200, settings.turnScale);
+  if (patch.duration !== undefined)
+    settings.turnDuration = clamp(patch.duration, 1, 10, settings.turnDuration);
+  if (patch.opacity !== undefined)
+    settings.turnOpacity = clamp(patch.opacity, 20, 100, settings.turnOpacity);
+  if (typeof patch.color === 'string' && /^#[0-9a-f]{6}$/i.test(patch.color)) {
+    settings.turnColor = patch.color.toLowerCase();
+  }
+  if (patch.posY !== undefined) settings.turnPosY = clamp(patch.posY, 5, 95, settings.turnPosY);
+  if (patch.posX !== undefined) settings.turnPosX = clamp(patch.posX, 5, 95, settings.turnPosX);
+  // 分组开关：左右 / 上下 可以分开启用
+  if (patch.enableLR !== undefined) settings.turnEnableLR = !!patch.enableLR;
+  if (patch.enableUD !== undefined) settings.turnEnableUD = !!patch.enableUD;
+}
+
+function turnStyleSnapshot() {
+  return {
+    offset: settings.turnOffset,
+    scale: settings.turnScale,
+    duration: settings.turnDuration,
+    opacity: settings.turnOpacity,
+    color: settings.turnColor,
+    posY: settings.turnPosY,
+    posX: settings.turnPosX
+  };
+}
+
+function pushTurnConfig() {
+  if (!subtitleWin || subtitleWin.isDestroyed()) return;
+  try {
+    subtitleWin.webContents.send('turn:config', turnStyleSnapshot());
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+function pushTurnHint(hint) {
+  if (!hint && (!subtitleWin || subtitleWin.isDestroyed())) return;
+
+  const w = createSubtitleWindow();
+  if (hint && !w.isVisible()) w.showInactive();
+  if (hint) {
+    w.webContents.send('subtitle:config', subtitleStyleSnapshot());
+    w.webContents.send('turn:config', turnStyleSnapshot());
+  }
+
+  const send = () => {
+    if (!w || w.isDestroyed()) return;
+    w.webContents.send('turn:hint', hint || { off: true });
+    console.log('[turn] 主进程 → 字幕层:', hint ? hint.dir : 'off', '| visible=', w.isVisible());
+  };
+  if (w.webContents.isLoading()) w.webContents.once('did-finish-load', send);
+  else send();
+}
+
+/* ------------------------------------------------------ 放大提醒窗口
+ *
+ * 方向一变就弹一张放大的小地图快照，2 秒后淡出。
+ * 目的是不用歪头去左上角看小地图 —— 尤其浮窗铺得很大时，
+ * 小地图那块早被视频本身盖住了。
+ *
+ * 不做实时镜像：每秒抓 8~10 次视频像素再编码，玩游戏时那点 CPU 白花；
+ * 而且看地图的时机就是「方向变了」那一下，一帧定格反而更清楚。
+ */
+
+let alertWin = null;
+let alertHideTimer = null;
+let alertPlacing = false;
+
+/**
+ * 提醒窗尺寸 = 叠加层窗口尺寸。
+ *
+ * 抓的就是叠加层那块屏幕，尺寸必须 1:1 —— 一旦放大，
+ * 抓进来的圆环和窗口自己的边框半径不同，会变成「圈中圈」。
+ */
+function alertSize() {
+  // 必须和叠加层里**实际画出来的圆环**对齐：
+  // radar.js 的 radius() 是「窗口短边的一半 × 0.86」，不是整个窗口。
+  // 按窗口尺寸裁会大出约 4%，看着就是「边框比画面大一圈」。
+  return Math.round(overlaySize() * 0.86);
+}
+
+function alertBounds() {
+  const size = alertSize();
+  // 默认放在主屏右侧居中：不挡游戏主体，余光能看到
+  let area = null;
+  try {
+    area = screen.getPrimaryDisplay().workArea;
+  } catch {
+    area = null;
+  }
+  if (!area) return { x: 40, y: 40, width: size, height: size };
+
+  const x = Number.isFinite(settings.alertX) ? settings.alertX : Math.round(area.x + area.width - size - 40);
+  const y = Number.isFinite(settings.alertY) ? settings.alertY : Math.round(area.y + (area.height - size) / 2);
+  return { x, y, width: size, height: size };
+}
+
+function createAlertWindow() {
+  if (alertWin && !alertWin.isDestroyed()) return alertWin;
+
+  alertWin = new BrowserWindow({
+    ...alertBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    title: 'GIFA 放大提醒',
+    webPreferences: {
+      preload: path.join(__dirname, 'alert', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // 窗口平时是隐藏的，但屏幕流必须继续跑 ——
+      // 否则每次点亮都要重新建流，第一帧空白半秒。
+      backgroundThrottling: false
+    }
+  });
+
+  alertWin.setAlwaysOnTop(true, 'screen-saver');
+  // 平时整窗穿透：提醒窗不能挡游戏点击，只有放置模式才接管鼠标
+  alertWin.setIgnoreMouseEvents(true, { forward: true });
+
+  alertWin.on('move', () => {
+    if (!alertWin || alertWin.isDestroyed()) return;
+    const b = alertWin.getBounds();
+    settings.alertX = Math.round(b.x);
+    settings.alertY = Math.round(b.y);
+    persist();
+  });
+
+  alertWin.on('closed', () => {
+    alertWin = null;
+    alertHideTimer = null;
+  });
+
+  alertWin.loadFile(path.join(__dirname, 'alert', 'index.html'));
+  alertWin.webContents.on('did-finish-load', () => {
+    if (!alertWin || alertWin.isDestroyed()) return;
+    alertWin.webContents.send('alert:placing', alertPlacing);
+    // 页面一就绪就把屏幕流建起来，等第一次点亮时画面已经在了
+    sendAlertStream();
+  });
+
+  return alertWin;
+}
+
+function setAlertPlacing(on) {
+  alertPlacing = !!on;
+  const w = alertPlacing ? createAlertWindow() : alertWin;
+  if (!w || w.isDestroyed()) return alertPlacing;
+  // 放置模式要能拖：放开鼠标接管，并让页面切成可拖动区域
+  w.setIgnoreMouseEvents(!alertPlacing, { forward: true });
+  if (alertPlacing && !w.isVisible()) w.showInactive();
+  if (!w.webContents.isLoading()) w.webContents.send('alert:placing', alertPlacing);
+  return alertPlacing;
+}
+
+/* 方位高亮的时序：雷达圈和放大提醒窗共用这一份。
+ *
+ * 雷达那边不再自己写常量，改由 pushRadarConfig 把这两个值下发过去 ——
+ * 各写一份迟早对不上，就会出现「雷达灭了提醒还挂着」。
+ */
+const CUE_HOLD_MS = 3200;
+const CUE_FADE_MS = 450;
+/** 提醒窗自己的淡出时长：比雷达的光晕更快，收得干脆一点 */
+const ALERT_FADE_MS = 200;
+
+/**
+ * 把「要显示哪块屏幕」告诉提醒窗。
+ *
+ * 叠加层本来就压在用户自己的游戏小地图上（标定第②步就是把圆环拖过去），
+ * 所以它的 bounds 就是小地图的位置 —— 不用再让用户框一次。
+ *
+ * 提醒窗拿到 sourceId 后自己拉屏幕流、每帧抠出这块画到 canvas，
+ * 所以这里只在区域变化时发一次，不是每帧都发。
+ */
+async function sendAlertStream() {
+  const w = alertWin;
+  if (!w || w.isDestroyed()) return;
+
+  let display = null;
+  try {
+    display = screen.getDisplayMatching(overlayBounds());
+  } catch {
+    display = null;
+  }
+  if (!display) return;
+
+  let sources = [];
+  try {
+    // 只要 sourceId，缩略图给 1×1 就够，几乎不花时间
+    sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
+  } catch (err) {
+    console.warn('[alert] 取屏幕源失败：', err && err.message);
+    return;
+  }
+  if (!sources || !sources.length) return;
+
+  const src = sources.find((x) => String(x.display_id) === String(display.id)) || sources[0];
+  const ring = alertSize();
+  const b = overlayBounds();
+  const cx = b.x + b.width / 2 - ring / 2;
+  const cy = b.y + b.height / 2 - ring / 2;
+
+  const payload = {
+    sourceId: src.id,
+    region: {
+      x: Math.round(cx - display.bounds.x),
+      y: Math.round(cy - display.bounds.y),
+      size: ring
+    },
+    screen: { width: display.size.width, height: display.size.height }
+  };
+
+  if (w.webContents.isLoading()) w.webContents.once('did-finish-load', () => {
+    if (w && !w.isDestroyed()) w.webContents.send('alert:stream', payload);
+  });
+  else {
+    try {
+      w.webContents.send('alert:stream', payload);
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  }
+}
+
+/** 方向来了：把窗口亮起来，到点收起。画面由常驻屏幕流实时提供，不用抓图。 */
+function showAlertCue() {
+  if (!settings.alertEnabled) return;
+
+  const w = createAlertWindow();
+  const hold = CUE_HOLD_MS;
+
+  const push = () => {
+    if (!w || w.isDestroyed()) return;
+    try {
+      const size = alertSize();
+      const b = w.getBounds();
+      if (b.width !== size || b.height !== size) w.setBounds({ ...b, width: size, height: size });
+      w.webContents.send('alert:show', { hold });
+      if (!w.isVisible()) w.showInactive();
+      // 位置/半径可能刚改过，顺手把显示区域同步过去
+      sendAlertStream();
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  };
+
+  if (w.webContents.isLoading()) w.webContents.once('did-finish-load', push);
+  else push();
+
+  clearTimeout(alertHideTimer);
+  alertHideTimer = setTimeout(() => {
+    if (!alertWin || alertWin.isDestroyed()) return;
+    if (alertPlacing) return; // 正在拖动就先别藏
+    try {
+      alertWin.hide(); // 隐藏窗口但保留屏幕流，下次点亮不用重连
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  }, CUE_HOLD_MS + ALERT_FADE_MS);
+}
+
+/** 把外观推给字幕窗口；窗口还没建就跳过（下次显示时会带上最新配置） */
+function pushSubtitleConfig() {
+  if (!subtitleWin || subtitleWin.isDestroyed()) return;
+  try {
+    subtitleWin.webContents.send('subtitle:config', subtitleStyleSnapshot());
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/* ------------------------------------------------ 弹幕层的层级避让 */
+
+/**
+ * Windows 上 Electron 的 setAlwaysOnTop(level) 里的 level **只在 macOS 有效**，
+ * Windows 全都落到同一个 HWND_TOPMOST 带里，谁后显示谁在上层。
+ * 所以「弹幕低于视频浮窗」不能只靠 level 参数，必须在弹幕显示后
+ * 主动把浮窗和方位箭头层 moveTop() 顶回去。
+ */
+let lastRaiseLog = 0;
+function raiseFloatAboveDanmaku() {
+  let raised = false;
+
+  // 方位箭头层（红绿箭头）优先，它必须压在最上面
+  try {
+    if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) {
+      // 重新声明一次 topmost 会把窗口重新插入到置顶带最前面，
+      // 再 moveTop 兜底 —— Windows 上单靠 level 参数没用
+      overlayWin.setAlwaysOnTop(true, 'screen-saver');
+      overlayWin.moveTop();
+      raised = true;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    if (win && !win.isDestroyed()) {
+      win.setAlwaysOnTop(true, 'screen-saver');
+      win.moveTop();
+      raised = true;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 每 10 秒最多打一条，方便确认这条链路真的执行了（不刷屏）
+  if (raised && Date.now() - lastRaiseLog > 10000) {
+    lastRaiseLog = Date.now();
+    console.log('[zorder] 已把浮窗/箭头层提到弹幕之上');
+  }
+}
+
+/* ---------------------------------------------------------- 弹幕层窗口 */
+
+/**
+ * 全屏透明弹幕层。和字幕层是同一套思路，区别是：
+ *  · 它要显示很多条同时飞的弹幕，所以渲染在独立窗口里用 CSS 动画跑；
+ *  · 只在开关打开时创建/显示，关掉立刻隐藏并清空；
+ *  · 依旧整窗鼠标穿透，绝不干扰游戏。
+ */
+let danmakuWin = null;
+
+function danmakuBounds() {
+  const d = screen.getPrimaryDisplay();
+  return { x: d.bounds.x, y: d.bounds.y, width: d.bounds.width, height: d.bounds.height };
+}
+
+function createDanmakuWindow() {
+  if (danmakuWin && !danmakuWin.isDestroyed()) return danmakuWin;
+
+  danmakuWin = new BrowserWindow({
+    ...danmakuBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    title: 'GIFA 弹幕层',
+    webPreferences: {
+      preload: path.join(__dirname, 'danmaku', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // 弹幕窗同理：空闲时让它被节流，真正需要时由主进程唤醒
+      backgroundThrottling: true
+    }
+  });
+
+  // 层级刻意比视频浮窗低一档：浮窗用 'screen-saver'，弹幕层用 'floating'。
+  // 这样弹幕飘过视频画面时会被浮窗挡住 —— 小地图上的红绿箭头始终看得见，
+  // 视觉上就是「弹幕在箭头下面」。若也用 screen-saver，两者同级，
+  // 谁后显示谁在上面，弹幕就会盖住方位标记。
+  danmakuWin.setAlwaysOnTop(true, 'floating');
+  danmakuWin.setIgnoreMouseEvents(true, { forward: true });
+
+  danmakuWin.on('closed', () => {
+    danmakuWin = null;
+  });
+
+  danmakuWin.loadFile(path.join(__dirname, 'danmaku', 'index.html'));
+
+  danmakuWin.webContents.on('did-finish-load', () => {
+    if (!danmakuWin || danmakuWin.isDestroyed()) return;
+    danmakuWin.setBounds(danmakuBounds());
+    pushDanmakuConfig();
+    raiseFloatAboveDanmaku();
+  });
+
+  return danmakuWin;
+}
+
+function refitDanmakuWindow() {
+  if (!danmakuWin || danmakuWin.isDestroyed()) return;
+  try {
+    danmakuWin.setBounds(danmakuBounds());
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/**
+ * 方位箭头层的「挖空圆」，坐标换算到弹幕窗口的局部坐标系。
+ * 箭头层是独立窗口，位置/半径都存在 settings.bearing 里；
+ * 弹幕窗口铺满主屏，所以 local = 屏幕坐标 − 窗口原点。
+ */
+function bearingHole() {
+  if (!settings.bearing || !settings.bearing.enabled) return null;
+  if (!win || win.isDestroyed()) return null;
+
+  const cx = Number(settings.bearing.x);
+  const cy = Number(settings.bearing.y);
+  const r = Number(settings.bearing.radius);
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(r)) return null;
+
+  let bounds = null;
+  try {
+    bounds = danmakuWin && !danmakuWin.isDestroyed() ? danmakuWin.getBounds() : danmakuBounds();
+  } catch {
+    return null;
+  }
+  if (!bounds) return null;
+
+  return {
+    // 半径留 1.25 倍余量：箭头层的窗口比箭头本身大一圈
+    cx: Math.round(cx - bounds.x),
+    cy: Math.round(cy - bounds.y),
+    r: Math.round(r * 1.25)
+  };
+}
+
+/** 把当前外观配置推给弹幕窗口（实时生效，不重建窗口） */
+function pushDanmakuConfig() {
+  if (!danmakuWin || danmakuWin.isDestroyed()) return;
+  const cfg = {
+    area: settings.danmakuArea,
+    opacity: settings.danmakuOpacity,
+    scale: settings.danmakuScale,
+    speed: settings.danmakuSpeed,
+    weight: settings.danmakuWeight,
+    max: settings.danmakuMax,
+    stroke: settings.danmakuStroke,
+    // 方位箭头那一圈挖空：弹幕在那里直接不渲染，
+    // 比跟窗口抢 z-order 更可靠（Windows 上置顶窗口的层级很难稳定控制）
+    hole: bearingHole()
+  };
+  try {
+    danmakuWin.webContents.send('danmaku:config', cfg);
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/** 清空弹幕窗里现有的全部弹幕（换片 / 拖进度条时用） */
+function resetDanmakuWindow() {
+  if (!danmakuWin || danmakuWin.isDestroyed()) return;
+  try {
+    danmakuWin.webContents.send('danmaku:reset', {});
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/** 清空并隐藏弹幕层 */
+function hideDanmaku() {
+  if (!danmakuWin || danmakuWin.isDestroyed()) return;
+  try {
+    danmakuWin.webContents.send('danmaku:reset', {});
+    danmakuWin.hide();
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+function destroyDanmakuWindow() {
+  if (!danmakuWin || danmakuWin.isDestroyed()) return;
+  danmakuWin.destroy();
+  danmakuWin = null;
+}
+
+/**
+ * 把雷达圈的几何下发给 overlay。
+ *
+ * overlay 的窗口是以标定圆心为中心、边长 overlaySize() 的正方形，
+ * 所以那边只需要知道「半径多少、要不要显示」，坐标天然对齐。
+ * 没标定过就 visible=false —— 圆心和半径都是猜的，画出来只会误导。
+ */
+function pushRadarConfig() {
+  if (!overlayWin || overlayWin.isDestroyed()) return;
+  const b = settings.bearing || {};
+  // 只要「开过箭头 + 标定过 + 有识别区域」就挂雷达。
+  // 不按视频区分：overlay 只需要知道圈画多大，具体用哪块 ROI 是访客页的事。
+  const hasRois =
+    (Array.isArray(b.rois) && b.rois.length > 0) ||
+    (b.roiBy && Object.values(b.roiBy).some((v) => Array.isArray(v) && v.length > 0));
+  const visible = !!b.enabled && !!b.calibrated && hasRois;
+  const payload = {
+    radius: Math.max(60, Number(b.radius) || 110),
+    visible,
+    // 高亮时序：雷达圈和放大提醒窗必须同亮同灭
+    hold: CUE_HOLD_MS,
+    fade: CUE_FADE_MS
+  };
+  try {
+    overlayWin.webContents.send('radar:config', payload);
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/* ------------------------------------------------------------ 弹幕数据源 */
+
+/**
+ * 弹幕列表只从官方接口取一次，**不再监听 DOM**。
+ *
+ * 为什么放弃 DOM 监听：B 站播放器在首帧/换片时会把整段历史弹幕一次性回填进
+ * 容器，MutationObserver 于是瞬间看到成百上千个节点 —— 那就是「井喷」。
+ * DOM 里也没有可靠的「这条弹幕属于第几秒」信息，只能按插入顺序播，必然错位。
+ *
+ * 这里用 api.bilibili.com/x/v1/dm/list.so?oid=<cid> 拿 XML：
+ *   <d p="出现秒,模式,字号,颜色,发送时间戳,...">文本</d>
+ * 解析成 { t: 毫秒时间戳, text, color } 后按 t 排序缓存。
+ */
+let danmakuList = [];   // 当前视频/分P 的全量弹幕（已排序）
+let danmakuCid = 0;     // 与 danmakuList 对应的 cid
+let danmakuSentAt = -1; // 上次给弹幕窗发窗口片段时的播放进度（秒）
+let currentCid = 0;     // 当前正在播的分 P 的 cid（中途开开关时用它补拉）
+let danmakuLoading = 0; // 正在请求的 cid，防止并发重复拉
+
+function decodeXmlText(str) {
+  return String(str)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function colorHex(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return '#ffffff';
+  return '#' + (v & 0xffffff).toString(16).padStart(6, '0');
+}
+
+async function fetchDanmakuList(cid) {
+  if (!cid) return [];
+  if (danmakuCid === cid && danmakuList.length) return danmakuList;
+  if (danmakuLoading === cid) return danmakuList;
+
+  danmakuLoading = cid;
+  try {
+    const res = await biliFetch(`https://api.bilibili.com/x/v1/dm/list.so?oid=${cid}`, {
+      Accept: 'application/xml,text/xml,*/*'
+    });
+    const xml = await res.text();
+    const out = [];
+    const re = /<d\s+p="([^"]*)"[^>]*>([\s\S]*?)<\/d>/g;
+    let m;
+    while ((m = re.exec(xml))) {
+      const parts = m[1].split(',');
+      const sec = Number(parts[0]);
+      if (!Number.isFinite(sec)) continue;
+      const text = decodeXmlText(m[2]).replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      out.push({
+        t: Math.round(sec * 1000),
+        text,
+        color: colorHex(parts[3]),
+        idx: out.length
+      });
+    }
+    out.sort((a, b) => a.t - b.t);
+    out.forEach((d, i) => {
+      d.idx = i;
+    });
+    danmakuList = out;
+    danmakuCid = cid;
+    console.log('[danmaku] 已加载弹幕', out.length, '条（cid=' + cid + '）');
+    return danmakuList;
+  } catch (err) {
+    console.warn('[danmaku] 拉取失败：', err.message);
+    return [];
+  } finally {
+    danmakuLoading = 0;
+  }
+}
+
+/**
+ * 按播放进度取「当前点前 1 秒 ~ 后 6 秒」的一小段发给弹幕窗。
+ * 绝不整包下发 —— 那正是井喷的另一种形式。
+ */
+function sendDanmakuSlice(t, seek, playing = true) {
+  if (!settings.enableDanmakuProjection) return;
+  if (!danmakuList.length) return;
+
+  const now = Number(t);
+  if (!Number.isFinite(now) || now < 0) return;
+
+  // 非 seek 时，距离上次发送不到 2.5 秒就不重复发
+  if (!seek && danmakuSentAt >= 0 && Math.abs(now - danmakuSentAt) < 2.5) return;
+  danmakuSentAt = now;
+
+  const from = Math.max(0, now - 1);
+  const to = now + 6;
+  const items = danmakuList.filter((d) => d.t >= from * 1000 && d.t <= to * 1000);
+  if (!items.length && !seek) return;
+
+  const w = createDanmakuWindow();
+  if (!w.isVisible()) {
+    w.showInactive();
+    // 刚显示出来的弹幕层会盖住所有置顶窗口，立刻把浮窗/箭头层顶回去
+    raiseFloatAboveDanmaku();
+  }
+  pushDanmakuConfig();
+
+  const send = () => {
+    if (!w || w.isDestroyed()) return;
+    w.webContents.send('danmaku:slice', { t: now, seek: !!seek, playing, items });
+  };
+  if (w.webContents.isLoading()) w.webContents.once('did-finish-load', send);
+  else send();
 }
 
 /* -------------------------------------------------------------- 全局热键 */
@@ -1216,7 +3041,8 @@ function registerHotkeys() {
       if (typingInField) return true;
       const focused = BrowserWindow.getFocusedWindow();
       return !!focused && focused === loginWin;
-    }
+    },
+    onRawHookEvent
   );
 
   if (hookState.needed && !hookState.ok) {
@@ -1289,7 +3115,14 @@ async function fetchVideoInfo(id) {
       id: d.bvid || id,
       title: d.title || '',
       owner: d.owner ? d.owner.name : '',
-      pages: (d.pages || []).map((p) => ({ page: p.page, part: p.part, duration: p.duration }))
+      // cid 是弹幕接口和官方字幕接口的必需参数，必须一起带出来
+      cid: d.cid || 0,
+      pages: (d.pages || []).map((p) => ({
+        page: p.page,
+        part: p.part,
+        duration: p.duration,
+        cid: p.cid || 0
+      }))
     };
   } catch (err) {
     return { ok: false, message: '读取视频信息失败：' + err.message };
@@ -1488,15 +3321,162 @@ function registerIpc() {
     capturingHotkey = !!on;
     if (capturingHotkey) cancelTemporarySpeed();
   });
+  /* ---- 播放控制：启动器的静音 / 倍速控件 ---- */
+  /* ---- 魔改扩展：识别健康度 ---- */
+  ipcMain.handle('bearing:stats', () => {
+    if (!lastBearingStats) return null;
+    // 超过 5 秒没更新说明识别循环停了（视频暂停 / 开关关闭），界面要能区分
+    return { ...lastBearingStats, ageMs: Date.now() - lastBearingStats.at };
+  });
+
+  ipcMain.handle('playback:get', () => playbackState());
+
+  ipcMain.handle('playback:update', (_e, patch = {}) => {
+    if (updatePlaybackSettings(settings, patch)) {
+      persist();
+      publishPlaybackSettings();
+      broadcast('settings:changed', settings);
+    }
+    return playbackState();
+  });
+
+  ipcMain.on('subtitle:time', (_e, payload = {}) => {
+    if (!settings.enableSubtitleSprite) return;
+    if (!subtitleCues.length) return; // 没有接口字幕，走 DOM 抓取那条路
+    // 暂停时按开关决定要不要清屏
+    if (payload && payload.paused && settings.subtitleHideOnPause) {
+      if (lastApiSubtitleText) {
+        lastApiSubtitleText = '';
+        hideSubtitleText();
+      }
+      return;
+    }
+    const t = Number(payload && payload.t);
+    if (!Number.isFinite(t)) return;
+    const text = subtitleAt(t);
+    if (text === lastApiSubtitleText) return;
+    lastApiSubtitleText = text;
+    if (text) showSubtitleText(text);
+    else hideSubtitleText();
+  });
+
+  ipcMain.on('subtitle:update', (_e, payload = {}) => {
+    if (!settings.enableSubtitleSprite) {
+      hideSubtitleText();
+      return;
+    }
+    if (payload && payload.off) {
+      hideSubtitleText();
+      return;
+    }
+    const text = String((payload && payload.text) || '').trim();
+    if (!text) return;
+    lastDomSubtitleText = text;
+    showSubtitleText(text);
+  });
+
+  /* ---- 字幕状态：控制台「B站设置」页轮询 ---- */
+  ipcMain.handle('subtitle:status', () => {
+    const api = subtitleCues.length > 0;
+    return {
+      mode: api ? 'api' : lastDomSubtitleText ? 'dom' : 'none',
+      count: subtitleCues.length,
+      cid: subtitleCid,
+      // 官方字幕模式取主进程查表的结果，DOM 模式取访客页推上来的最后一句
+      lastText: api ? lastApiSubtitleText : lastDomSubtitleText,
+      enabled: !!settings.enableSubtitleSprite,
+      apiEnabled: settings.subtitleUseApi !== false
+    };
+  });
+
+  /* ---- 手动重读：丢掉缓存再请求一次官方字幕轨 ---- */
+  ipcMain.handle('subtitle:refetch', async () => {
+    if (!settings.subtitleUseApi) return { ok: false, reason: 'api-off' };
+    const bvid = settings.lastVideoId;
+    const cid = currentCid;
+    if (!bvid || !cid) return { ok: false, reason: 'no-video' };
+    subtitleCid = 0;
+    subtitleCues = [];
+    subtitleGen += 1;
+    const gen = subtitleGen;
+    lastApiSubtitleText = '';
+    const cues = await fetchSubtitleCues(bvid, cid, gen);
+    if (cues === null || gen !== subtitleGen) return { ok: false, reason: 'stale' };
+    if (win && !win.isDestroyed()) {
+      sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+    }
+    return { ok: true, count: cues.length };
+  });
+
+  /* ---- 全屏弹幕：浮窗把访客页抓到的一条弹幕转给弹幕层 ---- */
+
+  // 浮窗把 <video> 的播放进度报上来：主进程按进度切「窗口片段」下发。
+  // 不再有 DOM 抓取，也就没有历史弹幕被一次性回填的问题。
+  ipcMain.on('danmaku:time', (_e, payload = {}) => {
+    if (!settings.enableDanmakuProjection) return;
+    const t = Number(payload.t);
+    if (!Number.isFinite(t)) return;
+
+    // 每次都把播放进度同步给弹幕窗（它用这个当本地时钟基准），
+    // 但片段只在需要时切，避免频繁下发
+    if (danmakuWin && !danmakuWin.isDestroyed()) {
+      danmakuWin.webContents.send('danmaku:time', { t, playing: payload.playing !== false });
+    }
+
+    if (payload.seek) {
+      resetDanmakuWindow();
+      danmakuSentAt = -1;
+      sendDanmakuSlice(t, true, payload.playing !== false);
+      return;
+    }
+    sendDanmakuSlice(t, false, payload.playing !== false);
+  });
+
+  /* ---- 字幕转向提醒：浮窗匹配到方向词后转给字幕层画大箭头 ---- */
+
+  ipcMain.on('turn:update', (_e, payload = {}) => {
+    if (!settings.enableTurnReminder) return;
+    // 分组开关（前端已过滤一次，这里再兜一道，防止旧配置/竞态漏过来）
+    if (payload && (payload.dir === 'left' || payload.dir === 'right') && !settings.turnEnableLR) return;
+    if (payload && (payload.dir === 'up' || payload.dir === 'down') && !settings.turnEnableUD) return;
+    if (payload && payload.off) {
+      pushTurnHint(null);
+      return;
+    }
+    const dir = String(payload.dir || '');
+    if (!dir) return;
+    pushTurnHint({ dir, label: String(payload.label || ''), text: String(payload.text || '') });
+  });
+
+  /* ---- 空转回收：字幕层 / 弹幕层没内容时把窗口藏起来，省全屏合成 ---- */
+
+  ipcMain.on('subtitle:idle', () => {
+    if (!subtitleWin || subtitleWin.isDestroyed()) return;
+    if (!settings.enableSubtitleSprite && !settings.enableTurnReminder) return;
+    // 窗口 hide 后仍保留实例，下次有文本时 showInactive 即可，不用重建
+    if (subtitleWin.isVisible()) subtitleWin.hide();
+  });
+
+  /* ---- 输入状态：决定单键热键要不要让路 ---- */
+
+
 
   /* ---- 方位标记：视频侧只上报一个角度，主进程转发给叠加窗 ---- */
 
   ipcMain.on('overlay:bearing', (_e, payload) => {
     lastBearing = payload;
+    // 魔改扩展：访客页每帧带一份识别健康度，存下来给控制台轮询
+    if (payload && payload.stats) lastBearingStats = { ...payload.stats, at: Date.now() };
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.webContents.send('bearing', payload);
   });
 
-  ipcMain.handle('overlay:enable', (_e, on) => setBearingEnabled(on));
+  ipcMain.handle('overlay:enable', (_e, on) => {
+    const r = setBearingEnabled(on);
+    // 上游这个函数不发雷达配置，雷达模式下开关箭头后圈不会跟着出现/消失
+    pushRadarConfig();
+    pushDanmakuConfig();
+    return r;
+  });
 
   /**
    * 手动自动定心的结果。访客算出的 dx/dy 是「视频像素」，这里换算成归一化偏移，
@@ -1539,10 +3519,93 @@ function registerIpc() {
     sendTo(consoleWin, 'auto-center-result', out);
     return out;
   });
-  ipcMain.handle('overlay:place', (_e, on) => setOverlayPlacing(on));
+  /* ---- 魔改扩展：overlay 自绘拖动 ----
+   * 雷达模式下由渲染层按指针位移发过来，直接平移窗口。
+   * 不经过系统拖动，所以不会被屏幕边缘吸附、也不会弹回。 */
+  ipcMain.on('overlay:drag-start', (_e, p) => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    const x = Number(p && p.x);
+    const y = Number(p && p.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    overlayDrag = { x, y, bounds: overlayWin.getBounds() };
+  });
+
+  ipcMain.on('overlay:drag-move', (_e, p) => {
+    if (!overlayDrag || !overlayWin || overlayWin.isDestroyed()) return;
+    const x = Number(p && p.x);
+    const y = Number(p && p.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const b = overlayDrag.bounds;
+    try {
+      overlayWin.setBounds({
+        x: Math.round(b.x + (x - overlayDrag.x)),
+        y: Math.round(b.y + (y - overlayDrag.y)),
+        width: b.width,
+        height: b.height
+      });
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  });
+
+  ipcMain.on('overlay:drag-end', () => {
+    overlayDrag = null;
+    // 拖完先保证还能抓回来（推出去太远就拉回工作区内）
+    ensureOverlayReachable();
+    persist();
+    pushDanmakuConfig();
+    pushRadarConfig();
+  });
+
+  /* ---- 魔改扩展：智能防遮挡 ---- */
+  // 字幕里出现「地图 / 锚点 / 传送」时，暂时别把窗口淡掉
+  ipcMain.on('avoid:mark', () => markAvoidHide());
+
+  /* ---- 魔改扩展：放大提醒窗口 ---- */
+  ipcMain.handle('alert:place', (_e, on) => {
+    const next = on === undefined ? !alertPlacing : !!on;
+    const result = setAlertPlacing(next);
+    // 进放置模式时同步一次显示区域，窗口才有画面
+    if (result) sendAlertStream();
+    return result;
+  });
+
+  /* ---- 魔改扩展：字幕点亮的绝对方位，转给叠加层画雷达 ---- */
+  ipcMain.on('compass:cue', (_e, cue) => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    const deg = Number(cue && cue.deg);
+    if (!Number.isFinite(deg)) return;
+    try {
+      overlayWin.webContents.send('compass:cue', { deg, label: String(cue.label || '') });
+    } catch {
+      /* 窗口正在销毁 */
+    }
+
+    /* 放大提醒：画面由常驻屏幕流实时提供，所以这里是「直接亮窗」，
+     * 没有任何抓图等待 —— 和雷达同一帧出现。 */
+    showAlertCue();
+  });
+
+  ipcMain.handle('overlay:place', (_e, on) => {
+    const placing = setOverlayPlacing(on);
+    // 进放置模式先保证抓得到：上次可能被推到屏幕外了
+    if (placing) ensureOverlayReachable();
+    return placing;
+  });
   // 启动器重建 / 箭头开关切换后，用它把按钮文案对齐到主进程的真实状态
   ipcMain.handle('overlay:place-state', () => overlayPlacing);
-  ipcMain.handle('overlay:radius', (_e, r) => setOverlayRadius(r));
+  ipcMain.handle('overlay:radius', (_e, r) => {
+    const out = setOverlayRadius(r);
+    pushRadarConfig();
+    // 提醒窗是 1:1 镜像，叠加层变大它也要跟着变大，显示区域同步更新
+    if (alertWin && !alertWin.isDestroyed()) {
+      const size = alertSize();
+      const b = alertWin.getBounds();
+      if (b.width !== size || b.height !== size) alertWin.setBounds({ ...b, width: size, height: size });
+      sendAlertStream();
+    }
+    return out;
+  });
 
   // 调试：把访客抓到的识别区域落盘，用来肉眼确认 ROI 有没有对准小地图
   ipcMain.handle('overlay:dump-save', (_e, payload = {}) => {
@@ -1609,6 +3672,141 @@ function registerIpc() {
     if (patch.clickThrough !== undefined) setPass(patch.clickThrough);
     if (patch.opacity !== undefined) setOpacity(patch.opacity);
     if (patch.hotkeys) settings.hotkeys = { ...settings.hotkeys, ...patch.hotkeys };
+
+    /* ---- 魔改扩展：字幕 / 转向 / 弹幕 的开关与外观 ---- */
+    if (patch.enableSubtitleSprite !== undefined) {
+      settings.enableSubtitleSprite = !!patch.enableSubtitleSprite;
+      // 转向提醒还开着的话，字幕层窗口要留着给大箭头用
+      if (!settings.enableSubtitleSprite && !settings.enableTurnReminder) hideSubtitleText();
+      // 视频已经载入后才打开开关：补拉一次官方字幕轨
+      if (settings.enableSubtitleSprite && settings.subtitleUseApi && settings.lastVideoId && currentCid) {
+        subtitleGen += 1;
+        const gen = subtitleGen;
+        subtitleCid = 0;
+        fetchSubtitleCues(settings.lastVideoId, currentCid, gen).then((cues) => {
+          if (!cues || gen !== subtitleGen) return;
+          if (win && !win.isDestroyed()) {
+            sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+          }
+        });
+      }
+    }
+    if (patch.subtitleUseApi !== undefined) {
+      settings.subtitleUseApi = !!patch.subtitleUseApi;
+      if (!settings.subtitleUseApi) {
+        subtitleCues = [];
+        subtitleCid = 0;
+        lastApiSubtitleText = '';
+        if (win && !win.isDestroyed()) sendTo(win, 'subtitle:api', { on: false, count: 0 });
+      } else if (settings.enableSubtitleSprite && settings.lastVideoId && currentCid) {
+        subtitleGen += 1;
+        const gen = subtitleGen;
+        subtitleCid = 0;
+        fetchSubtitleCues(settings.lastVideoId, currentCid, gen).then((cues) => {
+          if (!cues || gen !== subtitleGen) return;
+          if (win && !win.isDestroyed()) {
+            sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+          }
+        });
+      }
+    }
+    for (const key of [
+      'subtitleHideNative',
+      'subtitleMergeOverlap',
+      'subtitleHideOnPause',
+      'subtitleAutoOpen',
+      // 沉浸模式的两条防遮挡规则
+      'avoidHideEnabled',
+      'combatFadeEnabled'
+    ]) {
+      if (patch[key] !== undefined) settings[key] = !!patch[key];
+    }
+    if (patch.subtitle) {
+      applySubtitleStylePatch(patch.subtitle);
+      pushSubtitleConfig();
+    }
+    if (patch.turn) {
+      applyTurnStylePatch(patch.turn);
+      pushTurnConfig();
+    }
+    if (patch.enableTurnReminder !== undefined) {
+      settings.enableTurnReminder = !!patch.enableTurnReminder;
+      if (!settings.enableTurnReminder) pushTurnHint(null);
+      if (!settings.enableTurnReminder && !settings.enableSubtitleSprite) hideSubtitleText();
+    }
+    if (patch.danmaku) {
+      const d = patch.danmaku;
+      const clamp = (v, min, max, fb) =>
+        Number.isFinite(Number(v)) ? Math.min(max, Math.max(min, Math.round(Number(v)))) : fb;
+      if (d.area !== undefined) settings.danmakuArea = clamp(d.area, 10, 100, settings.danmakuArea);
+      if (d.opacity !== undefined) settings.danmakuOpacity = clamp(d.opacity, 0, 100, settings.danmakuOpacity);
+      if (d.scale !== undefined) settings.danmakuScale = clamp(d.scale, 50, 200, settings.danmakuScale);
+      if (d.speed !== undefined) settings.danmakuSpeed = clamp(d.speed, 0, 100, settings.danmakuSpeed);
+      if (d.weight !== undefined) settings.danmakuWeight = clamp(d.weight, 400, 900, settings.danmakuWeight);
+      if (d.max !== undefined) settings.danmakuMax = clamp(d.max, 10, 150, settings.danmakuMax);
+      if (d.stroke !== undefined) settings.danmakuStroke = !!d.stroke;
+      pushDanmakuConfig();
+    }
+    if (patch.snapAdjustment !== undefined) {
+      const v = Number(patch.snapAdjustment);
+      settings.snapAdjustment = Number.isFinite(v) ? Math.min(20, Math.max(-20, Math.round(v))) : 0;
+      // 已经贴在边上时，改微调量要立刻重新贴一次，否则看不出效果
+      reapplySnapIfAtEdge();
+    }
+    if (patch.avoidHideHold !== undefined) {
+      const v = Number(patch.avoidHideHold);
+      settings.avoidHideHold = Math.round(Math.max(1, Math.min(30, Number.isFinite(v) ? v : 4)));
+    }
+    if (patch.combatOpacity !== undefined) {
+      const v = Number(patch.combatOpacity);
+      settings.combatOpacity = Math.round(Math.max(10, Math.min(100, Number.isFinite(v) ? v : 75)));
+      applyWindowPresentation();
+    }
+    if (patch.alertEnabled !== undefined) {
+      settings.alertEnabled = !!patch.alertEnabled;
+      if (settings.alertEnabled) {
+        // 提前建窗口并起流：第一次点亮就能立刻出画面，不用等冷启动
+        createAlertWindow();
+      } else if (alertWin && !alertWin.isDestroyed()) {
+        // 销毁而不是隐藏：屏幕流、视频解码器、canvas 一起释放。
+        // 关掉这个开关的用户就是不想付这份开销。
+        alertWin.destroy();
+        alertWin = null;
+      }
+    }
+    if (patch.overlayRadar !== undefined) {
+      const next = !!patch.overlayRadar;
+      if (next !== settings.overlayRadar) {
+        settings.overlayRadar = next;
+        // 渲染方式变了必须重建窗口：脚本是在页面加载时按 query 选的
+        if (overlayWin && !overlayWin.isDestroyed()) overlayWin.destroy();
+        overlayWin = null;
+        if (settings.bearing.enabled) showOverlay();
+      }
+    }
+    if (patch.ratioLocked !== undefined) {
+      setRatioLocked(patch.ratioLocked);
+    }
+    if (patch.enableVisionGreenArc !== undefined) {
+      settings.enableVisionGreenArc = !!patch.enableVisionGreenArc;
+      // 关掉绿弧时访客页会跳过扇形识别，配置要立刻重发一次
+      broadcast('settings:changed', settings);
+    }
+    if (patch.closeToTray !== undefined) {
+      settings.closeToTray = !!patch.closeToTray;
+      rebuildTrayMenu();
+    }
+    if (patch.trayClickAction !== undefined) {
+      settings.trayClickAction = patch.trayClickAction === 'float' ? 'float' : 'launcher';
+    }
+    if (patch.danmakuHideNative !== undefined) {
+      settings.danmakuHideNative = !!patch.danmakuHideNative;
+    }
+    if (patch.enableDanmakuProjection !== undefined) {
+      settings.enableDanmakuProjection = !!patch.enableDanmakuProjection;
+      if (!settings.enableDanmakuProjection) hideDanmaku();
+      else if (currentCid) fetchDanmakuList(currentCid);
+    }
     if (patch.bearing) {
       const b = patch.bearing;
       if (b.calibrated !== undefined) settings.bearing.calibrated = !!b.calibrated;
@@ -1686,8 +3884,20 @@ function registerIpc() {
         cancelTemporarySpeed();
         openLogin();
         return true;
-      case 'immersion':
-        return setImmersion(payload === undefined ? !immersion : !!payload);
+      case 'immersion': {
+        const result = setImmersion(payload === undefined ? !immersion : !!payload);
+        // 等渲染层把标题栏/控制条收掉，再量 chromeHeight 并对齐一次，
+        // 不然沉浸模式下上下会留黑边
+        setTimeout(() => applyRatioLock(true), 150);
+        return result;
+      }
+      case 'ratio-refit':
+        // 布局变化（进/退沉浸、纯净模式）后重新量 chromeHeight 并对齐
+        setTimeout(() => applyRatioLock(true), 120);
+        return settings.ratioLocked;
+      case 'ratio-lock':
+        setRatioLocked(payload === undefined ? !settings.ratioLocked : !!payload);
+        return settings.ratioLocked;
       case 'cycle-speed':
         return cyclePlaybackRate();
       case 'open-data':
@@ -1795,6 +4005,33 @@ function registerIpc() {
     // 启动器可能正开着：让「上次看到」那一行立刻跟上，不用等下次启动
     broadcast('settings:changed', settings);
 
+    // 换片/切 P：上一个视频的数据要清干净，绝不能让新视频继承旧状态
+    const cid = pages.find((x) => x.page === p)?.cid || (info.ok ? info.cid : 0);
+    currentCid = cid;
+    danmakuCid = 0;
+    danmakuList = [];
+    danmakuSentAt = -1;
+    resetDanmakuWindow();
+    hideSubtitleText();
+    pushTurnHint(null);
+    subtitleCues = [];
+    subtitleCid = 0;
+    subtitleGen += 1;
+    const gen = subtitleGen;
+    lastApiSubtitleText = '';
+    lastDomSubtitleText = '';
+    if (settings.enableSubtitleSprite && settings.subtitleUseApi && cid && id) {
+      fetchSubtitleCues(id, cid, gen).then((cues) => {
+        if (!cues || gen !== subtitleGen) return;
+        if (win && !win.isDestroyed()) {
+          sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+        }
+      });
+    } else if (win && !win.isDestroyed()) {
+      sendTo(win, 'subtitle:api', { on: false, count: 0 });
+    }
+    if (settings.enableDanmakuProjection && cid) fetchDanmakuList(cid);
+
     return {
       ok: true,
       id,
@@ -1850,8 +4087,17 @@ if (!gotLock) {
       /* ignore */
     }
     registerIpc();
+    createTray(); // 先建托盘：启动器被收进托盘后还要有个入口能叫回来
     createConsole(); // 先出启动器，配置好了再点「启动跟跑」
     registerHotkeys();
+
+    // 外接屏拔插 / 改分辨率：全屏透明层要重新铺满，否则只盖住半个屏幕
+    screen.on('display-metrics-changed', () => {
+      refitSubtitleWindow();
+      refitDanmakuWindow();
+    });
+    screen.on('display-added', refitSubtitleWindow);
+    screen.on('display-removed', refitSubtitleWindow);
 
     // `--open BVxxx` 是从快捷方式直接带视频来的，那就顺手把浮窗也起来
     if (OPEN_ARG) createWindow();
@@ -1880,6 +4126,7 @@ if (!gotLock) {
 
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', () => {
+    destroyTray();
     clearInterval(hoverTimer);
     cancelTemporarySpeed();
     if (saveTimer) flushSettings();

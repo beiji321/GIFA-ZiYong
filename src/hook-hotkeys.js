@@ -18,7 +18,8 @@
  * 其余带修饰键的组合（Alt+Space 等）继续交给 globalShortcut。
  */
 
-const MOUSE_ACC = /^Mouse([45])$/i;
+// 右键 + 侧键：RMB+Mouse4 / RMB+Mouse5，右键只作前缀，本身不触发
+const MOUSE_ACC = /^(RMB\+)?Mouse([45])$/i;
 const HOOK_ACTIONS = new Set(['holdSpeed', 'cycleSpeed']);
 const MODIFIER_OF = {
   ctrl: 1, control: 1, commandorcontrol: 1, cmdorctrl: 1,
@@ -34,6 +35,18 @@ const MODIFIER_KEYS = {
 
 /** uiohook 的 button 编码：1=左 2=右 3=中 4=侧键后退 5=侧键前进 */
 const BUTTON_OF = { Mouse4: 4, Mouse5: 5 };
+
+/** 右键是否按着：只用于把侧键区分成「侧键」和「右键+侧键」两套 token */
+let rightDown = false;
+
+/**
+ * 原始按键/鼠标事件回调（可选）。
+ *
+ * 绑定表只认「已经配过热键的动作」，但战斗检测需要知道
+ * 用户按了 Q / R 或连点左键 —— 那些可能根本没绑任何热键。
+ * 所以单独开一条通道，和绑定逻辑互不影响。
+ */
+let onRawEvent = null;
 
 /** Electron 加速器名 → uiohook 键名（其余同名直接用） */
 const KEY_ALIAS = {
@@ -122,21 +135,27 @@ function modifiersOf(event) {
 }
 
 function bindingOf(accelerator, action) {
-  const parts = accelerator.split('+').map((part) => part.trim());
+  const acc = String(accelerator).trim();
+
+  // 鼠标要整体匹配，必须先于「按 + 拆修饰键」：
+  // RMB+Mouse4 里的 + 不是修饰键分隔符，先拆的话 RMB 会被当成未知修饰键，
+  // 整条绑定直接判无效，界面上录进去了却永远不触发。
+  const mouse = acc.match(MOUSE_ACC);
+  if (mouse) {
+    return {
+      action,
+      token: `${mouse[1] ? 'rmb-mouse' : 'mouse'}:${BUTTON_OF[`Mouse${mouse[2]}`]}`,
+      modifiers: HOOK_ACTIONS.has(action) ? 0 : 'any'
+    };
+  }
+
+  const parts = acc.split('+').map((part) => part.trim());
   const key = parts.pop();
   let modifiers = 0;
   for (const part of parts) {
     const modifier = MODIFIER_OF[part.toLowerCase()];
     if (!Number.isInteger(modifier) || (modifiers & modifier)) return null;
     modifiers |= modifier;
-  }
-  const mouse = key.match(MOUSE_ACC);
-  if (mouse) {
-    return {
-      action,
-      token: `mouse:${BUTTON_OF[`Mouse${mouse[1]}`]}`,
-      modifiers: HOOK_ACTIONS.has(action) ? modifiers : 'any'
-    };
   }
   const code = keycodeOf(key);
   if (!code) return null;
@@ -178,18 +197,36 @@ function onDown(token, event) {
 }
 
 function onMouseDown(event) {
+  if (onRawEvent) onRawEvent({ kind: 'mouse', button: event.button });
+  // 右键单独按不算键位，只记状态，供「右键 + 侧键」判定
+  if (event.button === 2) {
+    rightDown = true;
+    return;
+  }
+  if (event.button === 4 || event.button === 5) {
+    onDown(`${rightDown ? 'rmb-mouse' : 'mouse'}:${event.button}`, event);
+    return;
+  }
   onDown(`mouse:${event.button}`, event);
 }
 
 function onKeyDown(event) {
+  if (onRawEvent) onRawEvent({ kind: 'key', code: event.keycode });
   onDown(`key:${event.keycode}`, event);
 }
 
 function onMouseUp(event) {
-  const token = `mouse:${event.button}`;
-  pressed.delete(token);
-  blocked.delete(token);
-  if (activeHold && activeHold.token === token) cancelHeld();
+  if (onRawEvent) onRawEvent({ kind: 'mouseup', button: event.button });
+  if (event.button === 2) {
+    rightDown = false;
+    return;
+  }
+  // 按下时按当时的右键状态选过 token，抬起时两个都清，避免状态残留
+  for (const token of [`mouse:${event.button}`, `rmb-mouse:${event.button}`]) {
+    pressed.delete(token);
+    blocked.delete(token);
+    if (activeHold && activeHold.token === token) cancelHeld();
+  }
 }
 
 function onKeyUp(event) {
@@ -295,11 +332,12 @@ function rearm() {
  * @returns {{ needed: boolean, ok: boolean, keys: string[] }}
  *          needed=是否有钩子类绑定；ok=钩子启动是否成功；keys=认不出的键位
  */
-function apply(hotkeys, trigger, ignore) {
+function apply(hotkeys, trigger, ignore, raw) {
   cancelHeld();
   pressed.clear();
   if (trigger) onTrigger = trigger;
   if (ignore) shouldIgnore = ignore;
+  onRawEvent = typeof raw === 'function' ? raw : null;
   bindings.clear();
 
   const nativeAvailable = load();
@@ -339,6 +377,8 @@ function apply(hotkeys, trigger, ignore) {
 function describe(acc) {
   if (/^Mouse4$/i.test(acc)) return '鼠标侧键（后退）';
   if (/^Mouse5$/i.test(acc)) return '鼠标侧键（前进）';
+  if (/^RMB\+Mouse4$/i.test(acc)) return '右键+侧键（后退）';
+  if (/^RMB\+Mouse5$/i.test(acc)) return '右键+侧键（前进）';
   return acc;
 }
 
@@ -346,4 +386,4 @@ function isRunning() {
   return running;
 }
 
-module.exports = { apply, isHookAccelerator, describe, isRunning, rearm, cancelHeld };
+module.exports = { apply, isHookAccelerator, describe, isRunning, rearm, cancelHeld, keycodeOf };

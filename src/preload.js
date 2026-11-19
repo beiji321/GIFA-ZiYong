@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('api', {
   overlayEnable: (on) => ipcRenderer.invoke('overlay:enable', on),
   // 不传参数即切换；传布尔值是幂等设置
   overlayPlace: (on) => ipcRenderer.invoke('overlay:place', on),
+  // 放大提醒窗：进入/退出拖动模式
+  alertPlace: (on) => ipcRenderer.invoke('alert:place', on),
   overlayPlaceState: () => ipcRenderer.invoke('overlay:place-state'),
   overlayRadius: (r) => ipcRenderer.invoke('overlay:radius', r),
   // 手动自动定心的结果：由浮窗转交主进程，把修正写进该视频的标定
@@ -41,5 +43,38 @@ contextBridge.exposeInMainWorld('api', {
   // 启动器 ↔ 浮窗
   onFloatState: (cb) => ipcRenderer.on('float:state', (_e, s) => cb(s)),
   onFloatCmd: (cb) => ipcRenderer.on('float:cmd', (_e, c) => cb(c)),
-  onSettingsChanged: (cb) => ipcRenderer.on('settings:changed', (_e, s) => cb(s))
+  onSettingsChanged: (cb) => ipcRenderer.on('settings:changed', (_e, s) => cb(s)),
+
+  /* ---- 魔改扩展：字幕层 / 弹幕层 / 托盘 / 播放控件 ---- */
+
+  // 字幕：访客页抓到的文本转给主进程，由独立字幕层窗口绘制
+  subtitle: (payload) => ipcRenderer.send('subtitle:update', payload),
+  // 官方字幕模式：主进程拉到字幕轨后通知浮窗，浮窗再让访客页按进度报时间
+  onSubtitleApi: (cb) => ipcRenderer.on('subtitle:api', (_e, s) => cb(s)),
+  subtitleTime: (payload) => ipcRenderer.send('subtitle:time', payload),
+  // 字幕来源状态 + 手动重读
+  subtitleStatus: () => ipcRenderer.invoke('subtitle:status'),
+  subtitleRefetch: () => ipcRenderer.invoke('subtitle:refetch'),
+
+  // 转向提醒：浮窗匹配到方向词后转给字幕层画大箭头
+  turn: (payload) => ipcRenderer.send('turn:update', payload),
+
+  // 弹幕投影：浮窗上报播放进度，主进程按进度切片下发
+  danmakuTime: (payload) => ipcRenderer.send('danmaku:time', payload),
+
+  // 字幕点亮的绝对方位：转给叠加层画雷达
+  compassCue: (cue) => ipcRenderer.send('compass:cue', cue),
+  // 智能防遮挡：字幕里出现看地图类的词
+  avoidHide: () => ipcRenderer.send('avoid:mark'),
+  // 识别健康度：最近 60 帧成功率与失败原因，控制台每秒轮询
+  bearingStats: () => ipcRenderer.invoke('bearing:stats'),
+
+  // 播放控件（启动器的静音 / 倍速）
+  playbackGet: () => ipcRenderer.invoke('playback:get'),
+  playbackUpdate: (patch) => ipcRenderer.invoke('playback:update', patch),
+
+  // 窗口比例状态：浮窗贴边吸附后回报，启动器据此更新微调滑块
+  onRatioState: (cb) => ipcRenderer.on('ratio:state', (_e, s) => cb(s)),
+  onResizePhase: (cb) => ipcRenderer.on('resize:phase', (_e, p) => cb(p)),
+  onSnapEdges: (cb) => ipcRenderer.on('snap:edges', (_e, e) => cb(e))
 });
