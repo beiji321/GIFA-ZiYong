@@ -228,6 +228,24 @@ function createHarness(options = {}) {
     DEFAULT_GAMEPAD,
     resetGamepadSession() {},
     stopGamepadPoller() {},
+    // 托盘是我们加的：notifyFloatState 会顺手刷新托盘菜单，测试里给个空实现
+    rebuildTrayMenu() {},
+    // 诊断日志：只往文件里写，测试里给空实现
+    diag: { init() {}, log() {} },
+    scheduleCidRetry() {},
+    switchPartData() {},
+    // 以下是我们的增量：位置比例恢复、比例锁定、叠加层、雷达配置。
+    // 这个测试只关心沉浸与 bounds 语义，这些给空实现即可。
+    saveWindowRatio() {},
+    restoreWindowRatio: () => null,
+    saveBearingRatio() {},
+    applyRatioLock() {},
+    ensureOverlayVisible() {},
+    pushRadarConfig() {},
+    pushDanmakuConfig() {},
+    destroySubtitleWindow() {},
+    destroyDanmakuWindow() {},
+    destroyAlertWindow() {},
     gamepadPauses: new Set(),
     overlayWin: null
   });
@@ -247,11 +265,15 @@ function createHarness(options = {}) {
     'let hoverTimer = null;',
     'let hoverCandidate = false;',
     'let hoverCandidateAt = 0;',
+    // 沉浸防遮挡（effectiveOpacity 要用）
+    'let avoidUntil = 0;',
+    'let combatUntil = 0;',
     ...[
       'settingsFile', 'flushSettings', 'persist', 'playbackSettings', 'updatePlaybackSettings',
       'isPlaybackGuest', 'isPlaybackMessage', 'playbackState', 'guestPlaybackSettings',
       'publishPlaybackSettings', 'showNotice', 'cyclePlaybackRate', 'setHoldSpeed', 'cancelTemporarySpeed',
       'applyPin', 'createWindow', 'sendTo', 'broadcast', 'floatState', 'notifyFloatState',
+      'effectiveOpacity',
       'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'setImmersion', 'registerIpc'
     ].map((name) => extractFunction(mainSource, name)),
     `globalThis.testApi = {

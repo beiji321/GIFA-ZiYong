@@ -511,9 +511,10 @@ function drawRadarLabels(cx, cy, rim, now) {
     ctx.font = '700 15px "Microsoft YaHei UI", "Microsoft YaHei", sans-serif';
 
     // 先描一圈黑边：任何地形底色下都读得清（参考项目也是先画深色底再画字）
-    ctx.lineWidth = 4;
+    // 点中时字号放大 1.5 倍，4px 黑边会吃掉笔画内部 —— 点中的字反而发黑，收到 3px
+    ctx.lineWidth = hit ? 3 : 4;
     ctx.lineJoin = 'round';
-    ctx.strokeStyle = `rgba(0, 0, 0, ${0.72 * alpha})`;
+    ctx.strokeStyle = hit ? 'rgba(0, 24, 40, 0.85)' : `rgba(0, 0, 0, ${0.72 * alpha})`;
     ctx.strokeText(d.label, 0, 0);
 
     if (hit) {
@@ -567,8 +568,18 @@ function showCompassCue(deg, label) {
   RADAR.cueLabel = String(label || '');
   // 斜向会得到两个轴，正方向只有一个
   RADAR.cueAxes = axesForDeg(RADAR.cueDeg);
-  RADAR.cueAt = Date.now();
+  /* 续期时不要重置 cueAt —— cueAt 也是淡入的起点，
+   * 每次重置都会让光晕从 0 重新淡入，每秒暗一下再亮起来，
+   * 看着就是「呼吸灯一直闪」。
+   *
+   * 也不能把它推到 hold 边界（那样 age 会在两次续期之间越过 hold，
+   * 反而开始淡出，同样会闪）。正确做法是往后挪一点点，
+   * 正好跳过开头 60ms 的淡入：age 从 60 涨到 1060，
+   * 离 hold 还有一大截，始终满亮。 */
+  RADAR.cueAt = same ? Date.now() - 60 : Date.now();
   if (!same) RADAR.cuePulseAt = RADAR.cueAt;
+  /* 续期时动画循环多半已经停了（3.6 秒后 radarTick 不再续帧），
+   * 光晕是静止的、不会重画。必须重新叫醒，续期才真的看得见。 */
   if (!RADAR.raf) RADAR.raf = requestAnimationFrame(radarTick);
 }
 

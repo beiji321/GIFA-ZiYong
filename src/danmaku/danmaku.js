@@ -317,6 +317,20 @@ function onSlice(payload) {
   setPlaying(payload.playing !== false);
 
   const items = Array.isArray(payload.items) ? payload.items : [];
+  // 收到片段就回一句：主进程据此判断是「没数据」还是「有数据没画出来」
+  try {
+    if (typeof window.danmakuLayer.report === 'function') {
+      window.danmakuLayer.report({
+        slice: true,
+        items: items.length,
+        queued: queue.length,
+        shown: shown.size,
+        playing: payload.playing !== false
+      });
+    }
+  } catch {
+    /* 上报失败不影响播放 */
+  }
   const known = new Set(queue.map((q) => q.idx));
   for (const it of items) {
     if (!it || !Number.isFinite(Number(it.t))) continue;

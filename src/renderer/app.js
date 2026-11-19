@@ -30,9 +30,15 @@ let wv = null;
 
 /** B 站视频页 URL 读 ?p=（1 起）；读不到返回 0 */
 function partFromUrl(u) {
-  const m = /[?&](?:p|page)=(\d+)/.exec(String(u || ''));
-  const n = m ? Number(m[1]) : 0;
-  return Number.isFinite(n) && n > 0 ? n : 0;
+  const s = String(u || '');
+  const m = /[?&](?:p|page)=(\d+)/.exec(s);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  // 第一 P 的地址通常就是 /video/BVxxx/ 不带 p 参数。
+  // 以前这里返回 0，从 P2 自动回到 P1 时下拉框和弹幕都不会跟着退。
+  return /\/video\/(?:BV[0-9A-Za-z]{10}|av\d+)/i.test(s) ? 1 : 0;
 }
 
 /** 读 /video/BVxxx/ 或 /video/av123/，用来过滤旧页面迟到的状态心跳 */
@@ -50,7 +56,9 @@ function idFromUrl(u) {
 function syncPartFromGuest(v, fromGuest) {
   const n = Number(v && v.p);
   if (!Number.isFinite(n) || n < 1 || n === state.p) return;
-  if (!state.pages.length || n > state.pages.length) return;
+  // 分 P 列表读不到（开机时接口偶发失败）不能把自动连播一起挡死：
+  // 页码照收，cid 由主进程按 p 自己去查。
+  if (state.pages.length && n > state.pages.length) return;
   const vid = String((v && v.vid) || '').toLowerCase();
   if (vid && state.id && vid !== String(state.id).toLowerCase()) return;
   if (fromGuest && Date.now() - state.loadIssuedAt < 1500) return;
@@ -63,6 +71,14 @@ function setCurrentPart(n, auto) {
   state.p = n;
   renderParts();
   if (!auto) return;
+  // 自动连播时弹幕/字幕在主进程里按 cid 缓存，必须让它按新的 P 换 cid。
+  // 少了这一步，全屏弹幕会一直放上一 P 的（手动切 P 走 bili:load，不经过这里）。
+  try {
+    const r = window.api.part({ id: state.id, p: n });
+    if (r && typeof r.catch === 'function') r.catch(() => {});
+  } catch {
+    /* 换 P 失败不影响继续播 */
+  }
   try {
     const r = window.api.save({ lastPart: n });
     if (r && typeof r.catch === 'function') r.catch(() => {});
@@ -88,6 +104,7 @@ async function init() {
   document.body.classList.toggle('ratio-locked', s.ratioLocked === true);
 
   createWebview();
+  wireChromeHeight();
   wireUi();
   wireHotkeys();
 
@@ -120,6 +137,58 @@ async function init() {
 }
 
 /* --------------------------------------------------------------- webview */
+
+/**
+ * 把 chrome 高度（标题栏 + 控制条）实时报给主进程。
+ *
+ * 比例锁定要用它算视频区高度，而它只有布局稳定后才是真的：
+ * 主进程自己在 ready-to-show 那一刻去量，量到的是布局完成前的值
+ * （日志里稳定量到 105，真实只有 66），高度就算错了，而且再没人纠正。
+ * 改由渲染层在布局真的变了的时候报告，主进程照着用。
+ */
+function wireChromeHeight() {
+  const stage = $('stage');
+  if (!stage || typeof ResizeObserver !== 'function') return;
+  let last = -1;
+  let timer = null;
+  let firstAt = 0;
+  const flush = () => {
+    timer = null;
+    firstAt = 0;
+    const h = Math.round(window.innerHeight - stage.clientHeight);
+    if (!Number.isFinite(h) || h < 0 || h >= 400 || h === last) return;
+    last = h;
+    try {
+      window.api.action('chrome-height', { h });
+    } catch {
+      /* 报不上去就还是用主进程自己量的兜底值 */
+    }
+  };
+  const report = () => {
+    const now = Date.now();
+    if (!firstAt) firstAt = now;
+    clearTimeout(timer);
+    /* 布局稳定 300ms 之后再报。
+     * 刚打开窗口那一刻量到的是半成品（地址栏还没收起来，量出 105，
+     * 真实是 66），报上去会把已知正确的高度改坏，窗口还会当场弹一下。
+     * 最多等 1.5 秒，避免一直不稳定时一次都报不上去。 */
+    timer = setTimeout(flush, now - firstAt > 1500 ? 0 : 300);
+  };
+  new ResizeObserver(report).observe(stage);
+  window.addEventListener('resize', report);
+  report();
+  // 再补一段定时采样：地址栏收起、控制条重排这类变化有时不触发
+  // ResizeObserver（父容器尺寸没动），只靠它可能一次都报不上来。
+  // 启动这八秒管够了，之后布局不再变。
+  const until = Date.now() + 8000;
+  const poll = setInterval(() => {
+    if (Date.now() > until) {
+      clearInterval(poll);
+      return;
+    }
+    report();
+  }, 400);
+}
 
 function createWebview() {
   wv = document.createElement('webview');
@@ -850,6 +919,19 @@ function wireUi() {
   });
 
   // 启动器改了设置（方位开关、标记大小、音量等），浮窗这边跟着更新
+  /* 接口字幕模式的方位判定入口。
+   *
+   * 这条通道走的是 preload 的 ipcRenderer.on，属于**浮窗主渲染进程**；
+   * 而 webview 的 ipc-message 是另一条独立通道，两者不能混用。
+   * 之前把它写在 webview 分支里，主进程发的文本根本没人收 ——
+   * 表现就是「接口字幕模式下罗盘永远不亮」，切 P 后尤其明显。 */
+  window.api.onCompassText((p) => {
+    if (!p || !p.text) return;
+    detectTurn(p.text);
+    detectCompassDir(p.text);
+    if (/地图|锚点|传送/.test(p.text)) window.api.avoidHide();
+  });
+
   window.api.onSettingsChanged((next) => {
     if (!next) return;
     state.boot.settings = next;
@@ -1361,6 +1443,30 @@ let compassToken = 0;
 let lastCompassCue = { deg: -1, at: 0 };
 /** 上一次处理过的字幕原文：同一句被反复推送时不再重复点亮 */
 let lastCompassText = '';
+/**
+ * 最近一次解析出的方位角。
+ *
+ * 用来判断「延时点亮的那个方向是不是已经过时了」：AI 字幕是逐字上屏的，
+ * 每 100~200ms 就送来一条新文本，句子里那个方位却一直没变。
+ * 原来只看 token 变没变，于是每次都在 240ms 的等待期里被下一条顶掉，
+ * 定时器永远到不了点亮那一步 —— 表现就是「字幕说了方向，雷达不亮」。
+ */
+let lastCompassDegs = [];
+
+/** 上一次续期的时间：同一句字幕反复推送时，按节奏续期而不是每次都发 */
+let lastCompassRefresh = 0;
+
+/**
+ * 续期：光晕还在、字幕也没走，就把它再往后延一延。
+ *
+ * 不能走 fireCompassCue —— 那里有「同方位 3 秒内不重复」的去抖，
+ * 正是为了防逐字上屏时反复闪。续期要的恰好是相反的语义：
+ * 不重新播开头的脉冲，只把 cueAt 往后推（叠加层那边 same 分支就是这么做的）。
+ */
+function refreshCompassCue(deg) {
+  if (!Number.isFinite(deg)) return;
+  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg), text: lastCompassText.slice(0, 50) });
+}
 
 /** 真正点亮一个方位（带同方位去抖） */
 function fireCompassCue(deg) {
@@ -1368,12 +1474,18 @@ function fireCompassCue(deg) {
   // 同一方位在停留时间内不重复点亮。
   // 按文字去重不够：AI 字幕会逐字上屏，同一句话每次都是不同的字符串，
   // 每次都算「新字幕」就每次都点亮一次，看着就是不停闪。按角度去重才可靠。
-  if (Math.abs(deg - lastCompassCue.deg) < 1 && now - lastCompassCue.at < 3000) return;
+  if (Math.abs(deg - lastCompassCue.deg) < 1 && now - lastCompassCue.at < 3000) {
+    // 同方位 3 秒内不重复点亮。记一条，免得和「根本没识别出来」混为一谈。
+    if (window.api.compassNone) {
+      window.api.compassNone({ text: lastCompassText.slice(0, 50), reason: 'dedupe', deg: Math.round(deg) });
+    }
+    return;
+  }
   lastCompassCue = { deg, at: now };
   // 留一行日志：F12 打开浮窗控制台就能看到每次点亮，
   // 判断「闪两下」到底是同方位重复触发还是两个不同方位交替。
   console.log('[compass] 点亮', Math.round(deg), nearestDirName(deg), '←', lastCompassText.slice(0, 40));
-  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg) });
+  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg), text: lastCompassText.slice(0, 50) });
 }
 
 /**
@@ -1427,7 +1539,17 @@ function detectCompassDir(text) {
   // 每次推送都点亮的话，开头那段双闪动画就会反复播，看起来像「闪两下」。
   // 同一句只认第一次。
   const key = String(text || '').replace(/\s+/g, '');
-  if (!key || key === lastCompassText) return;
+  if (!key) return;
+  if (key === lastCompassText) {
+    /* 同一句还在屏幕上。叠加层的光晕只亮 3.2 秒就淡出，
+     * 而字幕往往要挂十几秒 —— 用户看到字、再抬头看小地图，光早就没了，
+     * 于是每次都以为「没亮」。这里按节奏续期，字还在光就在。 */
+    if (lastCompassDegs.length && Date.now() - lastCompassRefresh > 900) {
+      lastCompassRefresh = Date.now();
+      for (const d of lastCompassDegs) refreshCompassCue(d);
+    }
+    return;
+  }
   lastCompassText = key;
 
   // 优先认地图位置：字幕里出现「地图右边」时它就是权威描述，
@@ -1439,7 +1561,16 @@ function detectCompassDir(text) {
         .map((seg) => ({ fraction: seg.fraction, deg: atomsToCompass(seg.atoms) }))
         .filter((seg) => seg.deg !== null); // 自相矛盾的方向直接跳过
 
-  if (!segs.length) return;
+  if (!segs.length) {
+    lastCompassDegs = [];
+    // 句子里明明有方位字或「地图」，却没解析出方向 —— 这才是真该查的
+    if (window.api.compassNone && /[东西南北]|地图/.test(key)) {
+      window.api.compassNone({ text: key.slice(0, 50), reason: 'unparsed' });
+    }
+    return;
+  }
+  lastCompassDegs = segs.map((seg) => seg.deg);
+  lastCompassRefresh = 0;
 
   const token = ++compassToken;
   const len = String(text || '').replace(/\s+/g, '').length;
@@ -1455,8 +1586,10 @@ function detectCompassDir(text) {
       continue;
     }
     setTimeout(() => {
-      // 这中间来了新字幕，说明这句已经过时，别再点亮旧方向
-      if (token !== compassToken) return;
+      /* 这中间来了新字幕。只有当新字幕里**不再有这个方向**时才算过时 ——
+       * AI 字幕逐字上屏时，同一句话会连推十几次，方位一直都在，
+       * 那种情况必须照常点亮，否则一次都亮不起来。 */
+      if (token !== compassToken && !lastCompassDegs.includes(seg.deg)) return;
       fireCompassCue(seg.deg);
     }, delay);
   }

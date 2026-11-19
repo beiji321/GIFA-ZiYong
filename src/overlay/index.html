@@ -28,6 +28,18 @@
       var radar = /(?:^|[?&])radar=1(?:&|$)/.test(location.search);
       var el = document.createElement('script');
       el.src = radar ? './radar.js' : './overlay.js';
+      /* 动态插入的脚本是异步执行的，可能晚于页面 load 事件。
+       * 主进程在 did-finish-load 时发的 radar:config 会因此早一步到达，
+       * 那时监听还没注册，消息直接丢掉 —— radar.js 就一直认为「不可见」，
+       * 字幕里的方位全被丢弃，表现就是雷达怎么都不亮。
+       * 这里等脚本真正执行完，再让主进程补发一次全部配置。 */
+      el.onload = function () {
+        try {
+          if (window.overlayApi && window.overlayApi.ready) window.overlayApi.ready();
+        } catch (e) {
+          /* 握手失败时主进程还有 did-finish-load 那一发兜底 */
+        }
+      };
       document.body.appendChild(el);
     })();
   </script>

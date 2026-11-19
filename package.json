@@ -23,7 +23,7 @@
     "test:login": "node scripts/login-test.js",
     "test:sandbox": "node scripts/sandbox-fallback-test.js && node scripts/sandbox-fallback-live-test.js",
     "test:gamepad": "node scripts/gamepad-poller-test.js && node --test scripts/gamepad-controls-test.js",
-    "test:controls": "node scripts/hold-hotkeys-test.js && node scripts/hotkey-config-test.js && node scripts/immersion-speed-test.js",
+    "test:controls": "node scripts/hold-hotkeys-test.js && node scripts/hotkey-config-test.js && node scripts/immersion-speed-test.js && node scripts/part-switch-test.js && node scripts/compass-parse-test.js && node scripts/overlay-boot-test.js && node scripts/ipc-contract-test.js",
     "test:autocenter": "node scripts/vision-probe/autocenter-500.js",
     "test:cone": "node scripts/vision-probe/cone-edge-regress.js",
     "test:snow": "node scripts/vision-probe/snow-sample-regress.js",

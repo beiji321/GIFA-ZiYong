@@ -90,12 +90,13 @@ async function startStream() {
         mandatory: {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: cfgCache.sourceId,
-          /* 上限 1080p / 10fps：
-           * 游戏小地图变化很慢，10fps 完全够用；
-           * 30fps 4K 的捕获能吃掉好几个百分点 CPU。 */
-          maxWidth: 1920,
-          maxHeight: 1080,
-          maxFrameRate: 10
+          /* 上限 720p / 8fps。
+           * 这个窗口最大也就 430px（overlaySize × 0.86），还在里面再裁一小块，
+           * 抓 1080p 完全是浪费 —— 桌面捕获的开销跟整屏尺寸走，
+           * 不是跟最后画出来多大走。小地图变化本来就慢，8fps 看不出来。 */
+          maxWidth: 1280,
+          maxHeight: 720,
+          maxFrameRate: 8
         }
       }
     });

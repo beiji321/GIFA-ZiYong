@@ -30,6 +30,7 @@ const gamepad = require('./gamepad');
 const { mergeHotkeys, prepareHotkeyUpdate } = require('./hotkey-config');
 const { DEFAULT_GAMEPAD, GAMEPAD_ACTION_ALLOWLIST, L3_BUTTON_INDEX, mergeGamepadSettings, createChordState, stepChord, isHoldAction } = require('./gamepad-config');
 const sandboxFallback = require('./sandbox-fallback');
+const diag = require('./diag');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -337,6 +338,10 @@ app.setPath('userData', USER_DATA_DIR);
 // 缓存类目录一并挪过去，否则 C 盘会多出一份 Chromium 缓存
 app.setPath('sessionData', USER_DATA_DIR);
 /* [DATA-DIR-END] ---------------------------------------------------------- */
+
+// 打包版没有控制台，启动期的问题只能写进文件才看得见。
+// 放在 [DATA-DIR] 区块外面：那块会被 data-dir-test 整段抠出来单独跑，不能带别的依赖。
+diag.init(USER_DATA_DIR);
 
 // 管理员权限下，部分 Windows 起不了 Chromium 沙箱子进程：GPU 进程连续 launch-failed，
 // 约一秒后主进程被 Chromium 主动结束，用户只看到「双击没反应」。这里在第一个子进程
@@ -938,6 +943,13 @@ function createWindow() {
     notifyFloatState();
     // 魔改扩展：方位标定开着就把叠加层一起叫起来（含出屏拉回）
     ensureOverlayVisible();
+    diag.log('ratio', {
+      phase: 'ready-to-show',
+      locked: settings.ratioLocked,
+      bounds: win.getBounds(),
+      content: win.getContentSize(),
+      chromeHeight
+    });
     // 魔改扩展：比例锁定开着就按当前宽度对齐一次（要先量到 chromeHeight）
     if (settings.ratioLocked) {
       applyRatioLock();
@@ -946,9 +958,18 @@ function createWindow() {
       // refreshChromeHeight 会量成 0，算出的高度正好少一个 chrome。
       // 等布局稳定后再对一次 —— 不补这一步，锁着比例但窗口还是错的，
       // 得手动关开一次开关才生效。
-      setTimeout(() => {
-        if (settings.ratioLocked) applyRatioLock();
-      }, 450);
+      // chromeHeight 是向渲染层现量的（innerHeight - stage.clientHeight），
+      // 启动那一刻布局还没稳定，会量成 105 这种偏大的值，真实只有 66。
+      // 只重试一次不够：打包版启动更慢，450ms 时可能还停在错的值上，
+      // 之后就再没有人纠正了 —— 表现就是「锁定开着但比例是错的」。
+      // 多补几次，每次都会重新量一遍 chromeHeight，代价可以忽略。
+      for (const delay of [450, 1200, 2800]) {
+        setTimeout(() => {
+          if (!settings.ratioLocked) return;
+          if (!win || win.isDestroyed()) return;
+          applyRatioLock();
+        }, delay);
+      }
     }
   });
 
@@ -993,6 +1014,11 @@ function createWindow() {
 
   win.on('resize', () => {
     if (!win || win.isDestroyed()) return;
+    // 启动后几秒内谁改了窗口尺寸都记一笔：比例锁定失效时，
+    // 到底是没锁上，还是锁上又被谁改回去了，一眼能分清
+    if (Date.now() - bootAt < 8000) {
+      diag.log('resize', { bounds: win.getBounds(), locked: settings.ratioLocked });
+    }
     if (!settings.ratioLocked || ratioGuard) return;
     enforceRatio(win.getBounds().width);
   });
@@ -1023,26 +1049,23 @@ function createWindow() {
  */
 
 let chromeHeight = 64;
+// 渲染层亲口报过 chrome 高度之后，就以它为准 —— 主进程自己在
+// ready-to-show 那一刻量到的是布局完成前的值（日志里稳定差 39px）。
+let chromeReportedAt = 0;
 let ratioGuard = false;    // setBounds 会再触发 resize，用它挡住递归
 let ratioApplying = false; // did-finish-load / ready-to-show 可能先后触发，只跑一次
 
-/** 向渲染层实测 chrome 高度（标题栏 + 控制条） */
+/**
+ * chrome 高度（标题栏 + 控制条）现在由渲染层自己上报，见 app.js 的 wireChromeHeight。
+ *
+ * 这里不再主动去渲染层量。原来的做法是 executeJavaScript 读
+ * innerHeight - stage.clientHeight，但窗口刚创建那一刻布局还没定型，
+ * 稳定量到 105（真实 66），高度就算错了，而且再没人纠正 ——
+ * 这就是「锁定开着但比例不对」的根因。保留这个函数只是为了兼容调用点，
+ * 真正的值来自 chrome-height 消息；渲染层报之前用 64 这个出厂值兜着。
+ */
 function refreshChromeHeight() {
-  if (!win || win.isDestroyed()) return Promise.resolve(chromeHeight);
-  const js =
-    "(function(){var s=document.getElementById('stage');" +
-    'return s?Math.max(0, window.innerHeight-s.clientHeight):64})()';
-  return win.webContents
-    .executeJavaScript(js, true)
-    .then((h) => {
-      if (Number.isFinite(h) && h >= 0 && h < 400) {
-        // 沉浸模式下 chrome 确实是 0；非沉浸量到 0 只可能是页面还没渲染完，
-        // 采信它会把高度算少一个 chrome，所以保留上一次的可靠值。
-        if (h > 0 || immersion) chromeHeight = Math.round(h);
-      }
-      return chromeHeight;
-    })
-    .catch(() => chromeHeight);
+  return Promise.resolve(chromeHeight);
 }
 
 /** 拖拽边缘时按宽度实时校正高度 */
@@ -1087,6 +1110,14 @@ async function applyRatioLock(force = false) {
   const [w] = win.getContentSize();
   if (!Number.isFinite(w) || w <= 0) return;
   const h = Math.round((w * 9) / 16) + chromeHeight;
+  diag.log('ratio', {
+    phase: 'apply',
+    locked: settings.ratioLocked,
+    content: win.getContentSize(),
+    bounds: win.getBounds(),
+    chromeHeight,
+    target: [w, h]
+  });
 
   ratioGuard = true;
   try {
@@ -1467,6 +1498,7 @@ function setImmersion(on) {
     if (!win.isVisible()) win.showInactive();
   }
   if (immersion === next) return immersion;
+  diag.log('immersion', { on: next, bounds: win.getBounds() });
   immersion = next;
   const boundsBefore = win.getBounds();
   win.setResizable(!next);
@@ -1631,6 +1663,28 @@ function overlayBounds() {
   };
 }
 
+/**
+ * 把叠加层启动所需的一切推过去。
+ *
+ * 有两个触发点，缺一不可：
+ *   · did-finish-load —— 兜底，保证上游那套 overlay.js 也能拿到
+ *   · overlay:ready  —— 脚本真正执行完之后由渲染层主动要，准点
+ *
+ * 为什么必须要第二条：index.html 是动态插入 <script> 的，
+ * 加载完成的时刻可能晚于 did-finish-load。只靠第一条的话，
+ * radar:config 会早一步到达，那时监听还没注册，消息直接丢掉 ——
+ * radar.js 于是永远认为「不可见」，字幕里的方位全被丢弃，雷达怎么都不亮。
+ */
+function pushOverlayBoot() {
+  if (!overlayWin || overlayWin.isDestroyed()) return;
+  overlayWin.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
+  if (lastBearing) overlayWin.webContents.send('bearing', lastBearing);
+  // 雷达模式必须补这一发：radar.js 靠 radar:config 里的 visible 决定画不画，
+  // 不发就一直是「不可见」，整个叠加层等于空白。
+  pushRadarConfig();
+  pushDanmakuConfig();
+}
+
 function createOverlay() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
 
@@ -1679,15 +1733,7 @@ function createOverlay() {
     settings.overlayRadar ? { search: 'radar=1' } : undefined
   );
 
-  overlayWin.webContents.on('did-finish-load', () => {
-    if (!overlayWin || overlayWin.isDestroyed()) return;
-    overlayWin.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
-    if (lastBearing) overlayWin.webContents.send('bearing', lastBearing);
-    // 雷达模式必须补这一发：radar.js 靠 radar:config 里的 visible 决定画不画，
-    // 不发就一直是「不可见」，整个叠加层等于空白。
-    pushRadarConfig();
-    pushDanmakuConfig();
-  });
+  overlayWin.webContents.on('did-finish-load', pushOverlayBoot);
 
   return overlayWin;
 }
@@ -2103,6 +2149,7 @@ async function fetchSubtitleCues(bvid, cid, gen) {
     const subs = data.subtitle && data.subtitle.subtitles;
     if (!Array.isArray(subs) || !subs.length) {
       // 分清两种「没有字幕」：没登录 vs 这个视频本来就没字幕轨
+      diag.log('subtitle', { cid, count: 0, needLogin: !!data.need_login_subtitle });
       console.log(
         '[subtitle] 接口没有字幕轨（need_login_subtitle=%s），回退 DOM 抓取',
         !!data.need_login_subtitle
@@ -2135,9 +2182,11 @@ async function fetchSubtitleCues(bvid, cid, gen) {
     }
     cues.sort((a, b) => a.from - b.from);
     if (!commit(cues)) return null; // 换片了，这个结果作废
+    diag.log('subtitle', { cid, count: cues.length, lan: pick.lan });
     console.log('[subtitle] 已加载字幕 %d 条（cid=%s，轨=%s）', cues.length, cid, pick.lan);
     return cues;
   } catch (err) {
+    diag.log('subtitle', { cid, error: err.message });
     console.warn('[subtitle] 拉取失败，回退到 DOM 抓取：', err.message);
     return commit([]) ? [] : null;
   } finally {
@@ -2188,6 +2237,7 @@ function subtitleBounds() {
 
 function createSubtitleWindow() {
   if (subtitleWin && !subtitleWin.isDestroyed()) return subtitleWin;
+  diag.log('subWin', { create: true });
 
   subtitleWin = new BrowserWindow({
     ...subtitleBounds(),
@@ -2277,6 +2327,45 @@ function pushSubtitleToWindow(text) {
 }
 
 /** 隐藏字幕（不清窗口，下次直接复用，避免反复创建） */
+/**
+ * 字幕换了一句：把文本转给浮窗，让那边判转向和绝对方位。
+ *
+ * 以前只有访客页那条路（DOM 抓字幕 → 'subtitle' 消息）会调 detectCompassDir，
+ * 而接口字幕模式压根不经过访客页 —— 字幕窗口由主进程直接驱动。
+ * 于是接口字幕下方位检测一次都没跑过，雷达永远不亮，
+ * 跟重启、跟启动续播都没关系，只是碰巧 DOM 模式时才亮。
+ */
+/**
+ * 当前字幕链路是否健康。
+ *
+ * 切分 P 之后罗盘「不亮了」有两种完全不同的原因：
+ *   · 字幕根本没在更新（子进程/接口断了）—— 属于数据链问题
+ *   · 字幕在更新，只是光晕 3.6 秒就淡出，用户抬头时已经错过 —— 属于体验问题
+ * 所以这里记录「最近一次收到字幕文本的时间」，配合 cueText 日志就能分开。
+ */
+let lastSubtitleTextAt = 0;
+let lastPartSwitchAt = 0;
+let lastCompassKeepAlive = 0; // 上次给同一句字幕续期光晕的时间
+
+function cueSubtitleText(text) {
+  const t = String(text || '');
+  if (!t) return;
+  lastSubtitleTextAt = Date.now();
+  if (!win || win.isDestroyed()) return;
+  // 记一句：能区分「主进程根本没发」和「发了但浮窗没解析」
+  const now = Date.now();
+  if (now - lastCueTextAt > 3000) {
+    lastCueTextAt = now;
+    const gap = lastPartSwitchAt ? Math.round((Date.now() - lastPartSwitchAt) / 100) / 10 : null;
+    diag.log('cueText', { text: t.slice(0, 40), sincePart: gap });
+  }
+  try {
+    sendTo(win, 'compass-text', { text: t });
+  } catch (err) {
+    diag.log('cueText', { error: String((err && err.message) || err) });
+  }
+}
+
 function hideSubtitleText() {
   if (!subtitleWin || subtitleWin.isDestroyed()) return;
   try {
@@ -2524,6 +2613,14 @@ function setAlertPlacing(on) {
   if (!w || w.isDestroyed()) return alertPlacing;
   // 放置模式要能拖：放开鼠标接管，并让页面切成可拖动区域
   w.setIgnoreMouseEvents(!alertPlacing, { forward: true });
+  // 无边框窗口靠 -webkit-app-region: drag 拖动，而 Windows 上
+  // 这一步需要窗口能被激活。提醒窗平时是 focusable:false（不能抢游戏焦点），
+  // 拖拽就会时好时坏 —— 放置期间临时放开，退出时立刻收回去。
+  try {
+    w.setFocusable(alertPlacing);
+  } catch {
+    /* 个别平台没有这个方法 */
+  }
   if (alertPlacing && !w.isVisible()) w.showInactive();
   if (!w.webContents.isLoading()) w.webContents.send('alert:placing', alertPlacing);
   return alertPlacing;
@@ -2534,6 +2631,11 @@ function setAlertPlacing(on) {
  * 雷达那边不再自己写常量，改由 pushRadarConfig 把这两个值下发过去 ——
  * 各写一份迟早对不上，就会出现「雷达灭了提醒还挂着」。
  */
+/* 光晕停留时长。
+ * 原来 3.2 秒 —— 字幕往往要挂十几秒，用户看到字、再抬头看小地图，
+ * 光已经淡完了，于是每次都以为「没亮」。
+ * 现在配合「同一句字幕持续续期」（见 app.js 的 detectCompassDir），
+ * 只要字还在屏幕上，光就一直在；这里的 3200 只决定「字幕走后还能留多久」。 */
 const CUE_HOLD_MS = 3200;
 const CUE_FADE_MS = 450;
 /** 提醒窗自己的淡出时长：比雷达的光晕更快，收得干脆一点 */
@@ -2601,6 +2703,13 @@ async function sendAlertStream() {
 /** 方向来了：把窗口亮起来，到点收起。画面由常驻屏幕流实时提供，不用抓图。 */
 function showAlertCue() {
   if (!settings.alertEnabled) return;
+
+  /* 只记录，不改行为 —— 提醒窗是不是把罗盘拖卡了，还没有证据，
+   * 先让它照常亮，用日志看「提醒窗亮着」和「罗盘停摆」是否真的同步。 */
+  if (Date.now() - lastAlertAt > 10000) {
+    lastAlertAt = Date.now();
+    diag.log('alert', { show: true, overlay: !!overlayWin && !overlayWin.isDestroyed() });
+  }
 
   const w = createAlertWindow();
   const hold = CUE_HOLD_MS;
@@ -2696,6 +2805,7 @@ function raiseFloatAboveDanmaku() {
  *  · 依旧整窗鼠标穿透，绝不干扰游戏。
  */
 let danmakuWin = null;
+let dmReportAt = 0; // 弹幕层上次状态上报的时间（节流用）
 
 function danmakuBounds() {
   const d = screen.getPrimaryDisplay();
@@ -2725,7 +2835,7 @@ function createDanmakuWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       // 弹幕窗同理：空闲时让它被节流，真正需要时由主进程唤醒
-      backgroundThrottling: true
+      backgroundThrottling: false
     }
   });
 
@@ -2887,7 +2997,24 @@ let danmakuList = [];   // 当前视频/分P 的全量弹幕（已排序）
 let danmakuCid = 0;     // 与 danmakuList 对应的 cid
 let danmakuSentAt = -1; // 上次给弹幕窗发窗口片段时的播放进度（秒）
 let currentCid = 0;     // 当前正在播的分 P 的 cid（中途开开关时用它补拉）
+let currentPages = [];  // 本次视频的分 P 列表：自动连播只给新的 p，要靠它查 cid
+let cidRetryTimer = null; // 启动时接口抽风，cid 没拿到就过一会儿再要
+const bootAt = Date.now(); // 启动时间点：只在这之后的几秒内记窗口尺寸变化
 let danmakuLoading = 0; // 正在请求的 cid，防止并发重复拉
+let danmakuRetried = 0; // 当前 cid 已经自动重试过几次
+let danmakuRetryCid = 0; // 重试计数对应哪个 cid
+let danmakuNextTry = 0; // 列表为空时，下一次允许补拉的时间点
+let danmakuSliceCid = 0; // 上一次下发片段时用的 cid，用来发现换 P
+let lastCompassNoneAt = 0; // 上次记录「没点亮」的时间（节流）
+let lastAlertAt = 0;       // 上次亮提醒窗的时间（节流，防止屏幕流反复重连）
+let lastCueTextAt = 0;     // 上次记录「把字幕文本送去判方位」的时间（节流）
+let lastGlowMissAt = 0;    // 上次记录「光晕没画上去」的时间（节流）
+let lastDmTimeAt = 0;    // 上次收到播放进度的时间：弹幕全靠它驱动，断了就全哑
+let lastDmT = 0;         // 上次收到的播放进度（秒）
+let lastDmPlaying = null; // 上次收到的播放状态
+let lastGapLog = 0;      // 上次记录「这段没弹幕」的时间
+let lastSliceAt = 0;     // 上次真正发出片段的时间（墙钟）
+let watchPrevT = null;   // 看门狗上一轮看到的播放进度，用来判断时间有没有在走
 
 function decodeXmlText(str) {
   return String(str)
@@ -2937,14 +3064,105 @@ async function fetchDanmakuList(cid) {
     });
     danmakuList = out;
     danmakuCid = cid;
+    if (danmakuRetryCid === cid) {
+      danmakuRetryCid = 0;
+      danmakuRetried = 0;
+    }
+    danmakuNextTry = 0;
+    diag.log('danmaku', { cid, count: out.length });
     console.log('[danmaku] 已加载弹幕', out.length, '条（cid=' + cid + '）');
     return danmakuList;
   } catch (err) {
-    console.warn('[danmaku] 拉取失败：', err.message);
+    if (danmakuRetryCid !== cid) {
+      danmakuRetryCid = cid;
+      danmakuRetried = 0;
+    }
+    // 失败就自己再要几次：切到下一个分 P 时接口偶尔抽风，
+    // 以前这里直接 return []，列表一直是空的，
+    // 而 sendDanmakuSlice 开头就是「列表空就返回」——弹幕就永久没了。
+    if (danmakuRetried < 3) {
+      danmakuRetried += 1;
+      danmakuNextTry = Date.now() + 3000 * danmakuRetried;
+      diag.log('danmaku', { cid, error: err.message, retry: danmakuRetried });
+      console.warn('[danmaku] 拉取失败，%d 秒后重试（第 %d 次）：%s',
+        3 * danmakuRetried, danmakuRetried, err.message);
+    } else {
+      diag.log('danmaku', { cid, error: err.message, retry: 'gave-up' });
+      console.warn('[danmaku] 拉取失败，已放弃：', err.message);
+    }
     return [];
   } finally {
     danmakuLoading = 0;
   }
+}
+
+/**
+ * 切分 P 之后要做的数据刷新：弹幕、字幕、转向提示全部按新 cid 重来。
+ *
+ * 手动切 P 会走 bili:load，那边整套重解析；但自动连播是访客页自己跳的 URL，
+ * 主进程只收到一个新的 p 号。以前只在界面里改了 p，没动这里的 cid，
+ * 结果全屏弹幕一直放上一 P 的 —— 这就是那条「自动切 P 弹幕不换」的根因。
+ */
+function switchPartData(id, cid) {
+  currentCid = cid;
+  danmakuCid = 0;
+  danmakuList = [];
+  danmakuSentAt = -1;
+  resetDanmakuWindow();
+  hideSubtitleText();
+  pushTurnHint(null);
+  subtitleCues = [];
+  subtitleCid = 0;
+  subtitleGen += 1;
+  const gen = subtitleGen;
+  lastApiSubtitleText = '';
+  lastDomSubtitleText = '';
+  if (settings.enableSubtitleSprite && settings.subtitleUseApi && cid && id) {
+    fetchSubtitleCues(id, cid, gen).then((cues) => {
+      if (!cues || gen !== subtitleGen) return;
+      if (win && !win.isDestroyed()) {
+        sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
+      }
+    });
+  } else if (win && !win.isDestroyed()) {
+    sendTo(win, 'subtitle:api', { on: false, count: 0 });
+  }
+  if (settings.enableDanmakuProjection && cid) fetchDanmakuList(cid);
+
+  /* 切 P 后字幕要重新拉，这段空窗期罗盘不会动。
+   * 记下切换时刻，之后第一句字幕到达时能算出空窗有多长。 */
+  lastPartSwitchAt = Date.now();
+  lastSubtitleTextAt = 0;
+  diag.log('partSwitch', { cid, at: lastPartSwitchAt });
+}
+
+/**
+ * cid 没拿到时的补拉。
+ *
+ * 启动那一刻 x/web-interface/view 偶尔会失败（网络还没就绪），pages 为空、
+ * cid 落到 0 —— 弹幕和字幕会一起消失，而视频本身照常能播，
+ * 用户看到的就是「续播起来了，但没有弹幕没有字幕」，重新切一次 P 又好了。
+ * 这里过几秒自己再要一次，拿到就按新 cid 把弹幕/字幕补上。
+ */
+function scheduleCidRetry(id, p, attempt = 0) {
+  if (cidRetryTimer) clearTimeout(cidRetryTimer);
+  if (attempt >= 3) return;
+  cidRetryTimer = setTimeout(async () => {
+    cidRetryTimer = null;
+    // 这几秒里用户可能已经换了视频或换了 P，那就别插手
+    if (!id || settings.lastVideoId !== id) return;
+    if (Number(settings.lastPart) !== Number(p)) return;
+    const info = await fetchVideoInfo(id);
+    const cid = info.ok ? (info.pages.find((x) => x.page === p)?.cid || info.cid || 0) : 0;
+    if (!cid) {
+      scheduleCidRetry(id, p, attempt + 1);
+      return;
+    }
+    if (cid === currentCid) return;
+    diag.log('load', { retry: true, attempt, id, p, cid });
+    if (info.pages && info.pages.length) currentPages = info.pages;
+    switchPartData(id, cid);
+  }, 2500 * (attempt + 1));
 }
 
 /**
@@ -2953,7 +3171,17 @@ async function fetchDanmakuList(cid) {
  */
 function sendDanmakuSlice(t, seek, playing = true) {
   if (!settings.enableDanmakuProjection) return;
-  if (!danmakuList.length) return;
+  if (!danmakuList.length) {
+    /* 列表是空的，不代表这个分 P 没弹幕 —— 也可能是刚才那一次请求失败了。
+     * 以前这里直接 return，于是永远等不到下一次请求，弹幕就永久消失。
+     * 这里按节制补拉：10 秒内最多试一次，失败重试逻辑在 fetchDanmakuList 里。 */
+    if (currentCid && Date.now() >= danmakuNextTry && danmakuLoading !== currentCid) {
+      danmakuNextTry = Date.now() + 10000;
+      diag.log('danmaku', { cid: currentCid, refill: true });
+      fetchDanmakuList(currentCid);
+    }
+    return;
+  }
 
   const now = Number(t);
   if (!Number.isFinite(now) || now < 0) return;
@@ -2965,10 +3193,42 @@ function sendDanmakuSlice(t, seek, playing = true) {
   const from = Math.max(0, now - 1);
   const to = now + 6;
   const items = danmakuList.filter((d) => d.t >= from * 1000 && d.t <= to * 1000);
-  if (!items.length && !seek) return;
+  if (!items.length && !seek) {
+    /* 这段没有弹幕可发。要区分两种情况：
+     *   · 视频这段本来就没人发弹幕（正常）
+     *   · 弹幕列表的时间和播放进度对不上（真的 bug，会一直空）
+     * 记一次「最近的一条弹幕还差多少秒」，一眼就能看出来。 */
+    if (Date.now() - lastGapLog > 10000) {
+      lastGapLog = Date.now();
+      let nearest = null;
+      for (const d of danmakuList) {
+        const dt = d.t / 1000 - now;
+        if (nearest === null || Math.abs(dt) < Math.abs(nearest)) nearest = dt;
+      }
+      diag.log('dmGap', {
+        t: Math.round(now),
+        playing: !!playing,
+        list: danmakuList.length,
+        nearest: nearest === null ? null : Math.round(nearest * 10) / 10
+      });
+    }
+    return;
+  }
+
+  /* 换了分 P 就先让弹幕层清一次。
+   * 弹幕层用「列表下标」去重，不同分 P 的下标是各自从 0 开始的，
+   * 残留的旧下标会把新分 P 的弹幕全部当成「已显示」丢掉 ——
+   * 表现就是换 P 之后弹幕没了。 */
+  if (danmakuSliceCid !== currentCid) {
+    danmakuSliceCid = currentCid;
+    resetDanmakuWindow();
+  }
+
+  lastSliceAt = Date.now();
 
   const w = createDanmakuWindow();
   if (!w.isVisible()) {
+    diag.log('dmWin', { show: true, t: now, items: items.length });
     w.showInactive();
     // 刚显示出来的弹幕层会盖住所有置顶窗口，立刻把浮窗/箭头层顶回去
     raiseFloatAboveDanmaku();
@@ -3575,10 +3835,28 @@ function registerIpc() {
     const t = Number(payload && payload.t);
     if (!Number.isFinite(t)) return;
     const text = subtitleAt(t);
-    if (text === lastApiSubtitleText) return;
+    if (text === lastApiSubtitleText) {
+      /* 同一句字幕还在屏幕上：定期续期罗盘。
+       *
+       * 接口字幕只在**文本变化**时才推送，文本不变就再也没有消息。
+       * 而叠加层的光晕 3.2 秒就淡出 —— 用户看到字、抬头看小地图，
+       * 光早就没了，所以一直觉得「根本没亮」。
+       * 这里由主进程按帧驱动续期，不依赖文本变化。 */
+      if (text && Date.now() - lastCompassKeepAlive > 1000) {
+        lastCompassKeepAlive = Date.now();
+        cueSubtitleText(text);
+      }
+      return;
+    }
     lastApiSubtitleText = text;
-    if (text) showSubtitleText(text);
-    else hideSubtitleText();
+    lastCompassKeepAlive = Date.now();
+    if (text) {
+      showSubtitleText(text);
+      // 接口字幕也要判方位，否则雷达在这种模式下永远不亮
+      cueSubtitleText(text);
+    } else {
+      hideSubtitleText();
+    }
   });
 
   ipcMain.on('subtitle:update', (_e, payload = {}) => {
@@ -3592,6 +3870,7 @@ function registerIpc() {
     }
     const text = String((payload && payload.text) || '').trim();
     if (!text) return;
+    if (text !== lastDomSubtitleText) cueSubtitleText(text);
     lastDomSubtitleText = text;
     showSubtitleText(text);
   });
@@ -3634,6 +3913,9 @@ function registerIpc() {
   // 浮窗把 <video> 的播放进度报上来：主进程按进度切「窗口片段」下发。
   // 不再有 DOM 抓取，也就没有历史弹幕被一次性回填的问题。
   ipcMain.on('danmaku:time', (_e, payload = {}) => {
+    lastDmTimeAt = Date.now();
+    if (Number.isFinite(Number(payload.t))) lastDmT = Number(payload.t);
+    lastDmPlaying = !!payload.playing;
     if (!settings.enableDanmakuProjection) return;
     const t = Number(payload.t);
     if (!Number.isFinite(t)) return;
@@ -3791,20 +4073,189 @@ function registerIpc() {
     return result;
   });
 
+  /* 这句字幕没点亮。reason 分两种，修法完全不同：
+   *   unparsed → 解析没认出方向（要改正则）
+   *   dedupe   → 认出来了，但同方位 3 秒内已经亮过（正常，圈还亮着） */
+  ipcMain.on('compass:none', (_e, payload = {}) => {
+    const now = Date.now();
+    if (now - lastCompassNoneAt < 2000) return;
+    lastCompassNoneAt = now;
+    diag.log('compassNone', {
+      reason: String(payload.reason || ''),
+      text: String(payload.text || '').slice(0, 50),
+      deg: payload.deg
+    });
+  });
+
+  /* 叠加层脚本执行完了，主动来要配置。见 pushOverlayBoot 的注释：
+   * 这才是配置真正送达的准点，did-finish-load 只是兜底。 */
+  ipcMain.on('overlay:ready', () => {
+    diag.log('overlay', { ready: true, radar: !!settings.overlayRadar });
+    pushOverlayBoot();
+  });
+
+  /* 叠加层请求刷新合成。
+   *
+   * 透明窗口的内容更新后，DWM 不一定重新取画面 —— 尤其窗口静止不动时。
+   * 抖 1px 再抖回来能强制它重取，这是修「画布对了但屏幕是空的」最直接的手段。 */
+  let nudgeBusy = false;
+  ipcMain.on('overlay:nudge', () => {
+    if (nudgeBusy) return;
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    nudgeBusy = true;
+    try {
+      const b = overlayWin.getBounds();
+      overlayWin.setBounds({ ...b, width: b.width + 1 });
+      setTimeout(() => {
+        try {
+          if (overlayWin && !overlayWin.isDestroyed()) {
+            overlayWin.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
+          }
+        } catch {
+          /* 窗口正在销毁 */
+        }
+        nudgeBusy = false;
+      }, 60);
+    } catch {
+      nudgeBusy = false;
+    }
+  });
+
+  /* 叠加层把画布存一张 PNG。放到用户数据目录旁边，
+   * 排查「我这边说画了、你那边说没亮」时，直接看这张图最快。 */
+  ipcMain.on('overlay:dump', (_e, dataUrl, tag) => {
+    try {
+      const b64 = String(dataUrl || '').replace(/^data:image\/png;base64,/, '');
+      if (!b64) return;
+      const file = path.join(USER_DATA_DIR, `overlay-${tag || 'x'}.png`);
+      fs.writeFileSync(file, Buffer.from(b64, 'base64'));
+      diag.log('overlay', { dump: file });
+    } catch (err) {
+      diag.log('overlay', { dumpError: String((err && err.message) || err) });
+    }
+  });
+
+  /* 叠加层自报状态。透明窗口画没画出来肉眼难判断，这里留证据：
+   * config 一类的报「配置有没有落地」，lit 一类的报「方位到底点亮没有」。 */
+  /* 弹幕层自报。只记节点事件：第一次收到片段、条数骤降为 0 这类，
+   * 正常播放时不刷屏。 */
+  ipcMain.on('danmaku:state', (_e, state) => {
+    if (!state || !state.slice) return;
+    const now = Date.now();
+    const idle = now - dmReportAt > 5000;
+    // 没有数据、或从来没报过，都要留痕；正常有数据的 5 秒最多一条
+    if (!state.items && !idle) return;
+    if (!idle && state.items > 0 && dmReportAt) return;
+    dmReportAt = now;
+    diag.log('dmRender', {
+      items: state.items,
+      queued: state.queued,
+      shown: state.shown,
+      playing: !!state.playing,
+      winVisible: !!danmakuWin && !danmakuWin.isDestroyed() && danmakuWin.isVisible()
+    });
+  });
+
+  ipcMain.on('overlay:state', (_e, state) => {
+    if (!state || typeof state !== 'object') return;
+    if (state.config) {
+      diag.log('overlay', { config: true, visible: !!state.visible, radius: state.radius });
+      return;
+    }
+    /* 像素自检现在每帧都发，全量记会刷屏。
+     * 只记「第一次且金色点为 0」的那一条 —— 这正是要抓的：高亮没画上去。 */
+    if (state.goldPts === 0) {
+      if (Date.now() - lastGlowMissAt < 5000) return;
+      lastGlowMissAt = Date.now();
+      diag.log('glowMiss', {
+        lit: state.lit,
+        alpha: state.glow && state.glow.alpha,
+        conic: state.glow && state.glow.conic,
+        peak: state.peak,
+        peakRGB: state.peakRGB,
+        litPts: state.litPts,
+        goldPts: state.goldPts
+      });
+      return;
+    }
+    if (state.lit !== undefined) {
+      diag.log('overlay', {
+        lit: state.lit,
+        label: state.label,
+        axes: state.axes,
+        vis: state.vis,
+        raf: state.raf,
+        size: state.size,
+        canvas: state.canvas,
+        css: state.css,
+        dpr: state.dpr,
+        peak: state.peak,
+        peakRGB: state.peakRGB,
+        litPts: state.litPts,
+        goldPts: state.goldPts,
+        age: state.age,
+        hold: state.hold,
+        fade: state.fade,
+        glow: state.glow,
+        // 窗口在屏幕上的真实位置和层级 —— 画布有内容却看不见，
+        // 多半是位置跑到屏幕外，或者被别的 alwaysOnTop 窗口压住
+        bounds: (() => {
+          try {
+            return overlayWin && !overlayWin.isDestroyed() ? overlayWin.getBounds() : null;
+          } catch {
+            return null;
+          }
+        })(),
+        top: (() => {
+          try {
+            return overlayWin && !overlayWin.isDestroyed() ? overlayWin.isAlwaysOnTop() : null;
+          } catch {
+            return null;
+          }
+        })(),
+        visible: (() => {
+          try {
+            return overlayWin && !overlayWin.isDestroyed() ? overlayWin.isVisible() : null;
+          } catch {
+            return null;
+          }
+        })(),
+        dmTop: (() => {
+          try {
+            return danmakuWin && !danmakuWin.isDestroyed() ? danmakuWin.isAlwaysOnTop() : null;
+          } catch {
+            return null;
+          }
+        })()
+      });
+    }
+  });
+
   /* ---- 魔改扩展：字幕点亮的绝对方位，转给叠加层画雷达 ---- */
   ipcMain.on('compass:cue', (_e, cue) => {
-    if (!overlayWin || overlayWin.isDestroyed()) return;
     const deg = Number(cue && cue.deg);
     if (!Number.isFinite(deg)) return;
+    const alive = !!overlayWin && !overlayWin.isDestroyed();
+    diag.log('compass', {
+      deg,
+      label: String(cue.label || ''),
+      text: String(cue.text || ''),
+      overlay: alive,
+      radar: !!settings.overlayRadar
+    });
+
+    /* 放大提醒：画面由常驻屏幕流实时提供，所以这里是「直接亮窗」，
+     * 没有任何抓图等待 —— 和雷达同一帧出现。
+     * 放在叠加层判断之前：提醒窗和雷达是两件事，
+     * 叠加层没开的时候提醒不该跟着一起哑掉。 */
+    showAlertCue();
+
+    if (!alive) return;
     try {
       overlayWin.webContents.send('compass:cue', { deg, label: String(cue.label || '') });
     } catch {
       /* 窗口正在销毁 */
     }
-
-    /* 放大提醒：画面由常驻屏幕流实时提供，所以这里是「直接亮窗」，
-     * 没有任何抓图等待 —— 和雷达同一帧出现。 */
-    showAlertCue();
   });
 
   ipcMain.handle('overlay:place', (_e, on) => {
@@ -4195,6 +4646,19 @@ function registerIpc() {
         // payload 省略时按当前状态取反，方便同一个入口做开关
         win.setFullScreen(payload === undefined ? !win.isFullScreen() : !!payload);
         break;
+      case 'chrome-height': {
+        const h = Number(payload && payload.h);
+        if (!Number.isFinite(h) || h < 0 || h >= 400) return false;
+        // 记第一次上报，用来确认这条通道真的通了（之前静默失败过一次）
+        if (!chromeReportedAt) diag.log('chrome', { from: 'renderer', first: h });
+        if (h === chromeHeight) return true;
+        chromeHeight = Math.round(h);
+        chromeReportedAt = Date.now();
+        diag.log('chrome', { from: 'renderer', h: chromeHeight });
+        // 布局变了就重新对齐一次；只在锁定开着时才需要
+        if (settings.ratioLocked) applyRatioLock();
+        return true;
+      }
       case 'resize':
         if (immersion) return false;
         if (payload && Number.isFinite(payload.w) && Number.isFinite(payload.h)) {
@@ -4238,41 +4702,64 @@ function registerIpc() {
 
     // 换片/切 P：上一个视频的数据要清干净，绝不能让新视频继承旧状态
     const cid = pages.find((x) => x.page === p)?.cid || (info.ok ? info.cid : 0);
-    currentCid = cid;
-    danmakuCid = 0;
-    danmakuList = [];
-    danmakuSentAt = -1;
-    resetDanmakuWindow();
-    hideSubtitleText();
-    pushTurnHint(null);
-    subtitleCues = [];
-    subtitleCid = 0;
-    subtitleGen += 1;
-    const gen = subtitleGen;
-    lastApiSubtitleText = '';
-    lastDomSubtitleText = '';
-    if (settings.enableSubtitleSprite && settings.subtitleUseApi && cid && id) {
-      fetchSubtitleCues(id, cid, gen).then((cues) => {
-        if (!cues || gen !== subtitleGen) return;
-        if (win && !win.isDestroyed()) {
-          sendTo(win, 'subtitle:api', { on: cues.length > 0, count: cues.length });
-        }
-      });
-    } else if (win && !win.isDestroyed()) {
-      sendTo(win, 'subtitle:api', { on: false, count: 0 });
+    diag.log('load', {
+      id,
+      p,
+      cid,
+      pages: pages.length,
+      infoOk: !!info.ok,
+      message: info.ok ? '' : info.message || ''
+    });
+    currentPages = pages;
+    switchPartData(id, cid);
+    // 以 cid 是否拿到为准，而不是 info.ok —— 拿到 info 但 cid 仍是 0 一样白搭
+    if (!cid) scheduleCidRetry(id, p);
+    else if (cidRetryTimer) {
+      clearTimeout(cidRetryTimer);
+      cidRetryTimer = null;
     }
-    if (settings.enableDanmakuProjection && cid) fetchDanmakuList(cid);
 
     return {
       ok: true,
       id,
       p,
+      cid,
       url: buildUrl(id, p),
       title: info.ok ? info.title : '',
       owner: info.ok ? info.owner : '',
       pages,
       message: info.ok ? '' : `读不到分 P 信息（${info.message}），已直接载入`
     };
+  });
+
+  /**
+   * 自动连播换 P：访客页自己跳到下一 P，只把新的 p 号告诉我们。
+   * 这里**只换分 P 上下文**（cid / 弹幕 / 字幕），不动播放器、不重新载入 ——
+   * 页面已经在播新的一 P 了，再 load 一次会打断它。
+   */
+  ipcMain.handle('bili:part', async (_e, payload = {}) => {
+    const p = Math.floor(Number(payload.p));
+    if (!Number.isFinite(p) || p < 1) return { ok: false, reason: 'bad-part' };
+    const id = String(payload.id || settings.lastVideoId || '');
+    if (!id) return { ok: false, reason: 'no-video' };
+
+    // 同一支视频的分 P 列表在 bili:load 时已经拿到，正常情况直接查
+    let cid = currentPages.find((x) => x.page === p)?.cid || 0;
+    if (!cid) {
+      const info = await fetchVideoInfo(id);
+      if (info.ok) {
+        currentPages = info.pages || [];
+        cid = currentPages.find((x) => x.page === p)?.cid || info.cid || 0;
+      }
+    }
+    if (!cid) return { ok: false, reason: 'no-cid' };
+    // 连播与心跳都会触发，重复回调很常见，cid 没变就别把弹幕清掉重来
+    if (cid === currentCid) return { ok: true, p, cid, unchanged: true };
+
+    diag.log('part', { p, cid, via: 'auto' });
+    switchPartData(id, cid);
+    console.log('[part] 自动连播切到 P%d（cid=%s）', p, cid);
+    return { ok: true, p, cid };
   });
 }
 
@@ -4318,6 +4805,17 @@ if (!gotLock) {
     });
 
     loadSettings();
+    diag.log('settings', {
+      ratioLocked: settings.ratioLocked,
+      danmaku: !!settings.enableDanmakuProjection,
+      subtitle: !!settings.enableSubtitleSprite,
+      subtitleApi: settings.subtitleUseApi !== false,
+      lastText: settings.lastText || '',
+      lastPart: settings.lastPart || 0,
+      bounds: settings.bounds,
+      openArg: OPEN_ARG || '',
+      resume: shouldResumeOnLaunch(settings, OPEN_ARG)
+    });
     // 调试用：本次启动强制打开方位标记，不写进设置文件
     if (process.argv.includes('--bearing')) settings.bearing.enabled = true;
     try {
@@ -4351,6 +4849,68 @@ if (!gotLock) {
     }
 
     if (settings.bearing.enabled && win) showOverlay();
+
+    /* 弹幕看门狗：弹幕完全由播放进度驱动，进度一断整个层就哑了，
+     * 而画面上看不出任何异常（视频照常播）。这里发现「8 秒没进度」就记一笔，
+     * 并带上当时的列表长度 —— 能立刻分辨是「没进度」还是「没数据」。 */
+    setInterval(() => {
+      if (!settings.enableDanmakuProjection || !currentCid) return;
+      const gap = Date.now() - lastDmTimeAt;
+
+      /* 播放进度在，但很久没发出任何弹幕 —— 这是「看着看着弹幕就没了」
+       * 最可能的形态。关键要分清进度本身有没有在走：
+       *   advanced ≈ 10  → 进度正常，是列表时间和进度对不上
+       *   advanced = 0   → 进度冻住了，访客页那边没在报真实时间 */
+      const advanced = watchPrevT === null ? null : Math.round((lastDmT - watchPrevT) * 10) / 10;
+      watchPrevT = lastDmT;
+      if (Date.now() - lastSliceAt > 15000) {
+        diag.log('dmStall', {
+          t: Math.round(lastDmT),
+          advanced,
+          playing: lastDmPlaying,
+          gap: Math.round(gap / 1000),
+          list: danmakuList.length,
+          cid: currentCid
+        });
+      }
+
+      if (gap < 8000) return;
+      diag.log('dmIdle', {
+        gap: Math.round(gap / 1000),
+        t: Math.round(lastDmT),
+        playing: lastDmPlaying,
+        cid: currentCid,
+        list: danmakuList.length,
+        win: !!danmakuWin && !danmakuWin.isDestroyed(),
+        float: !!win && !win.isDestroyed()
+      });
+    }, 10000);
+
+    /* 启动自检：15 秒后把各窗口的真实状态记一笔。
+     * 透明浮层「有没有起来」肉眼很难判断，用户也没法描述
+     * 「是没显示还是显示了但没画」。这里一次记全，排查时看日志即可。 */
+    setTimeout(() => {
+      const alive = (w) => !!w && !w.isDestroyed();
+      let overlayVisible = false;
+      try {
+        overlayVisible = alive(overlayWin) && overlayWin.isVisible();
+      } catch {
+        overlayVisible = false;
+      }
+      diag.log('health', {
+        float: alive(win),
+        overlay: alive(overlayWin),
+        overlayVisible,
+        subtitle: alive(subtitleWin),
+        danmaku: alive(danmakuWin),
+        alert: alive(alertWin),
+        radar: !!settings.overlayRadar,
+        bearing: !!(settings.bearing && settings.bearing.enabled),
+        calibrated: !!(settings.bearing && settings.bearing.calibrated),
+        ratioLocked: !!settings.ratioLocked,
+        chromeHeight
+      });
+    }, 15000);
 
     // 只允许登录窗口弹 B 站域名的子窗口（第三方登录/扫码），其余一律拦截
     app.on('web-contents-created', (_e, contents) => {

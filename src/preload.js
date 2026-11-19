@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld('api', {
   save: (patch) => ipcRenderer.invoke('settings:save', patch),
   action: (name, payload) => ipcRenderer.invoke('win:action', name, payload),
   load: (payload) => ipcRenderer.invoke('bili:load', payload),
+  // 自动连播换 P：只换 cid/弹幕/字幕，不重新载入播放器
+  part: (payload) => ipcRenderer.invoke('bili:part', payload),
   nav: () => ipcRenderer.invoke('bili:nav'),
   // 游戏内热键需要管理员身份（UIPI），由用户在启动器里按需触发 UAC 提权重启
   relaunchElevated: () => ipcRenderer.invoke('app:relaunch-elevated'),
@@ -47,6 +49,8 @@ contextBridge.exposeInMainWorld('api', {
   onFloatState: (cb) => ipcRenderer.on('float:state', (_e, s) => cb(s)),
   onFloatCmd: (cb) => ipcRenderer.on('float:cmd', (_e, c) => cb(c)),
   onSettingsChanged: (cb) => ipcRenderer.on('settings:changed', (_e, s) => cb(s)),
+  // 主进程把「这句字幕要判方位」送过来（接口字幕模式不走访客页）
+  onCompassText: (cb) => ipcRenderer.on('compass-text', (_e, p) => cb(p)),
 
   /* ---- 魔改扩展：字幕层 / 弹幕层 / 托盘 / 播放控件 ---- */
 
@@ -67,6 +71,8 @@ contextBridge.exposeInMainWorld('api', {
 
   // 字幕点亮的绝对方位：转给叠加层画雷达
   compassCue: (cue) => ipcRenderer.send('compass:cue', cue),
+  // 这句字幕没点亮：带上原文和原因，排查「说了方位却不亮」
+  compassNone: (cue) => ipcRenderer.send('compass:none', cue),
   // 智能防遮挡：字幕里出现看地图类的词
   avoidHide: () => ipcRenderer.send('avoid:mark'),
   // 识别健康度：最近 60 帧成功率与失败原因，控制台每秒轮询

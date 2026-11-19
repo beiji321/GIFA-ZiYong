@@ -157,6 +157,19 @@ function bindingOf(accelerator, action) {
     if (!Number.isInteger(modifier) || (modifiers & modifier)) return null;
     modifiers |= modifier;
   }
+
+  /* Ctrl+Mouse5 这类：键盘修饰键 + 鼠标侧键。
+   * 上面那个整体匹配只覆盖「裸侧键」和「RMB+侧键」，
+   * 带键盘修饰键时整串匹配不上，得在拆完修饰键之后再判一次。 */
+  const modMouse = /^Mouse([45])$/i.exec(key);
+  if (modMouse) {
+    return {
+      action,
+      token: `mouse:${BUTTON_OF[`Mouse${modMouse[1]}`]}`,
+      modifiers: HOOK_ACTIONS.has(action) ? modifiers : 'any'
+    };
+  }
+
   const code = keycodeOf(key);
   if (!code) return null;
   if (HOOK_ACTIONS.has(action)) modifiers |= modifierOfCode(code);
