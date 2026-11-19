@@ -15,6 +15,7 @@ const gamepad = require('./gamepad');
 const { mergeHotkeys, prepareHotkeyUpdate } = require('./hotkey-config');
 const { DEFAULT_GAMEPAD, GAMEPAD_ACTION_ALLOWLIST, L3_BUTTON_INDEX, mergeGamepadSettings, createChordState, stepChord, isHoldAction } = require('./gamepad-config');
 const sandboxFallback = require('./sandbox-fallback');
+const { DEFAULT_BEARING_LAYOUTS, loadBearingLayouts, activeBearingLayout, applyBearingLayout } = require('./bearing-layouts');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -403,42 +404,6 @@ const GAMEPAD_DIR_UI = [
   { key: 'nw', label: '西北' }
 ];
 
-/**
- * 出厂预置的识别区域 —— 只用来定「第一次框选时金色圆环的起始位置」，不写进 rois。
- *
- * 这里踩过一个坑：早先把两个猜的坐标直接塞进 DEFAULT_SETTINGS.bearing.rois，
- * 而保存逻辑是「位置接近就替换、否则追加」。用户框一次，猜错的那条留在列表里，
- * 面板上就显示「已标定 2 处」，其中一处压根没对准小地图 —— 这就是
- * 「框选一次出两次标定」的根因。现在出厂列表为空，下面这个值只影响圆环初值。
- *
- * 数值来自实测对准的原生迷你地图 / 博主放大贴片布局。
- */
-const SEED_ROI = { cx: 0.1434, cy: 0.2481, r: 0.1542 };
-
-/** 0.2.3 及更早版本写进出厂列表的猜测值，装载设置时精确剔除（容差 1e-4，不会误伤真实标定） */
-const LEGACY_SEED_ROIS = [
-  { cx: 0.0875, cy: 0.122, r: 0.046 },
-  { cx: 0.148, cy: 0.222, r: 0.163 }
-];
-
-/** 剔除历史遗留的出厂猜测值；顺手丢掉结构不合法的条目 */
-function dropLegacySeeds(list) {
-  if (!Array.isArray(list)) return [];
-  return list.filter(
-    (r) =>
-      r &&
-      Number.isFinite(r.cx) &&
-      Number.isFinite(r.cy) &&
-      Number.isFinite(r.r) &&
-      !LEGACY_SEED_ROIS.some(
-        (s) =>
-          Math.abs(s.cx - r.cx) < 1e-4 &&
-          Math.abs(s.cy - r.cy) < 1e-4 &&
-          Math.abs(s.r - r.r) < 1e-4
-      )
-  );
-}
-
 const DEFAULT_SETTINGS = {
   // 内容区 896×504 正好 16:9，加上标题栏 30 + 控制条 34 = 604
   bounds: { width: 896, height: 568, x: null, y: null, aspect: 2 },
@@ -464,20 +429,8 @@ const DEFAULT_SETTINGS = {
   resumeOnLaunch: true,
   hotkeys: { ...DEFAULT_HOTKEYS },
   bearing: {
+    ...DEFAULT_BEARING_LAYOUTS,
     enabled: false,
-    /**
-     * 识别区域列表：{ cx, cy, r }，cx/cy 按画面宽高归一、r 按画面宽度归一。
-     * 一个视频里布局会变（原生迷你地图 / 剪辑放大的地图贴片），所以要存多块。
-     *
-     * 出厂**必须为空**：预置猜测值会被算成「已经标定过」，用户框一次就变两处。
-     * 圆环初值走 SEED_ROI，未标定时界面也会主动引导去框一次。
-     */
-    rois: [],
-    // 用户是否在画面上真正框过一次；没框过就先引导标定，不拿默认值硬猜
-    calibrated: false,
-    // 按视频记住标定结果
-    roiBy: {},
-    // 叠加层：圆环半径（屏幕像素）与圆心屏幕坐标
     radius: 110,
     x: null,
     y: null
@@ -552,6 +505,10 @@ let capturingHotkey = false;
 let holdSpeedActive = false;
 const holdSpeedSources = new Set();
 let immersion = false;
+let immersionSession = 0;
+let immersionBounds = null;
+let immersionAspect = 0;
+let restoredImmersionBounds = null;
 let hoverFaded = false;
 let hoverTimer = null;
 let hoverCandidate = false;
@@ -568,15 +525,6 @@ function loadSettings() {
     const raw = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     const rawBearing = raw.bearing || {};
 
-    // 迁移：剔除 0.2.3 及更早版本写进出厂列表的猜测区域。
-    // 那两条会被当成「已标定」，用户框一次就变成两处标定，先清干净再谈别的。
-    const rois = dropLegacySeeds(rawBearing.rois);
-    const roiBy = {};
-    for (const [id, list] of Object.entries(rawBearing.roiBy || {})) {
-      const kept = dropLegacySeeds(list);
-      if (kept.length) roiBy[id] = kept;
-    }
-
     settings = {
       ...structuredClone(DEFAULT_SETTINGS),
       ...raw,
@@ -586,12 +534,11 @@ function loadSettings() {
       bounds: { ...DEFAULT_SETTINGS.bounds, ...(raw.bounds || {}) },
       hotkeys: mergeHotkeys(DEFAULT_HOTKEYS, raw.hotkeys),
       bearing: {
-        ...DEFAULT_SETTINGS.bearing,
-        ...rawBearing,
-        rois,
-        roiBy,
-        // 清完一条不剩，就别再标榜「已标定」，否则界面显示 0 处却不去引导框选
-        calibrated: !!rawBearing.calibrated && rois.length > 0
+        ...loadBearingLayouts(rawBearing, raw.lastVideoId),
+        enabled: !!rawBearing.enabled,
+        radius: Number.isFinite(rawBearing.radius) ? rawBearing.radius : DEFAULT_SETTINGS.bearing.radius,
+        x: Number.isFinite(rawBearing.x) ? rawBearing.x : null,
+        y: Number.isFinite(rawBearing.y) ? rawBearing.y : null
       },
       gamepad: mergeGamepadSettings(DEFAULT_SETTINGS.gamepad, raw.gamepad)
     };
@@ -682,12 +629,22 @@ function cancelTemporarySpeed() {
 
 function attachPlaybackGuest(guest) {
   playbackGuest = guest;
+  immersionAspect = 0;
   guest.setAudioMuted(true);
   guest.on('did-start-navigation', (details) => {
-    if (details.isMainFrame && !details.isSameDocument) guest.setAudioMuted(true);
+    if (details.isMainFrame && !details.isSameDocument) {
+      guest.setAudioMuted(true);
+      if (playbackGuest === guest) immersionAspect = 0;
+    }
+  });
+  guest.on('render-process-gone', () => {
+    if (playbackGuest === guest) immersionAspect = 0;
   });
   guest.once('destroyed', () => {
-    if (playbackGuest === guest) playbackGuest = null;
+    if (playbackGuest === guest) {
+      playbackGuest = null;
+      immersionAspect = 0;
+    }
   });
 }
 
@@ -746,6 +703,7 @@ function createWindow() {
   if (win && !win.isDestroyed()) {
     win.showInactive();
     applyPin();
+    if (settings.bearing.enabled) showOverlay();
     return win;
   }
 
@@ -806,9 +764,12 @@ function createWindow() {
   win.on('enter-full-screen', () => sendFullscreen(true));
   win.on('leave-full-screen', () => sendFullscreen(false));
 
-  win.once('ready-to-show', () => {
-    win.showInactive(); // 不抢游戏焦点
+  const videoWindow = win;
+  videoWindow.once('ready-to-show', () => {
+    if (win !== videoWindow || videoWindow.isDestroyed()) return;
+    videoWindow.showInactive(); // 不抢游戏焦点
     applyWindowPresentation();
+    if (settings.bearing.enabled) showOverlay();
     notifyFloatState();
   });
 
@@ -816,14 +777,17 @@ function createWindow() {
   win.on('blur', () => applyPin());
 
   const rememberBounds = () => {
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed() || immersionBounds) return;
     const b = win.getBounds();
+    if (restoredImmersionBounds && sameWindowBounds(b, restoredImmersionBounds)) return;
+    restoredImmersionBounds = null;
     // 保留 aspect 标记：用户手动拉过之后就不该在下次启动时被强行改回 16:9
     settings.bounds = { ...settings.bounds, x: b.x, y: b.y, width: b.width, height: b.height, aspect: 2 };
     persist();
   };
   win.on('move', rememberBounds);
   win.on('resize', rememberBounds);
+  win.on('restore', syncImmersionBoundsAfterRestore);
 
   win.on('closed', () => {
     win = null;
@@ -831,7 +795,12 @@ function createWindow() {
     clearInterval(hoverTimer);
     hoverTimer = null;
     immersion = false;
+    immersionBounds = null;
+    immersionAspect = 0;
+    restoredImmersionBounds = null;
     hoverFaded = false;
+    overlayPlacing = false;
+    lastBearing = null;
     // 主窗关了，叠加层不能独自留下，否则 window-all-closed 不触发、进程退不掉
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.destroy();
     notifyFloatState();
@@ -891,6 +860,51 @@ function syncHoverFade() {
   if (immersion && settings.hoverFadeEnabled) hoverTimer = setInterval(updateHoverFade, 60);
 }
 
+function sameWindowBounds(first, second) {
+  return first.x === second.x && first.y === second.y && first.width === second.width && first.height === second.height;
+}
+
+function fitImmersionWindow() {
+  if (!immersion || !immersionBounds || !immersionAspect || !win || win.isDestroyed() || win.isFullScreen() || win.isMinimized()) return;
+  const original = immersionBounds;
+  const { workArea } = screen.getDisplayMatching(original);
+  const current = win.getBounds();
+  const content = win.getContentBounds();
+  const frameW = Math.max(0, current.width - content.width);
+  const frameH = Math.max(0, current.height - content.height);
+  const maxW = Math.max(1, Math.min(original.width, workArea.width) - frameW);
+  const maxH = Math.max(1, Math.min(original.height, workArea.height) - frameH);
+  const width = Math.max(1, Math.min(maxW, Math.round(maxH * immersionAspect))) + frameW;
+  const height = Math.max(1, Math.min(maxH, Math.round(maxW / immersionAspect))) + frameH;
+  const left = Math.max(workArea.x, Math.min(workArea.x + workArea.width - width, original.x + Math.round((original.width - width) / 2)));
+  const top = Math.max(workArea.y, Math.min(workArea.y + workArea.height - height, original.y + Math.round((original.height - height) / 2)));
+  const bounds = { x: left, y: top, width, height };
+  if (!sameWindowBounds(current, bounds)) win.setBounds(bounds);
+}
+
+function restoreImmersionWindow(bounds, correctRounding) {
+  if (win.isFullScreen() || sameWindowBounds(win.getBounds(), bounds)) return;
+  let requested = bounds;
+  win.setBounds(requested);
+  if (!correctRounding) return;
+  const keys = ['x', 'y', 'width', 'height'];
+  for (let retry = 0; retry < 2; retry += 1) {
+    const applied = win.getBounds();
+    if (sameWindowBounds(applied, bounds) || keys.some((key) => Math.abs(bounds[key] - applied[key]) > 2)) return;
+    requested = Object.fromEntries(keys.map((key) => [key, requested[key] + bounds[key] - applied[key]]));
+    if (requested.width <= 0 || requested.height <= 0) return;
+    win.setBounds(requested);
+  }
+}
+
+function syncImmersionBoundsAfterRestore() {
+  if (immersion) return fitImmersionWindow();
+  if (!immersionBounds || !win || win.isDestroyed() || win.isMinimized()) return;
+  restoreImmersionWindow(immersionBounds, true);
+  restoredImmersionBounds = win.getBounds();
+  immersionBounds = null;
+}
+
 function setImmersion(on) {
   const next = !!on;
   if (next && (!win || win.isDestroyed())) createWindow();
@@ -900,15 +914,26 @@ function setImmersion(on) {
     if (!win.isVisible()) win.showInactive();
   }
   if (immersion === next) return immersion;
-  immersion = next;
-  const boundsBefore = win.getBounds();
+  if (next) {
+    immersionBounds ||= win.getBounds();
+    immersionAspect = 0;
+    immersionSession += 1;
+    immersion = true;
+  }
   win.setResizable(!next);
   win.setMovable(!next);
-  const boundsAfter = win.getBounds();
-  if (['x', 'y', 'width', 'height'].some((key) => boundsAfter[key] !== boundsBefore[key])) win.setBounds(boundsBefore);
+  if (next) {
+    restoreImmersionWindow(immersionBounds, false);
+  } else {
+    immersionAspect = 0;
+    immersion = false;
+    syncImmersionBoundsAfterRestore();
+  }
   syncHoverFade();
   sendTo(win, 'win:state', { immersion });
-  if (playbackGuest && !playbackGuest.isDestroyed()) playbackGuest.send('player', { cmd: 'presentation', videoOnly: immersion });
+  if (playbackGuest && !playbackGuest.isDestroyed()) {
+    playbackGuest.send('player', { cmd: 'presentation', videoOnly: immersion, token: playbackToken, immersionSession });
+  }
   notifyFloatState();
   showNotice(immersion ? `已进入纯视频沉浸 · ${settings.hotkeys.toggleImmersion || '启动器开关'} 退出` : '已退出纯视频沉浸');
   return immersion;
@@ -1024,6 +1049,11 @@ let overlayWin = null;
 let overlayPlacing = false;
 let lastBearing = null;
 
+function clearBearingOverlay() {
+  lastBearing = null;
+  sendTo(overlayWin, 'bearing', { clear: true });
+}
+
 function overlaySize() {
   // 半径 ×2 再留 12% 余量，箭头尖端才不会贴到窗口边被裁掉
   return Math.round(Math.max(60, Number(settings.bearing.radius) || 110) * 2.24);
@@ -1079,33 +1109,24 @@ function createOverlay() {
     persist();
   });
 
-  overlayWin.on('closed', () => {
-    overlayWin = null;
+  const overlay = overlayWin;
+  overlay.on('closed', () => {
+    if (overlayWin === overlay) overlayWin = null;
   });
-
-  overlayWin.loadFile(path.join(__dirname, 'overlay', 'index.html'));
-
-  overlayWin.webContents.on('did-finish-load', () => {
-    if (!overlayWin || overlayWin.isDestroyed()) return;
-    overlayWin.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
-    if (lastBearing) overlayWin.webContents.send('bearing', lastBearing);
+  overlay.webContents.on('did-finish-load', () => {
+    if (overlayWin !== overlay || overlay.isDestroyed()) return;
+    overlay.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
+    if (lastBearing) overlay.webContents.send('bearing', lastBearing);
+    if (settings.bearing.enabled && !overlay.isVisible()) overlay.showInactive();
   });
-
-  return overlayWin;
+  overlay.loadFile(path.join(__dirname, 'overlay', 'index.html'));
+  return overlay;
 }
 
 function showOverlay() {
-  const w = createOverlay();
-  if (w.isVisible()) return w;
-
-  if (w.webContents.isLoading()) {
-    w.once('ready-to-show', () => {
-      if (!w.isDestroyed()) w.showInactive();
-    });
-  } else {
-    w.showInactive();
-  }
-  return w;
+  const overlay = createOverlay();
+  if (!overlay.isVisible() && !overlay.webContents.isLoading()) overlay.showInactive();
+  return overlay;
 }
 
 function setOverlayPlacing(placing) {
@@ -1140,11 +1161,11 @@ function setBearingEnabled(on) {
       overlayWin.setFocusable(false);
       overlayWin.hide();
     }
-    lastBearing = null;
+    clearBearingOverlay();
   }
 
-  if (win && !win.isDestroyed()) win.webContents.send('bearing:state', settings.bearing);
   persist();
+  broadcast('settings:changed', settings);
   return settings.bearing;
 }
 
@@ -1614,7 +1635,19 @@ function registerIpc() {
     }
     event.sender.setAudioMuted(true);
     playbackGate = 0;
-    event.returnValue = { ...guestPlaybackSettings(), token: ++playbackToken, ...(immersion ? { videoOnly: true } : {}) };
+    immersionAspect = 0;
+    event.returnValue = {
+      ...guestPlaybackSettings(), token: ++playbackToken, ...(immersion ? { videoOnly: true, immersionSession } : {})
+    };
+  });
+  ipcMain.on('player:video-size', (event, message) => {
+    if (!immersion || !isPlaybackMessage(event, message) || message.immersionSession !== immersionSession) return;
+    const { width, height } = message;
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 0 || height < 0) return;
+    const aspect = width && height ? width / height : 0;
+    if (aspect === immersionAspect) return;
+    immersionAspect = aspect;
+    fitImmersionWindow();
   });
   ipcMain.on('player:gating', (event, message) => {
     if (isPlaybackMessage(event, message) && Number.isSafeInteger(message.seq) && message.seq > playbackGate) {
@@ -1660,7 +1693,6 @@ function registerIpc() {
       nav,
       // 框选圆环的出厂初值。**不进标定列表**，只用来决定第一次打开标定时圆环落在哪，
       // 免得一打开就偏到画面外、用户点「完成」直接存下一个错区域。
-      seedRoi: SEED_ROI,
       webviewPreload: pathToFileURL(path.join(__dirname, 'webview-preload.js')).href,
       version: app.getVersion(),
       // 界面要能一眼看出「单键/侧键的全局钩子到底起来了没有」，
@@ -1710,54 +1742,48 @@ function registerIpc() {
     if (capturingHotkey) cancelTemporarySpeed();
   });
 
-  /* ---- 方位标记：视频侧只上报一个角度，主进程转发给叠加窗 ---- */
-
-  ipcMain.on('overlay:bearing', (_e, payload) => {
+  ipcMain.on('overlay:bearing', (event, payload) => {
+    if (event.sender !== win?.webContents || !payload || !settings.bearing.enabled) return;
+    const layout = activeBearingLayout(settings.bearing);
+    if (!payload.clear && (payload.layoutId !== layout.id || payload.revision !== layout.revision)) return;
     lastBearing = payload;
-    if (overlayWin && !overlayWin.isDestroyed()) overlayWin.webContents.send('bearing', payload);
+    sendTo(overlayWin, 'bearing', payload);
   });
 
   ipcMain.handle('overlay:enable', (_e, on) => setBearingEnabled(on));
 
-  /**
-   * 手动自动定心的结果。访客算出的 dx/dy 是「视频像素」，这里换算成归一化偏移，
-   * 直接写进该视频的标定（roiBy[id] 优先，否则全局 rois）——这就是「固定住」：
-   * 下次打开还是对准的，浮窗里的临时修正也会随新标定归零。
-   *
-   * 只接受 ok && applied 的结果；失败 / 取消不改任何标定。
-   */
-  ipcMain.handle('bearing:auto-center-result', (_e, res) => {
-    const p = res && typeof res === 'object' ? res : {};
-    let out = { ok: !!p.ok, applied: !!p.applied, reason: p.reason || '' };
+  ipcMain.handle('bearing:layout', (event, command) => {
+    const bearing = settings.bearing;
+    const fromFloat = !!win && event.sender === win.webContents;
+    const fromConsole = !!consoleWin && event.sender === consoleWin.webContents;
+    const operations = fromFloat ? ['select', 'create', 'calibrate'] : fromConsole ? ['select', 'default', 'rename', 'remove'] : [];
+    if (!operations.includes(command?.op)) return { ok: false, reason: 'invalid' };
+    const previous = activeBearingLayout(bearing);
+    const result = applyBearingLayout(bearing, command);
+    if (result.ok) {
+      const current = activeBearingLayout(bearing);
+      if (current.id !== previous.id || current.revision !== previous.revision) clearBearingOverlay();
+      persist();
+      broadcast('settings:changed', settings);
+    }
+    return { ...result, bearing };
+  });
 
-    if (p.ok && p.applied) {
-      const b = settings.bearing || (settings.bearing = {});
-      const rawId = String(p.videoId || settings.lastVideoId || '');
-      const keys = Object.keys(b.roiBy || {});
-      const key = rawId && b.roiBy && b.roiBy[rawId] ? rawId : keys.find((k) => k.toLowerCase() === rawId.toLowerCase());
-      const own = key && Array.isArray(b.roiBy[key]) && b.roiBy[key].length ? b.roiBy[key] : null;
-      const list = own || (Array.isArray(b.rois) ? b.rois : null);
-      const idx = Math.max(0, Math.min(Number(p.roiIndex) || 0, (list ? list.length : 0) - 1));
-      const roi = list && list[idx];
-
-      if (roi && Number.isFinite(p.dcx) && Number.isFinite(p.dcy)) {
-        roi.cx = Math.min(0.999, Math.max(0.001, roi.cx + p.dcx));
-        roi.cy = Math.min(0.999, Math.max(0.001, roi.cy + p.dcy));
-        if (own) b.roiBy[key] = list;
-        else b.rois = list;
-        // 自动定心成功本身就说明这块区域已经对准，别再提示「还没标定」
-        b.calibrated = true;
+  ipcMain.handle('bearing:auto-center-result', (event, result) => {
+    const bearing = settings.bearing;
+    const layout = activeBearingLayout(bearing);
+    if (event.sender !== win?.webContents || !result || !bearing.enabled ||
+        layout.id !== result.layoutId || layout.revision !== result.revision) return { ok: false, reason: 'invalid' };
+    let out = { ok: false, reason: result.reason };
+    if (result.ok) {
+      const saved = applyBearingLayout(bearing, { ...result, op: 'center', id: layout.id });
+      out = saved.ok ? { ok: true } : { ok: false, reason: 'save-failed' };
+      if (saved.ok) {
         persist();
-        // 两边都通知：浮窗会拿新标定重挂识别，启动器刷新文案
         broadcast('settings:changed', settings);
-        out = { ok: true, applied: true, dx: p.dx, dy: p.dy, roi };
-      } else {
-        out = { ok: false, applied: false, reason: 'save-failed' };
       }
     }
-
-    // 启动器也要看到结果（浮窗这时可能被游戏压住，用户看不到它的 toast）
-    sendTo(consoleWin, 'auto-center-result', out);
+    if (result.manual && result.reason !== 'reset') sendTo(consoleWin, 'auto-center-result', out);
     return out;
   });
   ipcMain.handle('overlay:place', (_e, on) => setOverlayPlacing(on));
@@ -1830,22 +1856,6 @@ function registerIpc() {
     if (patch.clickThrough !== undefined) setPass(patch.clickThrough);
     if (patch.opacity !== undefined) setOpacity(patch.opacity);
     if (patch.hotkeys) settings.hotkeys = { ...settings.hotkeys, ...patch.hotkeys };
-    if (patch.bearing) {
-      const b = patch.bearing;
-      if (b.calibrated !== undefined) settings.bearing.calibrated = !!b.calibrated;
-
-      if (Array.isArray(b.rois)) {
-        const rois = dropLegacySeeds(b.rois).slice(0, 4);
-        settings.bearing.rois = rois;
-        if (b.videoId) {
-          // 清空时必须把这个视频的专属记录一起删掉。以前只清全局 rois，
-          // roiBy 里还留着 —— 看着「清除本视频标定」成功了，重载视频又回来了，
-          // 因为取区域时优先读 roiBy。
-          if (rois.length) settings.bearing.roiBy[b.videoId] = rois;
-          else delete settings.bearing.roiBy[b.videoId];
-        }
-      }
-    }
     persist();
     broadcast('settings:changed', settings);
     return settings;
@@ -1929,20 +1939,19 @@ function registerIpc() {
           ? path.join(process.resourcesPath, 'licenses', 'NOTICE-GIFA.txt')
           : path.join(app.getAppPath(), 'build', 'LICENSE.txt'));
       case 'calib':
-        // 框选要看着视频拖圆环，只能在浮窗里做 —— 这里负责把它叫起来
-        if (!win || win.isDestroyed()) createWindow();
+        if (!win || win.isDestroyed() || !playbackGuest || !settings.lastVideoId) return false;
+        if (payload?.op !== 'create' && payload?.op !== 'calibrate') return false;
+        if (settings.clickThrough) return 'click-through';
         if (immersion) setImmersion(false);
-        sendTo(win, 'float:cmd', { cmd: 'calib' });
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+        sendTo(win, 'float:cmd', { cmd: 'calib', command: payload });
         return true;
-      case 'autocenter': {
-        // 自动定心也只在浮窗里做：浮窗没起就先起，等它加载完再把命令递过去
-        const fresh = !win || win.isDestroyed();
-        if (fresh) createWindow();
-        const send = () => sendTo(win, 'float:cmd', { cmd: 'autocenter' });
-        if (fresh) setTimeout(send, 1500);
-        else send();
+      case 'autocenter':
+        if (!win || win.isDestroyed() || !playbackGuest || !settings.lastVideoId) return false;
+        sendTo(win, 'float:cmd', { cmd: 'autocenter' });
         return true;
-      }
       case 'dump':
         if (win && !win.isDestroyed()) sendTo(win, 'float:cmd', { cmd: 'dump' });
         return true;
@@ -2089,6 +2098,9 @@ if (!gotLock) {
       /* ignore */
     }
     registerIpc();
+    for (const event of ['display-added', 'display-removed', 'display-metrics-changed']) {
+      screen.on(event, fitImmersionWindow);
+    }
     createConsole(); // 先出启动器，配置好了再点「启动跟跑」
     registerHotkeys();
     // XInput 轮询是个常驻子进程，关掉了就不该起它。手柄状态属 OS 层，
@@ -2103,8 +2115,6 @@ if (!gotLock) {
       console.log('[resume] 继续上次观看', settings.lastTitle || settings.lastText, `P${settings.lastPart}`);
       createWindow();
     }
-
-    if (settings.bearing.enabled && win) showOverlay();
 
     // 只允许登录窗口弹 B 站域名的子窗口（第三方登录/扫码），其余一律拦截
     app.on('web-contents-created', (_e, contents) => {

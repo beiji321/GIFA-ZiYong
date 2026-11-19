@@ -41,6 +41,7 @@ let cleanOn = false;
 let cleanStyle = null;
 let videoOnly = false;
 let videoOnlyStyle = null;
+let immersionSession = 0;
 
 /* 播放偏好在文档启动最早期同步读取。主进程同时把 guest 原生静音，
  * 因此 B 站的 autoplay / 首次 video 创建不会在恢复设置前漏出默认音量。 */
@@ -70,6 +71,7 @@ try {
   playbackPrefs = normalizePlaybackPrefs(initial);
   playbackToken = initial && initial.token;
   videoOnly = !!(initial && initial.videoOnly);
+  immersionSession = initial?.immersionSession || 0;
 } catch {
   /* 旧主进程 / 测试环境没有同步设置通道时使用默认值 */
 }
@@ -210,25 +212,27 @@ function pickVideo() {
 const EVENTS = [
   'play', 'pause', 'timeupdate', 'durationchange', 'loadedmetadata',
   'ratechange', 'volumechange', 'ended', 'waiting', 'playing',
-  'seeking', 'seeked', 'error', 'canplay', 'emptied'
+  'seeking', 'seeked', 'error', 'canplay', 'emptied', 'resize'
 ];
 
 function bind(v) {
   if (v === video) return;
+  if (BEARING.enabled) stopBearingLoop();
   if (video) {
     for (const ev of EVENTS) video.removeEventListener(ev, onEvent, true);
   }
   if (video) video.removeAttribute('data-gifa-video');
   video = v;
   if (!v) {
+    if (BEARING.enabled) startBearingLoop();
+    reportImmersionSize();
     push(true);
     return;
   }
   v.setAttribute('data-gifa-video', '');
   setVideoOnly(videoOnly);
   gatePlayback(v);
-  // 换了视频元素：小地图布局可能完全不同，自动定心从头学
-  resetAutoCenter('切换视频元素');
+  if (BEARING.enabled) startBearingLoop();
   for (const ev of EVENTS) v.addEventListener(ev, onEvent, true);
   if (!v.paused && !v.ended && v.readyState >= 3) notifyPlaybackReady(v);
   if (pendingPlay) {
@@ -241,6 +245,7 @@ function bind(v) {
 
 function onEvent(event) {
   if (!video || (event && event.target !== video)) return;
+  if (event && ['loadedmetadata', 'resize', 'emptied'].includes(event.type)) reportImmersionSize();
   if (playbackInit.src !== playbackSource(video)) gatePlayback(video);
   if (!playbackInit.ready) {
     if (event && playbackUserControls.has(event.type)) reportPlaybackChange(video, event.type, true);
@@ -359,20 +364,17 @@ function push(force) {
  */
 const BEARING = {
   enabled: false,
-  /**
-   * 识别区域列表。同一个视频里画面布局会变 ——
-   * 平时是游戏原生的迷你小地图（左上角），讲到路线时常常是剪辑放大的地图贴片，
-   * 两者大小、位置完全不同。用单一区域必然一半时间在瞎读，所以按列表存多块，
-   * 每帧挑最可信的一块用。
-   */
-  rois: [],
+  roi: null,
+  layoutId: null,
+  revision: 0,
+  autoCenter: false,
+  centerPending: false,
+  mapReportedMissing: false,
   canvas: null,
   ctx: null,
   timer: null,
   // requestVideoFrameCallback 的句柄：有新视频帧才算，天然和画面同步
   rvfc: null,
-  // 守护定时器：B 站换分 P 可能换掉 <video>，换了要重挂循环
-  guard: null,
   loopKind: '',
   lastAngle: -1,
   // 自适应低通的当前值；-1 表示还没初始化
@@ -409,14 +411,13 @@ const BEARING = {
    * ±3px 有效率从 0.88 掉到 0.45，±4px 只剩 0.19。而用户用手拖圆环根本做不到
    * 这个精度（实测打包版默认 SEED 偏 −4.7px 时有效率只有 0.24）。
    *
-   * 做法：**用户点「③ 自动定心」才跑**，跑一次、算准就停，不会自己再触发。
+   * 新布局首次识别到小地图时自动尝试，成功后保存；已有布局可以手动重试。
    * 从画面本身学：青色箭头连通块的质心稳定落在支点后方 0.139×√面积 处
    * （452 帧实测，标准差 0.011）。单帧看有「把尾巴当鼻尖」的假解（相隔约 120°，
    * 置信度分不开），但真支点每帧都在同一位置、假解随朝向移动，多帧投票就能分开。
    *
-   *   active  true = 正在定心（只在手动触发后短暂为真）
-   *   trim    学到的圆心修正（视频像素，相对用户框选的点）；成功后立刻生效，
-   *           随后由主进程把修正写进该视频的标定并回传，trim 归零
+   *   active  true = 正在定心
+   *   trim    待保存的圆心修正（视频像素），主进程回传已修正的布局后清空
    *   votes   本次会话里各候选支点投出的票
    */
   auto: {
@@ -1535,7 +1536,7 @@ function viewPayload(view, cone) {
  * extra 用来捎上视角：箭头认不出来不等于视角也丢了（箭头被特效盖住、
  * 扇形反而清楚是常事），这种情况绿弧还得继续走。
  */
-function markInvalid(reason, extra) {
+function markInvalid(reason, extra, mapPresent = true) {
   BEARING.raw.length = 0;
   BEARING.smooth = -1;
   BEARING.ab.theta = -1;
@@ -1549,13 +1550,20 @@ function markInvalid(reason, extra) {
   const viewChanged = viewAngle >= 0 &&
     (BEARING.view.sent < 0 || Math.abs(angDiff(viewAngle, BEARING.view.sent)) > 1.5);
   const shouldClearArrow = arrowLost && BEARING.reportedValid !== false;
-  if (!shouldClearArrow && !viewChanged) return;
-  if (!shouldClearArrow && now - BEARING.lastSentAt < 250) return;
+  const mapMissing = arrowLost && !mapPresent;
+  const mapChanged = !!BEARING.mapReportedMissing !== mapMissing;
+  if (!shouldClearArrow && !mapChanged && !viewChanged) return;
+  if (!shouldClearArrow && !mapChanged && now - BEARING.lastSentAt < 250) return;
 
   if (arrowLost) BEARING.reportedValid = false;
+  BEARING.mapReportedMissing = mapMissing;
   BEARING.lastSentAt = now;
   BEARING.view.sent = viewAngle;
-  ipcRenderer.sendToHost('bearing', { ok: false, reason: arrowLost ? reason : undefined, angle: null, ...(extra || {}) });
+  sendBearing({ ok: false, reason: arrowLost ? reason : undefined, angle: null, clearAngle: shouldClearArrow, mapMissing, ...(extra || {}) });
+}
+
+function sendBearing(payload) {
+  ipcRenderer.sendToHost('bearing', { ...payload, layoutId: BEARING.layoutId, revision: BEARING.revision });
 }
 
 function centeredPatch(img, size, width, dx = 0, dy = 0) {
@@ -1609,89 +1617,30 @@ function tickBearing() {
   if (!BEARING.enabled) return;
   BEARING.ticks = (BEARING.ticks || 0) + 1;
 
-  if (!BEARING.rois.length) {
-    markInvalid('还没框选小地图');
+  const roi = BEARING.roi;
+  if (!roi) {
+    markInvalid('没有视频小地图布局', null, false);
     return;
   }
 
-  // 逐个区域试，取置信度最高的一块。布局在原生迷你地图和放大贴片之间切换时，
-  // 不匹配的区域会被判无效，匹配的那块自然接管。
-  let best = null;
-  let seen = null;
-  let cone = null;
-  let mapCyan = 0;   // 所有 ROI 里最高的青色比例（布局切换时别取错区域）
-
-  // 自动定心：当前生效的圆心修正。为 0 时下面走和旧实现完全一样的路径。
-  const A = BEARING.auto;
-  const tx = A ? A.trim.x : 0;
-  const ty = A ? A.trim.y : 0;
-  // 定心要复用「本帧已经抓好的大窗」，顺手记下哪个 ROI 出了最佳箭头 / 青色最多
-  let bestGrab = null;
-  let bestRoi = null;
-  let bestIdx = -1;
-  let cyanGrab = null;
-  let cyanRoi = null;
-  let cyanIdx = -1;
-  let cyanBest = -1;
-
-  for (let i = 0; i < BEARING.rois.length; i += 1) {
-    const roi = BEARING.rois[i];
-    // 一帧只读一次视频画面：先抓扇形大窗，箭头小窗从里面裁。
-    // 原来两个通道各抓一次、每次约 10ms（与窗口大小无关），30fps 下白占半帧预算。
-    let gc = grabCenter(roi, 1.5, 512, tx, ty);
-    let g = gc ? cropCenterWindow(gc, roi, 0.62, 320, tx, ty) : null;
-    if (!g) {
-      // 修正后窗口贴到画面外（或大窗抓不到）：退回用户圆心，别把两路一起丢掉
-      gc = grabCenter(roi, 1.5, 512);
-      g = (gc && cropCenterWindow(gc, roi)) || grabCenter(roi);
-    }
-    if (!gc && !g) continue;
-
-    const arrow = g && analyzeArrowWithRecovery(g.img, g.size, g.step);
-    if (arrow) {
-      const r = arrow;
-      if (!seen || r.conf > seen.conf) seen = r;
-      if (r.valid && (!best || r.conf > best.conf)) {
-        best = { ...r, size: g.size };
-        bestGrab = gc;
-        bestRoi = roi;
-        bestIdx = i;
-      }
-    }
-
-    // 扇形每帧都要算，且必须换**大窗口**：几何通道的 0.62R 中心小窗
-    // 看不到径向衰减，等于把「内浓外淡」这个关键证据直接丢掉。
-    // 大窗口按 step=2 跳采，扫描像素数与几何通道同量级。
-    if (gc) {
-      const cn = analyzeConeWithRecovery(gc.img, gc.size, gc.step);
-      mapCyan = Math.max(mapCyan, cn.cyanFrac || 0);
-      if ((arrow?.valid || cn.cyanFrac >= MAP_CYAN_FRAC_MIN) && cn.valid &&
-          (!cone || cn.conf > cone.conf)) cone = { ...cn, size: gc.size };
-      if ((cn.cyanFrac || 0) > cyanBest) {
-        cyanBest = cn.cyanFrac || 0;
-        cyanGrab = gc;
-        cyanRoi = roi;
-        cyanIdx = i;
-      }
-    }
+  const { x: trimX, y: trimY } = BEARING.auto.trim;
+  let large = grabCenter(roi, 1.5, 512, trimX, trimY);
+  let small = large && cropCenterWindow(large, roi, 0.62, 320, trimX, trimY);
+  if (!small) {
+    if (trimX || trimY) large = grabCenter(roi, 1.5, 512);
+    small = (large && cropCenterWindow(large, roi)) || grabCenter(roi);
   }
 
+  const seen = small && analyzeArrowWithRecovery(small.img, small.size, small.step);
+  const best = seen?.valid ? { ...seen, size: small.size } : null;
+  const candidate = large && analyzeConeWithRecovery(large.img, large.size, large.step);
+  const mapPresent = !!best || (candidate?.cyanFrac || 0) >= MAP_CYAN_FRAC_MIN;
+  const cone = mapPresent && candidate?.valid ? { ...candidate, size: large.size } : null;
   const now = Date.now();
+  const playing = video && !video.paused && !video.ended;
+  if (BEARING.centerPending && large && mapPresent && playing) beginAutoCenter(now, false);
+  if (BEARING.auto.active) autoCenterStep(roi, large, mapPresent && playing, now);
 
-  /* 手动自动定心：只有用户点了「③ 自动定心」才跑；算准一次就停，不会自己重来。
-   * 用本帧已经抓好、尚未被其他逻辑改写的大窗做尝试，不额外读视频。 */
-  if (A && A.active) {
-    const target = bestGrab
-      ? { roi: bestRoi, gc: bestGrab, idx: bestIdx }
-      : { roi: cyanRoi, gc: cyanGrab, idx: cyanIdx };
-    if (target && target.roi) {
-      autoCenterStep(target.roi, target.idx, target.gc, !!best || cyanBest >= MAP_CYAN_FRAC_MIN, now);
-    }
-  }
-
-  // 视角通道独立于行进通道，先把它算出来。几何彻底失效时它可能还有值。
-  // 门控只管「小地图在不在」：可信箭头也能证明地图存在，但扇形不能单独放行。
-  const mapPresent = mapCyan >= MAP_CYAN_FRAC_MIN || !!best;
   const view = updateView(cone, now, mapPresent);
 
   if (!best) {
@@ -1706,12 +1655,13 @@ function tickBearing() {
     // 箭头认不出来时**不再**拿扇形冒充行进方向 —— 镜头可以独立于角色转，
     // 那样画出去的是视角不是走向。但视角本身要是还在，绿弧得继续走，
     // 否则外环会跟着箭头一起卡住。
-    markInvalid('画面里没有小地图', view ? viewPayload(view, cone) : null);
+    markInvalid(mapPresent ? '暂未识别到玩家箭头' : '画面里没有小地图', view ? viewPayload(view, cone) : null, mapPresent);
     return;
   }
 
   BEARING.explained = false;
   BEARING.invalidSince = 0;
+  BEARING.mapReportedMissing = false;
 
   // 三路一致性：几何说了算，扇形只加/减置信，不改角度。
   // 让扇形改角度是危险的 —— 镜头可以独立于角色转，一改就把行进方向带歪。
@@ -1730,7 +1680,7 @@ function tickBearing() {
           .map((c) => `${c.deg.toFixed(0)}°/${c.r.toFixed(0)}/${c.span}`)
           .join(' ')}，鼻尖 ${best.noseDeg}°，钝度 ${best.noseFlat}，` +
         `扇形 ${cone ? `${cone.deg.toFixed(0)}°/${(cone.conf * 100).toFixed(0)}%` : '无'}，` +
-        `采样 ${best.size}px，共 ${BEARING.rois.length} 个区域）`
+        `采样 ${best.size}px）`
     );
   }
 
@@ -1750,7 +1700,7 @@ function tickBearing() {
   // out === null：这一帧被判为「疑似反向」，箭头保持不动。
   // 但视角是**独立通道**，必须照常送 —— 否则绿弧会跟着箭头一起卡住半秒。
   if (out === null) {
-    ipcRenderer.sendToHost('bearing', {
+    sendBearing({
       ok: true,
       angle: BEARING.lastAngle < 0 ? (90 - best.angle + 720) % 360 : (90 - BEARING.lastAngle + 720) % 360,
       confidence: conf,
@@ -1789,7 +1739,7 @@ function tickBearing() {
    * 顺便和「0=北、顺时针」这个业界约定对齐，日志读起来也直观。
    */
   const compass = (90 - out + 720) % 360;
-  ipcRenderer.sendToHost('bearing', {
+  sendBearing({
     ok: true,
     angle: compass,
     confidence: conf,
@@ -1810,8 +1760,8 @@ const AC_RING = 24;
 const AC_TOL = 20;
 /* 连通块最小面积（像素）。低于它多半是噪声或图标碎片，不参与定心。 */
 const AC_MIN_BLOB = 40;
-/* 手动模式下每 120ms 尝试一次（用户主动在等，尽量快；一次尝试约 12ms 计算）。 */
 const AC_ATTEMPT_MS = 120;
+const AC_BACKGROUND_ATTEMPT_MS = 400;
 /* 投票保鲜期：真支点每帧都在同一处，假支点随朝向移动；窗口里角色转过向，票数自然拉开。 */
 const AC_VOTE_TTL_MS = 15000;
 /* 锁定门槛：至少 6 票，且至少是次优簇的 2 倍。 */
@@ -1963,24 +1913,21 @@ function decideAutoCenter(votes, now) {
   return { x: Math.round(top.x), y: Math.round(top.y), n: top.n, rival };
 }
 
-/**
- * 开始一次手动定心（由「③ 自动定心」按钮触发）。
- * 只置状态，真正的尝试在 tickBearing 每帧调用 autoCenterStep 时做。
- */
-function beginAutoCenter(now = Date.now()) {
+function beginAutoCenter(now = Date.now(), manual = true) {
   const A = BEARING.auto;
+  BEARING.centerPending = false;
   A.active = true;
+  A.manual = manual;
   A.trim.x = 0;
   A.trim.y = 0;
   A.votes.length = 0;
   A.attempts = 0;
   A.lastAttemptAt = 0;
   A.deadline = now + AC_SESSION_MS;
-  console.log('[跟跑助手] 手动自动定心开始');
 }
 
 /** 结束本次定心并把结果回报给渲染进程（渲染进程再让主进程把修正写进标定）。 */
-function finishAutoCenter(result) {
+function finishAutoCenter(result, manual = BEARING.auto.manual) {
   const A = BEARING.auto;
   const wasActive = A.active;
   A.active = false;
@@ -1989,7 +1936,7 @@ function finishAutoCenter(result) {
     A.trim.x = 0;
     A.trim.y = 0;
   }
-  const payload = { phase: 'done', ...result, attempts: A.attempts };
+  const payload = { phase: 'done', ...result, manual, layoutId: BEARING.layoutId, revision: BEARING.revision, attempts: A.attempts };
   try {
     ipcRenderer.sendToHost('bearing-autocenter', payload);
   } catch {
@@ -2011,7 +1958,7 @@ function finishAutoCenter(result) {
  * 手动定心的一帧：按时间节流做尝试、投票，锁定后把修正交给 finishAutoCenter。
  * 学到的支点和当前圆心差 ≤2px 时视为「圆心本来就准」，不动它。
  */
-function autoCenterStep(roi, roiIndex, big, mapPresent, now) {
+function autoCenterStep(roi, big, mapPresent, now) {
   const A = BEARING.auto;
   if (!A.active) return;
   if (now >= A.deadline) {
@@ -2020,22 +1967,14 @@ function autoCenterStep(roi, roiIndex, big, mapPresent, now) {
   }
   // 这一帧没有小地图：不投票，等下一帧（deadline 照样在走）
   if (!big || !mapPresent) return;
-  if (now - A.lastAttemptAt < AC_ATTEMPT_MS) return;
+  const cadence = A.manual ? AC_ATTEMPT_MS : AC_BACKGROUND_ATTEMPT_MS;
+  if (now - A.lastAttemptAt < cadence) return;
   A.lastAttemptAt = now;
   A.attempts += 1;
 
   autoCenterAttempt(roi, big, now);
   const lock = decideAutoCenter(A.votes, now);
-  if (!lock) {
-    if (A.attempts % 10 === 0) {
-      try {
-        ipcRenderer.sendToHost('bearing-autocenter', { phase: 'progress', attempts: A.attempts });
-      } catch {
-        /* 页面正在卸载 */
-      }
-    }
-    return;
-  }
+  if (!lock) return;
 
   const dx = lock.x - A.trim.x;
   const dy = lock.y - A.trim.y;
@@ -2055,7 +1994,6 @@ function autoCenterStep(roi, roiIndex, big, mapPresent, now) {
     dy: lock.y,
     dcx: vw ? lock.x / vw : 0,
     dcy: vh ? lock.y / vh : 0,
-    roiIndex,
     votes: lock.n,
     rival: lock.rival
   });
@@ -2080,14 +2018,12 @@ function startBearingLoop() {
   BEARING.logged = false;
   BEARING.invalidSince = 0;
   BEARING.reportedValid = null;
+  BEARING.mapReportedMissing = false;
   BEARING.explained = false;
-  // 视角通道独立重置：切视频/切分 P 后镜头位置全变了，沿用旧值会先指错一下
-  BEARING.view.theta = -1;
-  BEARING.view.sent = -1;
-  BEARING.view.conf = 0;
-  BEARING.view.src = '';
-  // 识别循环从头开始：定心结果不再可靠，重新学
+  Object.assign(BEARING.view, { theta: -1, sent: -1, conf: 0, src: '', pending: -1, t: 0 });
   resetAutoCenter('识别循环重新开始');
+  BEARING.centerPending = !!BEARING.roi && BEARING.autoCenter;
+  sendBearing({ clear: true });
 
   const v = video;
   if (!v) return;
@@ -2112,14 +2048,6 @@ function startBearingLoop() {
     BEARING.loopKind = 'timer';
     BEARING.timer = setInterval(tickBearing, 50);
   }
-
-  // 守护：B 站切换分 P 时可能整个换掉 <video>，换了就重挂循环
-  BEARING.guard = setInterval(() => {
-    if (!BEARING.enabled) return;
-    if (video && video.isConnected) return;
-    bind(pickVideo());
-    if (video) startBearingLoop();
-  }, 2000);
 }
 
 function stopBearingLoop() {
@@ -2133,8 +2061,6 @@ function stopBearingLoop() {
   BEARING.rvfc = null;
   if (BEARING.timer) clearInterval(BEARING.timer);
   BEARING.timer = null;
-  if (BEARING.guard) clearInterval(BEARING.guard);
-  BEARING.guard = null;
   BEARING.loopKind = '';
 }
 
@@ -2148,7 +2074,8 @@ try {
     state: () => ({
       enabled: BEARING.enabled,
       loopKind: BEARING.loopKind,
-      rois: BEARING.rois,
+      roi: BEARING.roi,
+      layoutId: BEARING.layoutId,
       raw: BEARING.raw.slice(),
       smooth: BEARING.smooth,
       lastAngle: BEARING.lastAngle,
@@ -2184,11 +2111,11 @@ try {
       return cells.join('\n');
     },
     grab: (roi) => {
-      const g = grabCenter(roi || BEARING.rois[0]);
+      const g = grabCenter(roi || BEARING.roi);
       if (!g) return { ok: false };
       const r = analyze(g.img, g.size, g.step);
       // 顺手把扇形也跑一遍，方便一次拿到两路证据做对比（同样用大窗口）
-      const gc = grabCenter(roi || BEARING.rois[0], 1.5, 512);
+      const gc = grabCenter(roi || BEARING.roi, 1.5, 512);
       const c = gc ? analyzeCone(gc.img, gc.size, gc.step) : null;
       return { ok: true, size: g.size, step: g.step, ...r, cone: c, ab: { ...BEARING.ab } };
     },
@@ -2367,14 +2294,14 @@ try {
     },
     // 把当前窗口存成基准帧
     markPrev: (roi) => {
-      const g = grabCenter(roi || BEARING.rois[0]);
+      const g = grabCenter(roi || BEARING.roi);
       if (!g) return false;
       BEARING.prev = { data: new Uint8ClampedArray(g.img.data), size: g.size };
       return true;
     },
     // 与基准帧做 SAD，返回地图内容的平移量 → 换算成行进方向
     flow: (roi) => {
-      const g = grabCenter(roi || BEARING.rois[0]);
+      const g = grabCenter(roi || BEARING.roi);
       const A = BEARING.prev;
       if (!g || !A || A.size !== g.size) return { ok: false, why: 'no baseline' };
       const size = g.size;
@@ -2508,7 +2435,8 @@ function grabFrameWithRoi() {
   ctx.strokeStyle = '#ff0000';
   ctx.lineWidth = 1.5;
 
-  for (const roi of BEARING.rois) {
+  const roi = BEARING.roi;
+  if (roi) {
     const cx = roi.cx * video.videoWidth * k;
     const cy = roi.cy * video.videoHeight * k;
     const r = Math.max(6, roi.r * video.videoWidth * k);
@@ -2558,77 +2486,49 @@ function videoRectInfo() {
   };
 }
 
-function setBearing(cfg = {}) {
-  // 区域列表是主入口；旧的单区域参数保留兼容
-  if (Array.isArray(cfg.rois)) {
-    const next = cfg.rois
-      .filter((r) => r && Number.isFinite(r.cx) && Number.isFinite(r.cy) && Number.isFinite(r.r))
-      .slice(0, 4);
-    // 同一份配置会被反复下发，区域真变了才清掉自动定心的学习结果
-    if (JSON.stringify(next) !== JSON.stringify(BEARING.rois)) resetAutoCenter('识别区域变化');
-    BEARING.rois = next;
-  } else if (Number.isFinite(cfg.mapCx)) {
-    const next = [{ cx: cfg.mapCx, cy: cfg.mapCy, r: cfg.mapR }];
-    if (JSON.stringify(next) !== JSON.stringify(BEARING.rois)) resetAutoCenter('识别区域变化');
-    BEARING.rois = next;
+function setBearing(config = {}) {
+  if (config.on !== undefined) {
+    const changed = BEARING.enabled !== !!config.on || BEARING.layoutId !== config.layoutId || BEARING.revision !== config.revision;
+    if (changed) {
+      resetAutoCenter('布局或显示状态变化');
+      const roi = config.roi;
+      BEARING.roi = roi && [roi.cx, roi.cy, roi.r].every(Number.isFinite) ? roi : null;
+      BEARING.layoutId = config.layoutId;
+      BEARING.revision = config.revision;
+      BEARING.autoCenter = !!config.autoCenter;
+      BEARING.enabled = !!config.on;
+      if (!BEARING.enabled) stopBearingLoop();
+      else if (video) startBearingLoop();
+      else bind(pickVideo());
+    }
   }
 
-  if (cfg.dump) {
-    const first = BEARING.rois[0];
-    const g = first ? grabCenter(first) : null;
-    if (!g) {
+  if (config.dump) {
+    const sample = BEARING.roi ? grabCenter(BEARING.roi) : null;
+    if (!sample) {
       ipcRenderer.sendToHost('bearing-dump', {
         dataUrl: '',
         error: video ? '坐标越界或像素读取被拒' : '还没找到 video 元素'
       });
-    } else {
-      let opaque = 0;
-      const px = g.img.data;
-      for (let i = 3; i < px.length; i += 4) if (px[i] > 0) opaque += 1;
-
-      try {
-        ipcRenderer.sendToHost('bearing-dump', {
-          dataUrl: BEARING.canvas.toDataURL('image/png'),
-          frame: grabFrameWithRoi(),
-          size: g.size,
-          vw: video.videoWidth,
-          vh: video.videoHeight,
-          ready: video.readyState,
-          opaque,
-          total: g.size * g.size,
-          src: (video.currentSrc || '').slice(0, 24),
-          rois: BEARING.rois
-        });
-      } catch (err) {
-        console.warn('[跟跑助手] 导出小地图截图失败', err.message);
-      }
+      return;
     }
-  }
-
-  // 纯 dump 调用（只抓一帧比对，不动识别开关）
-  if (cfg.on === undefined) return;
-
-  const on = !!cfg.on;
-  BEARING.enabled = on;
-
-  if (on) {
-    if (!BEARING.guard && !BEARING.rvfc) {
-      if (!video) bind(pickVideo());
-
-      // 打一行画面几何信息：标定坐标对不上时，这是唯一能直接核对的依据
-      const info = videoRectInfo();
-      if (info.ok) {
-        console.log(
-          `[跟跑助手] 视频元素 ${Math.round(info.w)}×${Math.round(info.h)} @(${Math.round(info.x)}, ${Math.round(info.y)})` +
-            ` · 视口 ${info.vpW}×${info.vpH} · 源 ${info.vw}×${info.vh} · object-fit=${info.fit}`
-        );
-      }
-
-      startBearingLoop();
+    let opaque = 0;
+    const pixels = sample.img.data;
+    for (let index = 3; index < pixels.length; index += 4) if (pixels[index] > 0) opaque += 1;
+    try {
+      ipcRenderer.sendToHost('bearing-dump', {
+        dataUrl: BEARING.canvas.toDataURL('image/png'),
+        frame: grabFrameWithRoi(),
+        size: sample.size,
+        vw: video.videoWidth,
+        vh: video.videoHeight,
+        opaque,
+        total: sample.size * sample.size,
+        rois: [BEARING.roi]
+      });
+    } catch (error) {
+      console.warn('[跟跑助手] 导出小地图截图失败', error.message);
     }
-  } else if (BEARING.guard || BEARING.rvfc || BEARING.timer) {
-    stopBearingLoop();
-    ipcRenderer.sendToHost('bearing', { ok: false });
   }
 }
 
@@ -2659,6 +2559,8 @@ function apply(msg) {
     return;
   }
   if (msg.cmd === 'presentation') {
+    if (msg.token !== playbackToken) return;
+    immersionSession = msg.immersionSession;
     setVideoOnly(!!msg.videoOnly);
     return;
   }
@@ -2678,31 +2580,18 @@ function apply(msg) {
   if (msg.cmd === 'play' && !video) pendingPlay = true;
   if (msg.cmd === 'pause') pendingPlay = false;
 
-  // 手动自动定心：用户点了「③ 自动定心」才进来。前置条件不满足就立刻回报原因。
+  if (msg.cmd === 'autocenter-discard') {
+    if (msg.layoutId === BEARING.layoutId && msg.revision === BEARING.revision && !BEARING.auto.active) {
+      resetAutoCenter('结果未保存');
+    }
+    return;
+  }
   if (msg.cmd === 'autocenter') {
     if (!video) bind(pickVideo());
-    if (!video) {
-      finishAutoCenter({ ok: false, reason: 'no-video' });
-      return;
-    }
-    if (video.paused || video.ended) {
-      finishAutoCenter({ ok: false, reason: 'paused' });
-      return;
-    }
-    if (!BEARING.enabled) {
-      finishAutoCenter({ ok: false, reason: 'disabled' });
-      return;
-    }
-    if (!BEARING.rois.length) {
-      finishAutoCenter({ ok: false, reason: 'no-roi' });
-      return;
-    }
-    beginAutoCenter();
-    try {
-      ipcRenderer.sendToHost('bearing-autocenter', { phase: 'start' });
-    } catch {
-      /* 页面正在卸载 */
-    }
+    const reason = !video ? 'no-video' : video.paused || video.ended ? 'paused' :
+      !BEARING.enabled ? 'disabled' : !BEARING.roi ? 'no-roi' : '';
+    if (reason) finishAutoCenter({ ok: false, reason }, true);
+    else beginAutoCenter();
     return;
   }
 
@@ -2756,6 +2645,17 @@ function apply(msg) {
   push(true);
 }
 
+function reportImmersionSize() {
+  if (!videoOnly || !immersionSession) return;
+  const ready = video?.isConnected && video.readyState >= 1;
+  ipcRenderer.send('player:video-size', {
+    token: playbackToken,
+    immersionSession,
+    width: ready ? video.videoWidth : 0,
+    height: ready ? video.videoHeight : 0
+  });
+}
+
 function setVideoOnly(on) {
   videoOnly = !!on;
   for (const element of document.querySelectorAll('[data-gifa-video-path]')) element.removeAttribute('data-gifa-video-path');
@@ -2779,6 +2679,7 @@ function setVideoOnly(on) {
   for (let parent = video && video.parentElement; parent; parent = parent.parentElement) {
     parent.setAttribute('data-gifa-video-path', '');
   }
+  reportImmersionSize();
 }
 
 /* ------------------------------------------------- 网页版「纯净模式」样式 */

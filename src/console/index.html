@@ -186,7 +186,7 @@
               </div>
               <div class="card-body note-steps note-cols">
                 <div class="note-step"><b>1</b><span>游戏内「图像 → 显示模式」改成 <b>窗口化</b> 或 <b>无边框</b>；独占全屏下系统不允许任何浮窗盖上去。</span></div>
-                <div class="note-step"><b>2</b><span>在「方位标定」里框选视频小地图，再把红圈拖到你自己的小地图上。</span></div>
+                <div class="note-step"><b>2</b><span>在「方位标定」里开启箭头，把标记摆到你的游戏小地图上。视频布局不同时再新增布局。</span></div>
                 <div class="note-step"><b>3</b><span>回到游戏，用快捷键暂停 / 快进。默认 <b>Alt+空格</b> 暂停播放。</span></div>
               </div>
             </section>
@@ -204,7 +204,7 @@
                 <span class="card-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
                 <div class="card-heading">
                   <h2>显示与标定</h2>
-                  <p>标定结果按视频记住，换片不用重新框</p>
+                  <p>视频小地图布局可跨视频复用，同一时刻只识别当前布局</p>
                 </div>
               </div>
               <div class="card-body">
@@ -222,29 +222,41 @@
                   </span>
                 </div>
 
-                <!-- 主流程只有两步，单独做成大按钮；排查工具降一级放在下面 -->
                 <div class="setting setting-stack">
                   <span class="setting-ico"><svg class="ico"><use href="#i-target"></use></svg></span>
-                  <span class="setting-text"><strong>标定三步</strong><small>先框住视频里的小地图，再把标记摆到你自己的小地图上；圆心不用手动对到像素级，交给「③ 自动定心」</small></span>
+                  <span class="setting-text"><strong><label for="bearingLayout">视频小地图布局</label></strong><small>同一个博主通常只需框一次。播放时会为当前布局自动对准圆心。</small></span>
+                  <div class="layout-row">
+                    <select id="bearingLayout" class="sel"></select>
+                    <button id="btnLayoutDefault" class="small">下次启动用此布局</button>
+                  </div>
+                  <div class="layout-row">
+                    <button id="btnNewLayout" class="small">新增布局</button>
+                    <button id="btnPickRoi" class="small">调整范围</button>
+                    <button id="btnRenameLayout" class="small">重命名</button>
+                    <button id="btnDeleteLayout" class="ghost small danger">删除布局</button>
+                  </div>
+                  <form id="layoutNameForm" class="layout-row" hidden>
+                    <input id="layoutName" type="text" maxlength="40" spellcheck="false" aria-label="布局名称" placeholder="例如：某某 UP 主" required />
+                    <button id="btnSaveLayoutName" type="submit" class="small">去框选</button>
+                    <button id="btnCancelLayoutName" type="button" class="ghost small">取消</button>
+                  </form>
+                  <p id="layoutStatus" class="layout-row tip" aria-live="polite"></p>
+                </div>
+
+                <div class="setting setting-stack">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-pin"></use></svg></span>
+                  <span class="setting-text"><strong>我的游戏小地图</strong><small>屏幕上的标记只需摆放一次，不随视频布局改变。</small></span>
                   <div class="steps">
-                    <button id="btnPickRoi" class="step-btn">① 框选视频里的小地图</button>
-                    <button id="btnPlace" class="step-btn">② 拖到我的游戏小地图上</button>
-                    <button id="btnAutoCenter" class="step-btn span2">③ 自动定心（点一下，程序自己对准圆心并记住）</button>
+                    <button id="btnPlace" class="step-btn">摆放方位标记</button>
                   </div>
                 </div>
 
                 <div class="tool-row">
                   <span class="tool-label">排查</span>
+                  <button id="btnAutoCenter" class="small">重新对准圆心</button>
                   <button id="btnDumpRoi" class="small">抓一帧核对</button>
                   <button id="btnOpenDump" class="small">打开导出位置</button>
-                  <span class="grow"></span>
-                  <button id="btnClearRoi" class="ghost small danger">清除本视频标定</button>
                 </div>
-                <p class="tip">
-                  框选要在浮窗里做：点了会把浮窗叫起来，拖金色圆环套住视频里的小地图，滚轮调大小。<br />
-                  圆心大致对准就行：点「③ 自动定心」后程序会自己找箭头支点，算准一次就写进这个视频的标定并固定住。<br />
-                  转场 / 特写 / 对话时画面里没有小地图，箭头会自动收起，不是故障。
-                </p>
               </div>
             </section>
 
@@ -286,7 +298,7 @@
                 </label>
                 <label class="setting" for="setImmersion">
                   <span class="setting-ico"><svg class="ico"><use href="#i-video"></use></svg></span>
-                  <span class="setting-text"><strong>纯视频沉浸模式</strong><small id="immersionHint">按 Alt+I 进入或退出，只保留视频、鼠标穿透，无法拖动或缩放；也可在这里关闭。</small></span>
+                  <span class="setting-text"><strong>纯视频沉浸模式</strong><small id="immersionHint">按 Alt+I 进入或退出，窗口贴合视频比例并穿透鼠标，退出后恢复原位置和大小。</small></span>
                   <span class="switch"><input type="checkbox" id="setImmersion" /></span>
                 </label>
                 <label class="setting" for="setHoverFade">

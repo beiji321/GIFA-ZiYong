@@ -316,6 +316,17 @@ window.addEventListener('resize', resize);
 window.overlayApi.onBearing((payload) => {
   if (!payload) return;
 
+  if (payload.clear || payload.clearAngle) {
+    cancelAnimationFrame(tween.arrow.raf);
+    Object.assign(tween.arrow, { target: null, shown: null, raf: 0 });
+    if (payload.clear) {
+      cancelAnimationFrame(tween.view.raf);
+      clearTimeout(viewExpireTimer);
+      Object.assign(tween.view, { target: null, shown: null, raf: 0, at: 0 });
+    }
+    draw();
+  }
+
   // 箭头：hold 表示这一帧的判据是「疑似反向」，保持原角度不动，不要跟着转
   if (!payload.hold && typeof payload.angle === 'number') {
     setTarget('arrow', payload.angle);

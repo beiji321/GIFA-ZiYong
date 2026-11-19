@@ -159,7 +159,7 @@ function simulate(dx0, dy0, startIdx) {
       }
     }
 
-    if (BEARING.auto.active) autoCenterStep(roi, 0, big, hasMap[i], f.t * 1000);
+    if (BEARING.auto.active) autoCenterStep(roi, big, hasMap[i], f.t * 1000);
   }
 
   const res = lastResult || { ok: false, reason: 'no-result' };

@@ -207,6 +207,11 @@ button {
   display: none;
 }
 
+.layout-sel { max-width: 112px; }
+@media (max-width: 460px) {
+  .sel.layout-sel { display: none; }
+}
+
 /* ------------------------------------------------------------------ 按钮 */
 
 button.primary {
@@ -682,7 +687,7 @@ body:not(.ui) #controls {
   display: none;
 }
 
-/* 纯视频模式保持窗口原尺寸，界面隐藏且不能被悬停重新唤出。 */
+/* 纯视频模式的界面隐藏，且不能被悬停重新唤出。 */
 #app.video-only { border: 0; border-radius: 0; }
 #app.video-only #titlebar,
 #app.video-only #urlbar,

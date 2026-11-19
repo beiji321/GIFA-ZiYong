@@ -61,6 +61,8 @@ function syncPartFromGuest(v, fromGuest) {
 function setCurrentPart(n, auto) {
   if (!Number.isFinite(n) || n < 1) return;
   state.p = n;
+  closeCalib();
+  resetLayoutHint();
   renderParts();
   if (!auto) return;
   try {
@@ -84,6 +86,7 @@ async function init() {
   applyImmersionState(!!(state.boot.floatState && state.boot.floatState.immersion));
 
   createWebview();
+  renderLayoutSelect();
   wireUi();
   wireHotkeys();
 
@@ -170,7 +173,6 @@ function createWebview() {
     state.guestReady = true;
     sendPlayer({ cmd: 'clean', on: true });
     syncBearingToGuest();
-    maybeAutoDump();
     if (state.autoPlay) {
       sendPlayer({ cmd: 'play' });
       setTimeout(() => sendPlayer({ cmd: 'play' }), 700);
@@ -229,117 +231,88 @@ function flush() {
 
 /* ------------------------------------------------------- 小地图方位标记 */
 
-/**
- * 把识别参数下发到 webview。
- * extra.dump = true 时让访客把抓到的识别区域导出来，方便肉眼比对 ROI 有没有对准。
- */
-/** 当前视频专属的标定区域列表，没有就用全局的 */
-function roisFor(id) {
-  const b = state.boot.settings.bearing || {};
-  const own = id && b.roiBy ? b.roiBy[id] : null;
-  if (Array.isArray(own) && own.length) return own;
-  return Array.isArray(b.rois) ? b.rois : [];
+function currentLayout() {
+  const bearing = state.boot.settings.bearing;
+  return bearing.layouts.find((layout) => layout.id === bearing.activeLayoutId);
 }
 
-function syncBearingToGuest(extra) {
-  const b = state.boot.settings.bearing || {};
+function renderLayoutSelect() {
+  const bearing = state.boot.settings.bearing;
+  const select = $('layoutSelect');
+  select.replaceChildren(...bearing.layouts.map((layout) => {
+    const option = document.createElement('option');
+    option.value = layout.id;
+    option.textContent = layout.name;
+    return option;
+  }));
+  select.value = bearing.activeLayoutId;
+  select.title = `视频小地图布局：${currentLayout().name}`;
+  select.classList.toggle('hidden', !bearing.enabled || bearing.layouts.length < 2);
+}
+
+function matchesCurrentLayout(payload) {
+  const layout = currentLayout();
+  return layout && payload && payload.layoutId === layout.id && payload.revision === layout.revision;
+}
+
+function syncBearingToGuest() {
+  const bearing = state.boot.settings.bearing;
+  const layout = currentLayout();
   sendPlayer({
     cmd: 'bearing',
-    on: !!b.enabled,
-    rois: roisFor(state.id),
-    ...(extra || {})
+    on: !!bearing.enabled,
+    roi: layout?.roi || null,
+    layoutId: layout?.id,
+    revision: layout?.revision,
+    autoCenter: !!layout && !layout.centered
   });
 }
 
-let bearingLostAt = 0;
-let bearingHinted = false;
+let layoutHintTimer = null;
+let layoutHinted = false;
 
-function onGuestBearing(p) {
-  if (!p) return;
+function resetLayoutHint() {
+  clearTimeout(layoutHintTimer);
+  layoutHintTimer = null;
+  layoutHinted = false;
+}
 
-  // 「这一帧有没有箭头角度」由 angle 是否存在决定，不再看 ok。
-  // 因为箭头认不出来时视角可能还有效（ok=false 但 view 有值），
-  // 那种情况绿弧要照常更新，只是箭头原地不动。
-  const hasAngle = typeof p.angle === 'number';
-
-  if (hasAngle) {
-    bearingLostAt = 0;
-    bearingHinted = false;
-  } else if (p.reason === '画面里没有小地图') {
-    // 长时间认不出来多半是画面布局换了，提示一次，避免用户以为坏了
-    if (!bearingLostAt) bearingLostAt = Date.now();
-    else if (!bearingHinted && Date.now() - bearingLostAt > 8000) {
-      bearingHinted = true;
-      toast('连续找不到小地图：画面布局可能变了，点 ⚙ → ① 按当前画面重新框一次', 6500);
-    }
+function onGuestBearing(payload) {
+  if (!state.guestReady || !state.boot.settings.bearing.enabled || !matchesCurrentLayout(payload)) return;
+  const hasAngle = typeof payload.angle === 'number';
+  const hasView = typeof payload.view === 'number';
+  if (payload.clear || hasAngle || hasView || payload.mapMissing === false) {
+    resetLayoutHint();
+  } else if (payload.mapMissing && !layoutHinted && !layoutHintTimer) {
+    layoutHintTimer = setTimeout(() => {
+      layoutHintTimer = null;
+      if (!state.video.playing || !matchesCurrentLayout(payload)) return;
+      layoutHinted = true;
+      toast('当前布局找不到小地图，可到「方位标定」切换或新增布局', 6500);
+    }, 7000);
   }
-
   window.api.bearing({
-    angle: hasAngle ? p.angle : null,
-    confidence: p.confidence || 0,
-    // 视角（扇形）走独立字段，和行进方向不合并 ——
-    // 站着转视角时两者本来就该不一样，合成一个反而都不准
-    view: typeof p.view === 'number' ? p.view : null,
-    viewConfidence: p.viewConfidence || 0,
-    viewSource: p.viewSource || '',
-    viewWidth: p.viewWidth || 0,
-    hold: !!p.hold
+    layoutId: payload.layoutId,
+    revision: payload.revision,
+    angle: hasAngle ? payload.angle : null,
+    confidence: payload.confidence || 0,
+    view: hasView ? payload.view : null,
+    viewConfidence: payload.viewConfidence || 0,
+    viewSource: payload.viewSource || '',
+    viewWidth: payload.viewWidth || 0,
+    hold: !!payload.hold,
+    clear: !!payload.clear,
+    clearAngle: !!payload.clearAngle
   });
 }
 
-let autoDumped = false;
-
-/**
- * 手动「自动定心」的结果。访客只负责算，修正值交给主进程写进该视频的标定，
- * 这样下次打开还是对准的（浮窗自己不留状态）。
- */
-const AUTO_CENTER_FAIL = {
-  paused: '视频没在播放，先播放再点自动定心',
-  timeout: '没学会圆心：画面里可能没有小地图，或角色一直没转向，再点一次并让角色转个身',
-  disabled: '先打开「显示方位箭头」',
-  'no-roi': '还没框选视频里的小地图',
-  'no-video': '还没找到视频',
-  reset: '自动定心已取消',
-  'save-failed': '已对准，但写入标定失败；本次会话内仍然有效'
-};
-
-function onGuestAutoCenter(p) {
-  if (!p) return;
-  if (p.phase === 'start') {
-    toast('自动定心中：保持视频播放，角色走动 / 转身更容易成功（5~20 秒）', 6000);
-    return;
+async function onGuestAutoCenter(payload) {
+  if (!state.guestReady || payload?.phase !== 'done' || !matchesCurrentLayout(payload)) return;
+  const result = await window.api.autoCenterResult(payload).catch(() => null);
+  if (!result?.ok && payload.applied && matchesCurrentLayout(payload)) {
+    sendPlayer({ cmd: 'autocenter-discard', layoutId: payload.layoutId, revision: payload.revision });
   }
-  if (p.phase === 'progress') return;
-  if (p.phase !== 'done') return;
-
-  if (!p.ok) {
-    toast(AUTO_CENTER_FAIL[p.reason] || '自动定心没成功，再试一次', 6000);
-    return;
-  }
-  if (!p.applied) {
-    toast('圆心本来就对准了（偏差 ≤2 像素），不用调整', 5000);
-    return;
-  }
-  toast(`圆心已自动对准：修正 (${p.dx}, ${p.dy})px`, 5000);
-  // 交给主进程持久化：成功后浮窗会收到修正过的标定，临时修正随之归零
-  try {
-    const r = window.api.autoCenterResult({ ...p, videoId: state.id });
-    if (r && typeof r.then === 'function') {
-      r.then((out) => {
-        if (!out || !out.ok) toast('已对准，但写入标定失败；本次会话内仍然有效', 6000);
-      }).catch(() => {});
-    }
-  } catch {
-    /* 主进程不在或通道关闭都不影响本次会话内的修正 */
-  }
-}
-
-/** 未标定时自动导出一张识别区域图，方便排查；标定过就不打扰 */
-function maybeAutoDump() {
-  const b = state.boot.settings.bearing;
-  if (!b || !b.enabled || b.calibrated || autoDumped) return;
-  autoDumped = true;
-  setTimeout(() => sendPlayer({ cmd: 'bearing', dump: true }), 12000);
+  if (!result && payload.manual) toast('圆心结果未保存，请重试');
 }
 
 async function onGuestDump(p) {
@@ -357,7 +330,7 @@ async function onGuestDump(p) {
 
 /* --------------------------------------------- 识别区域框选（标定） */
 
-const calib = { open: false, box: null, cx: 0, cy: 0, r: 60 };
+const calib = { open: false, target: null, box: null, cx: 0, cy: 0, r: 60 };
 let rectWaiter = null;
 
 /** 向视频端要一次 <video> 的位置信息 */
@@ -421,99 +394,65 @@ function paintCalib() {
   el.style.width = `${calib.r * 2}px`;
   el.style.height = `${calib.r * 2}px`;
 
-  // 实时读数：半径占画面宽度的比例。原神小地图的圆盘半径普遍是这个宽度的
-  // 13%~18%（博主放大录制时会更大），低于 12% 基本套不住整块小地图。
-  const box = calib.box;
-  if (box && box.w) {
-    const pct = (calib.r / box.w) * 100;
-    const sizeEl = $('calibSize');
-    if (sizeEl) {
-      sizeEl.textContent = `直径 ${Math.round(calib.r * 2)}px · 画面宽 ${pct.toFixed(1)}%${pct < 12 ? '（偏小）' : ''}`;
-      sizeEl.style.color = pct < 12 ? 'var(--warn, #e0a33a)' : '';
-    }
-  }
+  $('calibSize').textContent = `直径 ${Math.round(calib.r * 2)}px`;
 }
 
 function closeCalib() {
   calib.open = false;
+  calib.target = null;
   $('calib').classList.add('hidden');
 }
 
-async function openCalib() {
-  if (!state.id) {
-    toast('先载入一个视频，再框选小地图', 3200);
-    return;
-  }
-
+async function openCalib(command) {
+  if (!state.id) return toast('请先载入一个视频，再框选小地图', 3200);
+  if (rectWaiter || $('calibOk').disabled) return;
+  const videoId = state.id;
+  const part = state.p;
   const info = await requestVideoRect();
-  if (!info || !info.ok) {
-    toast(
-      info && info.error === 'no-frame' ? '视频画面还没解码出来，等几秒再试' : '没找到视频画面，稍后再试',
-      4000
-    );
-    return;
-  }
+  if (videoId !== state.id || part !== state.p) return;
+  if (!info?.ok) return toast('视频画面还没准备好，请稍后再试', 4000);
 
+  const layout = currentLayout();
+  if (!layout || (command.op === 'calibrate' && command.id !== layout.id)) return;
   calib.box = contentBox(info);
-
-  // 初始位置：沿用已标的值；没标过就用出厂初值（实测对准的那块布局），
-  // 免得一打开就落在画面外边、用户点「完成」直接存下一个错的区域。
-  const base = roisFor(state.id)[0] || state.boot.seedRoi || { cx: 0.1434, cy: 0.2481, r: 0.1542 };
+  calib.target = command.op === 'create' ? { op: 'create', name: command.name } : { op: 'calibrate', id: layout.id };
+  const base = layout.roi;
   calib.cx = calib.box.x + base.cx * calib.box.w;
   calib.cy = calib.box.y + base.cy * calib.box.h;
-  // 半径低于画面宽 5% 的一定套不住整块小地图（常见是 9%~14%），放大到可用值
-  calib.r = Math.max(16, Math.max(base.r, 0.09) * calib.box.w);
-
+  calib.r = base.r * calib.box.w;
   calib.open = true;
   $('calib').classList.remove('hidden');
-  $('calibHint').textContent = '拖动对准小地图圆心（大致即可，偏了可回启动器点「③ 自动定心」）· 滚轮缩放，让圆环刚好包住小地图圆盘';
+  $('calibHint').textContent = `「${command.name || layout.name}」 · 拖动圆环、滚轮调大小，套住视频小地图即可`;
   paintCalib();
 }
 
 async function saveCalib() {
-  const box = calib.box;
-  if (!box || !box.w) {
-    closeCalib();
-    return;
-  }
-
+  const { box, target } = calib;
+  const button = $('calibOk');
+  if (!calib.open || !target || !box?.w || button.disabled) return;
   const roi = {
     cx: (calib.cx - box.x) / box.w,
     cy: (calib.cy - box.y) / box.h,
     r: calib.r / box.w
   };
-
-  // 首次标定直接覆盖列表，不追加。
-  // 以前无论标没标过都是「位置接近就替换、否则追加」，而出厂又预置了猜测值，
-  // 于是框一次就变成「已标定 2 处」。现在：没确认过标定 = 这一块就是全部；
-  // 确认过之后再框，才当作「另一种画面布局」追加。
-  const calibrated = !!state.boot.settings.bearing.calibrated;
-  const list = calibrated ? roisFor(state.id).slice() : [];
-
-  // 跟已有区域位置重合就替换，否则当作「另一种画面布局」追加
-  let hit = -1;
-  for (let i = 0; i < list.length; i++) {
-    if (Math.hypot(list[i].cx - roi.cx, (list[i].cy - roi.cy) * 0.75) < 0.08) {
-      hit = i;
-      break;
+  button.disabled = true;
+  try {
+    const result = await window.api.updateBearingLayout({ ...target, roi });
+    if (!result.ok) {
+      const messages = {
+        duplicate: '已有同名布局，请返回「方位标定」换个名字',
+        roi: '请把圆心放在视频画面内，并让圆环套住小地图'
+      };
+      toast(messages[result.reason] || '布局未保存，请重新框选');
+      return;
     }
+    if (calib.target === target) closeCalib();
+    toast(state.boot.settings.bearing.enabled ? '布局已保存，播放时自动对准圆心' : '布局已保存，开启方位箭头后生效');
+  } catch {
+    toast('布局未保存，请重试');
+  } finally {
+    button.disabled = false;
   }
-  if (hit >= 0) list[hit] = roi;
-  else list.push(roi);
-
-  const rois = list.slice(0, 4);
-
-  await window.api.save({ bearing: { rois, calibrated: true, videoId: state.id || '' } });
-  state.boot.settings.bearing.rois = rois;
-  state.boot.settings.bearing.calibrated = true;
-  if (state.id && state.boot.settings.bearing.roiBy) {
-    state.boot.settings.bearing.roiBy[state.id] = rois;
-  }
-  syncBearingToGuest();
-  closeCalib();
-
-  toast(`已记住 ${rois.length} 处识别区域，正在抓一帧核对`, 3200);
-  setTimeout(() => sendPlayer({ cmd: 'bearing', dump: true }), 900);
 }
 
 function wireCalib() {
@@ -531,7 +470,7 @@ function wireCalib() {
   });
 
   box.addEventListener('pointermove', (e) => {
-    if (!drag) return;
+    if (!calib.open || !drag) return;
     const o = stageOrigin();
     calib.cx = e.clientX - o.left + drag.ox;
     calib.cy = e.clientY - o.top + drag.oy;
@@ -597,6 +536,9 @@ async function loadVideo(text, part, autoplay) {
     return;
   }
 
+  closeCalib();
+  resetLayoutHint();
+  window.api.bearing({ clear: true });
   state.id = res.id;
   state.p = res.p;
   state.pages = res.pages || [];
@@ -726,6 +668,12 @@ function wireUi() {
       : '循环倍速：1 → 1.25 → 1.5 → 2';
   });
 
+  $('layoutSelect').addEventListener('change', async (event) => {
+    const result = await window.api.updateBearingLayout({ op: 'select', id: event.target.value }).catch(() => null);
+    if (result?.ok) return;
+    renderLayoutSelect();
+    toast('无法切换布局，请重试');
+  });
   $('partSelect').addEventListener('change', (e) => {
     loadVideo(state.id, Number(e.target.value), true);
   });
@@ -747,7 +695,7 @@ function wireUi() {
   // 启动器发来的命令：开框选 / 抓一帧 / 换视频
   window.api.onFloatCmd((c) => {
     if (!c) return;
-    if (c.cmd === 'calib') openCalib();
+    if (c.cmd === 'calib' && c.command) openCalib(c.command);
     else if (c.cmd === 'autocenter') sendPlayer({ cmd: 'autocenter' });
     else if (c.cmd === 'dump') sendPlayer({ cmd: 'bearing', dump: true });
     else if (c.cmd === 'load' && c.text) loadVideo(c.text, Number(c.p) || 1, true);
@@ -756,7 +704,12 @@ function wireUi() {
   // 启动器改了设置（方位开关、标记大小、音量等），浮窗这边跟着更新
   window.api.onSettingsChanged((next) => {
     if (!next) return;
+    const previous = state.boot.settings.bearing;
     state.boot.settings = next;
+    if (previous.activeLayoutId !== next.bearing.activeLayoutId || !next.bearing.enabled) resetLayoutHint();
+    if (calib.target?.op === 'calibrate' && calib.target.id !== next.bearing.activeLayoutId) closeCalib();
+    if (previous.activeLayoutId !== next.bearing.activeLayoutId || previous.enabled !== next.bearing.enabled ||
+        JSON.stringify(previous.layouts) !== JSON.stringify(next.bearing.layouts)) renderLayoutSelect();
     syncBearingToGuest();
   });
 

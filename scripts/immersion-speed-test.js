@@ -9,6 +9,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { DEFAULT_GAMEPAD } = require('../src/gamepad-config');
+const { DEFAULT_BEARING_LAYOUTS, activeBearingLayout } = require('../src/bearing-layouts');
 
 const projectRoot = path.resolve(__dirname, '..');
 const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8');
@@ -118,15 +119,25 @@ function createWindow(options = {}) {
   window.mouseThrough = false;
   window.calls = [];
   window.messages = [];
+  window.loading = false;
+  window.focusable = options.focusable !== false;
   window.webContents = new EventEmitter();
+  window.webContents.isLoading = () => window.loading;
   window.webContents.send = (channel, payload) => window.messages.push({ channel, payload: plain(payload) });
   window.isDestroyed = () => window.destroyed;
   window.isVisible = () => window.visible;
   window.isMinimized = () => window.minimized;
+  window.fullScreen = !!options.fullScreen;
+  window.isFullScreen = () => window.fullScreen;
+  window.setFullScreen = (value) => { window.fullScreen = !!value; };
   window.getBounds = () => ({ ...window.bounds });
+  window.getContentBounds = () => window.getBounds();
   window.setBounds = (bounds) => {
+    const previous = window.getBounds();
     window.calls.push({ method: 'setBounds', value: { ...bounds } });
     Object.assign(window.bounds, bounds);
+    if (previous.x !== window.bounds.x || previous.y !== window.bounds.y) window.emit('move');
+    if (previous.width !== window.bounds.width || previous.height !== window.bounds.height) window.emit('resize');
   };
   function applyStyleBoundsChange(method) {
     const delta = options.styleBoundsDeltas?.[method];
@@ -146,13 +157,20 @@ function createWindow(options = {}) {
   };
   window.setIgnoreMouseEvents = (value, settings) => {
     window.mouseThrough = value;
-    window.calls.push({ method: 'setIgnoreMouseEvents', value, settings: plain(settings) });
+    window.calls.push({ method: 'setIgnoreMouseEvents', value, settings: settings && plain(settings) });
   };
   window.setOpacity = (value) => { window.opacity = value; window.calls.push({ method: 'setOpacity', value }); };
   window.setAlwaysOnTop = (...values) => window.calls.push({ method: 'setAlwaysOnTop', values });
   window.setVisibleOnAllWorkspaces = () => {};
-  window.loadFile = () => Promise.resolve();
-  window.restore = () => { window.minimized = false; window.calls.push({ method: 'restore' }); };
+  window.setFocusable = (value) => { window.focusable = value; };
+  window.loadFile = () => { window.loading = true; return Promise.resolve(); };
+  window.finishLoad = () => { window.loading = false; window.webContents.emit('did-finish-load'); };
+  window.minimize = () => { window.minimized = true; };
+  window.restore = () => {
+    window.minimized = false;
+    window.calls.push({ method: 'restore' });
+    window.emit('restore');
+  };
   window.showInactive = () => { window.visible = true; window.calls.push({ method: 'showInactive' }); };
   window.hide = () => { window.visible = false; window.calls.push({ method: 'hide' }); };
   window.close = () => { window.destroyed = true; window.emit('closed'); };
@@ -199,8 +217,8 @@ function createHarness(options = {}) {
     initialWindow,
     initialLauncher: launcher,
     initialSettings: options.settings || {},
-    BrowserWindow: function BrowserWindow(windowOptions) {
-      const window = createWindow({ bounds: windowOptions });
+    BrowserWindow: function BrowserWindow({ x, y, width, height, show, focusable }) {
+      const window = createWindow({ bounds: { x: x ?? 120, y: y ?? 70, width, height }, visible: show, focusable });
       createdWindows.push(window);
       return window;
     },
@@ -212,7 +230,11 @@ function createHarness(options = {}) {
       rearm: () => { hookRearms += 1; },
       apply() {}
     },
-    screen: { getCursorScreenPoint: () => ({ ...cursor }) },
+    screen: {
+      getCursorScreenPoint: () => ({ ...cursor }),
+      getDisplayMatching: () => ({ workArea: options.workArea || { x: -2048, y: -512, width: 4096, height: 2048 } }),
+      getPrimaryDisplay: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } })
+    },
     ipcMain: {
       handle: (channel, callback) => handlers.set(channel, callback),
       on: (channel, callback) => listeners.set(channel, callback)
@@ -226,16 +248,20 @@ function createHarness(options = {}) {
     clampBounds: (bounds) => ({ ...bounds }),
     // DEFAULT_SETTINGS 现在带 gamepad 分区，出厂值取自真实模块，不在这里重抄一遍
     DEFAULT_GAMEPAD,
+    DEFAULT_BEARING_LAYOUTS,
+    activeBearingLayout,
     resetGamepadSession() {},
     stopGamepadPoller() {},
-    gamepadPauses: new Set(),
-    overlayWin: null
+    gamepadPauses: new Set()
   });
   const declarations = [
     ...['DEFAULT_HOTKEYS', 'PLAYBACK_RATES', 'HOLD_PLAYBACK_RATES', 'DEFAULT_SETTINGS'].map((name) => extractConstant(mainSource, name)),
     'let settings = { ...structuredClone(DEFAULT_SETTINGS), opacity: 0.65, ...initialSettings };',
     'let win = initialWindow;',
     'let consoleWin = initialLauncher;',
+    'let overlayWin = null;',
+    'let overlayPlacing = false;',
+    'let lastBearing = null;',
     'let playbackGuest = null;',
     'let playbackToken = 0;',
     'let playbackGate = 0;',
@@ -243,6 +269,10 @@ function createHarness(options = {}) {
     'let holdSpeedActive = false;',
     'const holdSpeedSources = new Set();',
     'let immersion = false;',
+    'let immersionSession = 0;',
+    'let immersionBounds = null;',
+    'let immersionAspect = 0;',
+    'let restoredImmersionBounds = null;',
     'let hoverFaded = false;',
     'let hoverTimer = null;',
     'let hoverCandidate = false;',
@@ -251,17 +281,20 @@ function createHarness(options = {}) {
       'settingsFile', 'flushSettings', 'persist', 'playbackSettings', 'updatePlaybackSettings',
       'isPlaybackGuest', 'isPlaybackMessage', 'playbackState', 'guestPlaybackSettings',
       'publishPlaybackSettings', 'showNotice', 'cyclePlaybackRate', 'setHoldSpeed', 'cancelTemporarySpeed',
-      'applyPin', 'createWindow', 'sendTo', 'broadcast', 'floatState', 'notifyFloatState',
-      'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'setImmersion', 'registerIpc'
+      'attachPlaybackGuest', 'applyPin', 'createWindow', 'sendTo', 'broadcast', 'floatState', 'notifyFloatState',
+      'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'sameWindowBounds', 'fitImmersionWindow',
+      'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore', 'setImmersion', 'registerIpc',
+      'clearBearingOverlay', 'overlaySize', 'overlayBounds', 'createOverlay', 'showOverlay', 'setOverlayPlacing', 'setBearingEnabled'
     ].map((name) => extractFunction(mainSource, name)),
     `globalThis.testApi = {
-      createWindow, setImmersion, syncHoverFade, updateHoverFade, cyclePlaybackRate,
+      createWindow, setImmersion, fitImmersionWindow, syncHoverFade, updateHoverFade, cyclePlaybackRate,
       setHoldSpeed, cancelTemporarySpeed, guestPlaybackSettings, playbackState, registerIpc,
       getSettings: () => settings,
       getWindow: () => win,
+      getOverlay: () => overlayWin,
       setWindow: (window) => { win = window; },
       getState: () => ({ immersion, hoverFaded, holdSpeedActive, hoverTimer, hoverCandidate, hoverCandidateAt }),
-      setGuest: (guest) => { playbackGuest = guest; },
+      setGuest: attachPlaybackGuest,
       constants: { PLAYBACK_RATES, HOLD_PLAYBACK_RATES },
       savedFile: () => settingsFile()
     };`
@@ -283,11 +316,18 @@ function createHarness(options = {}) {
       api.setGuest(guest);
       return guest;
     },
-    send(channel, guest, message) {
+    send(channel, guest, message, senderFrame = guest.mainFrame) {
       assert.ok(listeners.has(channel), '缺少真实 IPC ' + channel);
-      const event = { sender: guest, senderFrame: guest.mainFrame, returnValue: undefined };
+      const event = { sender: guest, senderFrame, returnValue: undefined };
       listeners.get(channel)(event, message);
       return event.returnValue;
+    },
+    action(action, payload) {
+      return handlers.get('win:action')({}, action, payload);
+    },
+    invoke(channel, payload) {
+      assert.ok(handlers.has(channel), '缺少真实 IPC ' + channel);
+      return handlers.get(channel)({}, payload);
     },
     save(patch) {
       assert.ok(handlers.has('settings:save'), '缺少真实 settings:save');
@@ -442,6 +482,135 @@ check('重复切换同一沉浸状态幂等，无浮窗进入时通过真实创�
   assert.equal(harness.clock.pending().length, timers);
   assert.equal(harness.getWindow().resizable, false);
   assert.equal(harness.getWindow().movable, false);
+});
+
+function startImmersion(harness) {
+  harness.registerIpc();
+  const guest = harness.attachGuest();
+  const { token } = harness.send('player:settings', guest);
+  harness.setImmersion(true);
+  const { immersionSession } = guest.messages.at(-1).payload;
+  const report = (width, height) => harness.send('player:video-size', guest, { token, immersionSession, width, height });
+  return { guest, token, immersionSession, report };
+}
+
+check('等到视频尺寸再收去黑边；进入、换比例、异步事件和退出都不改保存矩形', () => {
+  const harness = createHarness({ withWindow: false });
+  harness.createWindow();
+  const window = harness.getWindow();
+  const original = window.getBounds();
+  const savedBounds = plain(harness.getSettings().bounds);
+  const { report } = startImmersion(harness);
+  report(0, 0);
+  assert.deepEqual(window.getBounds(), original);
+  report(896, 504);
+  assert.deepEqual(window.getBounds(), { ...original, y: original.y + 32, height: 504 });
+  settleHover(harness, { x: original.x + 20, y: original.y + 10 });
+  assert.equal(window.opacity, 0.65, '原黑边的光标位置不应触发变淡');
+  settleHover(harness, { x: original.x + 20, y: original.y + 50 });
+  assert.equal(window.opacity, 0.1);
+  const resizeCount = window.calls.filter((call) => call.method === 'setBounds').length;
+  report(1920, 1080);
+  report(0, 0);
+  assert.equal(window.calls.filter((call) => call.method === 'setBounds').length, resizeCount);
+  report(1280, 960);
+  assert.deepEqual(window.getBounds(), { ...original, x: original.x + 70, width: 757 });
+  harness.setImmersion(false);
+  window.emit('move');
+  window.emit('resize');
+  assert.deepEqual(window.getBounds(), original);
+  assert.deepEqual(plain(harness.getSettings().bounds), savedBounds);
+  assertNoPersistence(harness);
+  window.setBounds({ ...original, x: original.x + 1 });
+  harness.clock.advance(250);
+  assert.equal(JSON.parse(harness.fileWrites.at(-1)).bounds.x, original.x + 1);
+});
+
+check('只接受当前文档、当前沉浸会话的顶层 guest 尺寸', () => {
+  const harness = createHarness();
+  const window = harness.getWindow();
+  const original = window.getBounds();
+  const { guest, token, immersionSession, report } = startImmersion(harness);
+  const stale = { token, immersionSession, width: 896, height: 504 };
+  harness.send('player:video-size', guest, stale, {});
+  report(-1, 504);
+  report(896, Infinity);
+  assert.deepEqual(window.getBounds(), original);
+  harness.setImmersion(false);
+  report(896, 504);
+  harness.setImmersion(true);
+  report(896, 504);
+  const session = guest.messages.at(-1).payload.immersionSession;
+  harness.send('player:video-size', guest, { ...stale, immersionSession: session, token: token - 1 });
+  assert.deepEqual(window.getBounds(), original);
+  const replacement = harness.attachGuest();
+  const bootstrap = harness.send('player:settings', replacement);
+  harness.send('player:video-size', guest, { ...stale, ...bootstrap });
+  assert.deepEqual(window.getBounds(), original);
+  harness.send('player:video-size', replacement, { ...stale, ...bootstrap });
+  assert.equal(window.getBounds().height, 504);
+});
+
+check('在负坐标副屏的工作区内保持比例，工作区变化后仍能恢复原矩形', () => {
+  const workArea = { x: -1440, y: -50, width: 1440, height: 800 };
+  const harness = createHarness({ workArea, window: { bounds: { x: -410, y: 20 } } });
+  const window = harness.getWindow();
+  const original = window.getBounds();
+  const { report } = startImmersion(harness);
+  report(900, 1600);
+  let fitted = window.getBounds();
+  assert.equal(fitted.width, 320);
+  assert.equal(fitted.height, 568);
+  assert.equal(fitted.x + fitted.width, 0);
+  workArea.height = 400;
+  harness.fitImmersionWindow();
+  fitted = window.getBounds();
+  assert.equal(fitted.width, 225);
+  assert.equal(fitted.height, 400);
+  assert.equal(fitted.y, -50);
+  harness.setImmersion(false);
+  assert.deepEqual(window.getBounds(), original);
+});
+
+check('最小化期间不调整尺寸，不唤起窗口；还原后再应用比例或恢复原矩形', () => {
+  const harness = createHarness({ withWindow: false });
+  harness.createWindow();
+  const window = harness.getWindow();
+  const original = window.getBounds();
+  const savedBounds = plain(harness.getSettings().bounds);
+  const { report } = startImmersion(harness);
+  report(896, 504);
+  window.minimize();
+  const fitted = window.getBounds();
+  report(1280, 960);
+  assert.deepEqual(window.getBounds(), fitted);
+  assert.equal(window.isMinimized(), true);
+  window.restore();
+  assert.notDeepEqual(window.getBounds(), fitted);
+  window.minimize();
+  harness.setImmersion(false);
+  assert.equal(window.isMinimized(), true);
+  assert.equal(window.mouseThrough, false);
+  window.restore();
+  assert.deepEqual(window.getBounds(), original);
+  assert.deepEqual(plain(harness.getSettings().bounds), savedBounds);
+  assertNoPersistence(harness);
+});
+
+check('原窗口全屏不受沉浸适配影响', () => {
+  const harness = createHarness({ window: { fullScreen: true } });
+  const window = harness.getWindow();
+  const original = window.getBounds();
+  const { report } = startImmersion(harness);
+  report(900, 1600);
+  harness.action('fullscreen', false);
+  assert.equal(window.isFullScreen(), true);
+  assert.deepEqual(window.getBounds(), original);
+  harness.setImmersion(false);
+  assert.equal(window.isFullScreen(), true);
+  harness.action('fullscreen', false);
+  assert.equal(window.isFullScreen(), false);
+  assert.deepEqual(window.getBounds(), original);
 });
 
 check('悬停进入和离开均经过 120ms 防抖，透明度变 0.1 后恢复且不落盘', () => {
@@ -695,7 +864,7 @@ check('player:settings bootstrap 传常规值、临时值和沉浸 videoOnly 契
   harness.setImmersion(true);
   const active = plain(harness.send('player:settings', guest));
   assert.ok(active.token > token);
-  assert.deepEqual(active, { volume: 100, muted: false, playbackRate: 1.5, temporaryPlaybackRate: 2.5, videoOnly: true, token: active.token });
+  assert.deepEqual(active, { volume: 100, muted: false, playbackRate: 1.5, temporaryPlaybackRate: 2.5, videoOnly: true, token: active.token, immersionSession: 1 });
   harness.setHoldSpeed(false);
   harness.setImmersion(false);
   const restored = plain(harness.send('player:settings', guest));
@@ -783,6 +952,82 @@ check('cancelTemporarySpeed 同时恢复倍率和取消 hook 的 held 状态', (
   harness.cancelTemporarySpeed();
   assert.equal(harness.cancelledHolds(), 2);
   assertNoPersistence(harness);
+});
+
+check('方位显示已开启时，手动启动跟跑自动显示叠加层并补发首个方向', () => {
+  const harness = createHarness({ withWindow: false });
+  harness.getSettings().bearing.enabled = true;
+  harness.registerIpc();
+  assert.equal(harness.getOverlay(), null);
+  harness.action('start-float');
+  const videoWindow = harness.getWindow();
+  const layout = activeBearingLayout(harness.getSettings().bearing);
+  const payload = { layoutId: layout.id, revision: layout.revision, angle: 120, view: 90 };
+  harness.send('overlay:bearing', videoWindow.webContents, payload);
+  videoWindow.emit('ready-to-show');
+  const overlay = harness.getOverlay();
+  assert.ok(overlay, '已保存的开关必须在启动浮窗时生效');
+  assert.equal(overlay.isVisible(), false);
+  harness.action('start-float');
+  assert.equal(harness.getOverlay(), overlay);
+  assert.equal(harness.createdWindows.length, 2);
+  overlay.finishLoad();
+  assert.equal(overlay.isVisible(), true);
+  assert.equal(overlay.mouseThrough, true);
+  assert.deepEqual(overlay.messages, [
+    { channel: 'mode', payload: 'lock' },
+    { channel: 'bearing', payload }
+  ]);
+  assertNoPersistence(harness);
+});
+
+check('关闭再启动跟跑重建方位叠加层，不沿用放置模式和旧方向', () => {
+  const harness = createHarness({ withWindow: false });
+  harness.getSettings().bearing.enabled = true;
+  harness.registerIpc();
+  harness.action('start-float');
+  const firstVideo = harness.getWindow();
+  firstVideo.emit('ready-to-show');
+  const firstOverlay = harness.getOverlay();
+  assert.ok(firstOverlay);
+  firstOverlay.finishLoad();
+  assert.equal(harness.invoke('overlay:place', true), true);
+  const layout = activeBearingLayout(harness.getSettings().bearing);
+  harness.send('overlay:bearing', firstVideo.webContents, { layoutId: layout.id, revision: layout.revision, angle: 180 });
+  harness.action('stop-float');
+  assert.equal(firstOverlay.isDestroyed(), true);
+  assert.equal(harness.getOverlay(), null);
+  assert.equal(harness.getSettings().bearing.enabled, true);
+  harness.action('start-float');
+  harness.getWindow().emit('ready-to-show');
+  const secondOverlay = harness.getOverlay();
+  assert.ok(secondOverlay);
+  assert.notEqual(secondOverlay, firstOverlay);
+  secondOverlay.finishLoad();
+  assert.equal(secondOverlay.isVisible(), true);
+  assert.equal(secondOverlay.mouseThrough, true);
+  assert.equal(secondOverlay.focusable, false);
+  assert.equal(harness.invoke('overlay:place-state'), false);
+  assert.deepEqual(secondOverlay.messages, [{ channel: 'mode', payload: 'lock' }]);
+  assertNoPersistence(harness);
+});
+
+check('方位关闭时启动不创建叠加层，加载期间关闭不再被回调显示', () => {
+  const harness = createHarness({ withWindow: false });
+  harness.registerIpc();
+  harness.action('start-float');
+  harness.getWindow().emit('ready-to-show');
+  assert.equal(harness.getOverlay(), null);
+  harness.invoke('overlay:enable', true);
+  const overlay = harness.getOverlay();
+  assert.ok(overlay);
+  harness.invoke('overlay:enable', false);
+  overlay.finishLoad();
+  overlay.emit('ready-to-show');
+  assert.equal(overlay.isVisible(), false);
+  harness.invoke('overlay:enable', true);
+  assert.equal(harness.getOverlay(), overlay);
+  assert.equal(overlay.isVisible(), true);
 });
 
 check('真实窗口 closed 回调清理临时倍速、沉浸与悬停 timer', () => {

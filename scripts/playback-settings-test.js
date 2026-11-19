@@ -9,6 +9,7 @@ const { EventEmitter } = require('node:events');
 const { normalizeAccelerator, mergeHotkeys, prepareHotkeyUpdate } = require('../src/hotkey-config');
 const { DEFAULT_GAMEPAD, mergeGamepadSettings } = require('../src/gamepad-config');
 
+const { DEFAULT_BEARING_LAYOUTS, loadBearingLayouts } = require('../src/bearing-layouts');
 const projectRoot = path.resolve(__dirname, '..');
 const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8');
 const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gifa-playback-settings-'));
@@ -151,10 +152,12 @@ function createHarness(options = {}) {
     hookHotkeys: { apply() {}, cancelHeld: () => { heldCancellations += 1; } },
     resetGamepadSession() {},
     stopGamepadPoller() {},
-    DEFAULT_GAMEPAD
+    DEFAULT_GAMEPAD,
+    DEFAULT_BEARING_LAYOUTS,
+    loadBearingLayouts
   });
   const declarations = [
-    ...['DEFAULT_HOTKEYS', 'HOLD_PLAYBACK_RATES', 'LEGACY_SEED_ROIS', 'DEFAULT_SETTINGS'].map((name) => extractConstant(mainSource, name)),
+    ...['DEFAULT_HOTKEYS', 'HOLD_PLAYBACK_RATES', 'DEFAULT_SETTINGS'].map((name) => extractConstant(mainSource, name)),
     'let settings = structuredClone(DEFAULT_SETTINGS);',
     'let saveTimer = null;',
     'let win = null;',
@@ -164,10 +167,12 @@ function createHarness(options = {}) {
     'let holdSpeedActive = false;',
     'const holdSpeedSources = new Set();',
     'let immersion = false;',
+    'let immersionAspect = 0;',
+    'let immersionSession = 1;',
     'let hoverFaded = false;',
     'let hoverTimer = null;',
     ...[
-      'dropLegacySeeds', 'noteWatched', 'playbackSettings', 'updatePlaybackSettings',
+      'noteWatched', 'playbackSettings', 'updatePlaybackSettings',
       'settingsFile', 'loadSettings', 'flushSettings', 'persist', 'isPlaybackGuest',
       'isPlaybackMessage', 'playbackState', 'guestPlaybackSettings', 'floatState', 'notifyFloatState',
       'publishPlaybackSettings', 'showNotice', 'setHoldSpeed', 'cancelTemporarySpeed',
@@ -763,7 +768,7 @@ try {
     harness.setImmersion(true);
     assert.deepEqual(plain(harness.floatState()), { running: true, immersion: true, hoverFaded: false });
     assertBootstrap(harness.send('player:settings', guest), {
-      volume: 100, muted: false, playbackRate: 1.25, temporaryPlaybackRate: 3, videoOnly: true
+      volume: 100, muted: false, playbackRate: 1.25, temporaryPlaybackRate: 3, videoOnly: true, immersionSession: 1
     });
     harness.quit();
     assert.equal(harness.heldCancellations(), 1);

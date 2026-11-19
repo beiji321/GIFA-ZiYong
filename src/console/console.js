@@ -20,13 +20,18 @@ const state = {
 
 /** 自动定心失败的原因 → 给用户看的话 */
 const AUTO_CENTER_FAIL = {
-  paused: '视频没在播放，先播放再点自动定心',
-  timeout: '没学会圆心：画面里可能没有小地图，或角色一直没转向，再点一次并让角色转个身',
+  paused: '请先播放一段有小地图的画面',
+  timeout: '没能对准：请播放一段小地图清楚、角色有转向的画面再试',
   disabled: '先打开「显示方位箭头」',
-  'no-roi': '还没框选视频里的小地图',
+  'no-roi': '没有可用的视频小地图布局',
   'no-video': '浮窗里还没载入视频，先启动跟跑',
-  reset: '已取消',
-  'save-failed': '已对准，但写入标定失败'
+  'save-failed': '布局已切换或修改，本次结果未保存'
+};
+
+const LAYOUT_FAIL = {
+  name: '请填写布局名称',
+  duplicate: '已有同名布局，请换个名字',
+  invalid: '布局已变更，请重新选择'
 };
 
 /* ------------------------------------------------------------------ 启动 */
@@ -78,12 +83,10 @@ async function init() {
   window.api.onFloatState(setFloatState);
   window.api.onNotice((text) => toast(text));
   window.api.onLogin((nav) => applyNav(nav));
-  // 「③ 自动定心」的结果：主进程写标定成功后还会广播 settings，这里只负责告诉用户
-  window.api.onAutoCenterResult((r) => {
-    if (!r) return;
-    if (r.ok && r.applied) toast(`自动定心完成：圆心已修正 (${r.dx}, ${r.dy})px，已记住`);
-    else if (r.ok) toast('圆心本来就对准了，不用调整');
-    else toast(AUTO_CENTER_FAIL[r.reason] || '自动定心没成功，再试一次', true);
+  window.api.onAutoCenterResult((result) => {
+    if (!result) return;
+    if (result.ok) toast('圆心已对准，布局已更新');
+    else toast(AUTO_CENTER_FAIL[result.reason] || '没能对准圆心，请稍后再试', true);
   });
   // 浮窗改了设置（比如按热键切了穿透）就同步回界面
   window.api.onSettingsChanged((next) => {
@@ -197,8 +200,7 @@ async function launch() {
       renderParts();
       renderLastWatched(state.boot.settings);
       updateVideoMeta();
-      // 换视频后「已标定 N 处」要按新视频的记录重算，否则一直显示上一个视频的数字
-      fillSettings(state.boot.settings);
+
     }
 
     await window.api.action('start-float');
@@ -322,6 +324,7 @@ function updateVideoMeta() {
 
 function setFloatState(next) {
   const current = typeof next === 'boolean' ? { running: next } : next || {};
+  if (state.floatRunning && !current.running) renderPlaceButton(false);
   state.floatRunning = !!current.running;
   state.immersion = state.floatRunning && !!current.immersion;
   state.hoverFaded = state.immersion && !!current.hoverFaded;
@@ -338,11 +341,28 @@ function setFloatState(next) {
 
 /* ---------------------------------------------------------------- 设置 */
 
-/** 当前视频真正生效的识别区域：优先视频专属记录，其次全局 —— 跟浮窗里 roisFor() 保持一致 */
-function effectiveRois(b, videoId) {
-  const own = videoId && b.roiBy ? b.roiBy[videoId] : null;
-  if (Array.isArray(own) && own.length) return own;
-  return Array.isArray(b.rois) ? b.rois : [];
+function currentLayout() {
+  const bearing = state.boot.settings.bearing;
+  return bearing.layouts.find((layout) => layout.id === bearing.activeLayoutId);
+}
+
+function renderLayouts(bearing) {
+  const select = $('bearingLayout');
+  const current = currentLayout();
+  const options = bearing.layouts.map((layout) => {
+    const option = document.createElement('option');
+    option.value = layout.id;
+    option.textContent = layout.name;
+    return option;
+  });
+  select.replaceChildren(...options);
+  select.value = current?.id || '';
+  $('btnLayoutDefault').disabled = !current || current.id === bearing.defaultLayoutId;
+  const canEdit = current && !current.builtIn;
+  for (const id of ['btnPickRoi', 'btnRenameLayout', 'btnDeleteLayout']) $(id).disabled = !canEdit;
+  $('layoutStatus').textContent = current?.centered
+    ? '当前布局已对准圆心，可用于同布局的视频。'
+    : '启用方位箭头后，播放含小地图的片段即可自动定心。';
 }
 
 /**
@@ -362,7 +382,7 @@ function renderPlaybackHints() {
   const holdKey = prettify(hotkeys.holdSpeed ?? 'F8');
   const cycleKey = prettify(hotkeys.cycleSpeed ?? 'Alt+S');
   $('immersionHint').textContent =
-    `按 ${immersionKey} 进入或退出，只保留视频、鼠标穿透，无法拖动或缩放；也可在这里关闭。`;
+    `按 ${immersionKey} 进入或退出。窗口贴合视频比例并穿透鼠标，退出后恢复原位置和大小。`;
   $('holdRateHint').textContent =
     `按住 ${holdKey} 临时加速，松开恢复常规倍速；临时值不会替换保存的常规倍速。`;
   $('cycleSpeedHint').textContent =
@@ -393,14 +413,7 @@ function fillSettings(settings) {
   $('setBearingSize').value = String(b.radius ?? 110);
   $('sizeVal').textContent = String(b.radius ?? 110);
 
-  // 数量要按「这个视频实际会用到的」算，直接用全局 rois 会和浮窗对不上
-  const n = effectiveRois(b, state.video && state.video.id).length;
-  const done = !!(b.calibrated && n);
-  $('btnPickRoi').textContent = done
-    ? `① 框选小地图（已标定 ${n} 处）`
-    : '① 框选视频里的小地图（未标定）';
-  // 标定过的那一步打个绿勾，一眼能看出两步走到哪了
-  $('btnPickRoi').classList.toggle('done', done);
+  renderLayouts(b);
 
   for (const id of ['setOpacity', 'setVolume', 'setBearingSize']) paintRange($(id));
 }
@@ -461,7 +474,7 @@ function wireSettings() {
  */
 function renderPlaceButton(placing) {
   state.placing = !!placing;
-  $('btnPlace').textContent = placing ? '锁定位置' : '② 拖到我的游戏小地图上';
+  $('btnPlace').textContent = placing ? '锁定位置' : '摆放方位标记';
   // 摆放中整颗按钮高亮，提醒「再点一次才算锁定」
   $('btnPlace').classList.toggle('active', !!placing);
 }
@@ -474,22 +487,54 @@ async function syncPlaceButton() {
   }
 }
 
-function wireBearing() {
-  $('setBearing').addEventListener('change', async (e) => {
-    const on = e.target.checked;
-    state.boot.settings.bearing = await window.api.overlayEnable(on);
+async function changeLayout(command, message) {
+  try {
+    const result = await window.api.updateBearingLayout(command);
+    if (result.bearing) state.boot.settings.bearing = result.bearing;
+    fillSettings(state.boot.settings);
+    if (!result.ok) toast(LAYOUT_FAIL[result.reason] || '布局未保存，请重试', true);
+    else if (message) toast(message);
+    return result.ok;
+  } catch {
+    fillSettings(state.boot.settings);
+    toast('布局未保存，请重试', true);
+    return false;
+  }
+}
 
-    // 关掉箭头时主进程会强制退出放置模式，按钮得跟着复位
-    if (!on) {
-      await syncPlaceButton();
-      return;
+function showLayoutNameForm(mode) {
+  const form = $('layoutNameForm');
+  const layout = currentLayout();
+  form.dataset.mode = mode;
+  form.dataset.id = layout?.id || '';
+  $('layoutName').value = mode === 'rename' ? layout.name : '';
+  $('btnSaveLayoutName').textContent = mode === 'rename' ? '保存名称' : '去框选';
+  form.hidden = false;
+  $('layoutName').focus();
+  $('layoutName').select();
+}
+
+async function startLayoutCalibration(command) {
+  try {
+    const result = await window.api.action('calib', command);
+    if (result === true) return true;
+    if (result === 'click-through') {
+      toast('请先在「浮窗」关闭鼠标穿透，再框选', true);
+      return false;
     }
-    if (!state.boot.settings.bearing.calibrated) {
-      toast('还没标定过，现在把浮窗叫起来框一次');
-      window.api.action('calib');
-    } else {
-      toast('方位箭头已开启');
-    }
+  } catch {
+    toast('未能打开框选，请重试', true);
+    return false;
+  }
+  toast('请先启动跟跑并找到视频里的小地图', true);
+  return false;
+}
+
+function wireBearing() {
+  $('setBearing').addEventListener('change', async (event) => {
+    const on = event.target.checked;
+    state.boot.settings.bearing = await window.api.overlayEnable(on);
+    if (on) toast(`已开启方位箭头 · ${currentLayout().name}`);
     fillSettings(state.boot.settings);
     await syncPlaceButton();
   });
@@ -500,19 +545,46 @@ function wireBearing() {
     window.api.overlayRadius(v);
   });
 
+  $('bearingLayout').addEventListener('change', (event) => {
+    $('layoutNameForm').hidden = true;
+    changeLayout({ op: 'select', id: event.target.value });
+  });
+  $('btnLayoutDefault').addEventListener('click', () => {
+    changeLayout({ op: 'default', id: currentLayout().id }, '下次启动会使用此布局');
+  });
+  $('btnNewLayout').addEventListener('click', () => showLayoutNameForm('create'));
+  $('btnRenameLayout').addEventListener('click', () => showLayoutNameForm('rename'));
+  $('btnCancelLayoutName').addEventListener('click', () => { $('layoutNameForm').hidden = true; });
+  $('layoutNameForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const name = $('layoutName').value.trim().replace(/\s+/g, ' ');
+    if (!name) return toast(LAYOUT_FAIL.name, true);
+    const op = form.dataset.mode;
+    const id = form.dataset.id;
+    if (state.boot.settings.bearing.layouts.some((layout) =>
+      (op !== 'rename' || layout.id !== id) && layout.name.toLowerCase() === name.toLowerCase()
+    )) return toast(LAYOUT_FAIL.duplicate, true);
+    const ok = op === 'rename'
+      ? await changeLayout({ op, id, name }, '已保存布局名称')
+      : await startLayoutCalibration({ op: 'create', name });
+    if (ok) form.hidden = true;
+  });
+  $('btnDeleteLayout').addEventListener('click', () => {
+    const layout = currentLayout();
+    if (layout && window.confirm(`删除布局「${layout.name}」？`)) {
+      changeLayout({ op: 'remove', id: layout.id }, '已删除布局');
+    }
+  });
   $('btnPickRoi').addEventListener('click', () => {
-    window.api.action('calib');
-    toast('在浮窗里拖金色圆环套住小地图，滚轮调大小');
+    const layout = currentLayout();
+    if (layout) startLayoutCalibration({ op: 'calibrate', id: layout.id });
   });
 
-  // ③ 自动定心：用户主动点，跑一次、算准就停；结果由主进程写进这个视频的标定
-  $('btnAutoCenter').addEventListener('click', () => {
-    if (!state.boot.settings.bearing.enabled) {
-      toast('先打开「显示方位箭头」', true);
-      return;
-    }
-    window.api.action('autocenter');
-    toast('开始自动定心：保持视频播放，角色走动 / 转身更容易成功（5~20 秒）', 6000);
+  $('btnAutoCenter').addEventListener('click', async () => {
+    if (!state.boot.settings.bearing.enabled) return toast(AUTO_CENTER_FAIL.disabled, true);
+    if (!(await window.api.action('autocenter'))) toast(AUTO_CENTER_FAIL['no-video'], true);
+    else toast('正在对准：请保持视频播放，有转向的画面更容易成功');
   });
 
   $('btnPlace').addEventListener('click', async () => {
@@ -542,19 +614,6 @@ function wireBearing() {
     toast(`导出目录：${dir}`);
   });
 
-  $('btnClearRoi').addEventListener('click', async () => {
-    // 必须带上 videoId：主进程要靠它删掉 roiBy 里的专属记录，
-    // 否则取区域时优先读 roiBy，清了等于没清，重载视频又回来。
-    const videoId = state.video && state.video.id ? state.video.id : '';
-    await window.api.save({ bearing: { rois: [], calibrated: false, videoId } });
-    state.boot.settings.bearing.rois = [];
-    state.boot.settings.bearing.calibrated = false;
-    if (videoId && state.boot.settings.bearing.roiBy) {
-      delete state.boot.settings.bearing.roiBy[videoId];
-    }
-    fillSettings(state.boot.settings);
-    toast('已清除标定，点「① 框选」重新框一次');
-  });
 }
 
 /* --------------------------------------------------------------- 热键 */

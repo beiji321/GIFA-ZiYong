@@ -6,7 +6,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 const { spawn } = require('node:child_process');
+const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
 
 if (!process.versions.electron) {
@@ -31,7 +33,7 @@ if (!process.versions.electron) {
 }
 
 async function runElectron() {
-  const { app, BrowserWindow, ipcMain } = require('electron');
+  const { app, BrowserWindow, ipcMain, screen } = require('electron');
   const temporaryRoot = process.argv[2];
   assert.ok(path.basename(temporaryRoot).startsWith('gifa-playback-media-'));
   app.setPath('userData', path.join(temporaryRoot, 'profile'));
@@ -47,16 +49,21 @@ async function runElectron() {
   const reports = [];
   const preloadErrors = [];
   const readyWaiters = [];
+  const videoSizes = [];
+  const sizeWaiters = new Set();
+  const sourceDir = path.resolve(__dirname, '../src');
   app.on('web-contents-created', (_event, contents) => {
     contents.on('render-process-gone', (_goneEvent, details) => console.error('render-process-gone', details));
   });
   const host = new BrowserWindow({
-    show: false,
-    webPreferences: { webviewTag: true, backgroundThrottling: false }
+    x: 120, y: 70, width: 896, height: 568, frame: false, titleBarStyle: 'hidden', show: false,
+    minWidth: 240, minHeight: 150,
+    webPreferences: { webviewTag: true, backgroundThrottling: false, preload: path.join(sourceDir, 'preload.js') }
   });
+  const immersion = loadImmersionHarness(host, screen, sourceDir, () => ({ ...preferences }));
   host.webContents.on('did-attach-webview', (_event, contents) => {
     guest = contents;
-    guest.setAudioMuted(true);
+    immersion.attachPlaybackGuest(guest);
     guest.on('preload-error', (_preloadEvent, _preloadPath, error) => preloadErrors.push(error.message));
     guest.on('console-message', (details) => {
       if (details.level === 'error') console.error('[guest]', details.message);
@@ -66,8 +73,12 @@ async function runElectron() {
     assert.equal(event.sender, guest, 'preload 必须在 guest 已附加后启动');
     assert.equal(event.sender.hostWebContents, host.webContents, '实际 guest 的宿主必须匹配');
     assert.equal(event.senderFrame, event.sender.mainFrame, '实际 IPC 主框架身份必须匹配');
-    event.sender.setAudioMuted(true);
-    event.returnValue = { ...preferences, token: 1 };
+    immersion.onSettings(event);
+  });
+  ipcMain.on('player:video-size', (event, message) => {
+    immersion.onVideoSize(event, message);
+    videoSizes.push(message);
+    for (const waiter of sizeWaiters) waiter();
   });
   ipcMain.on('player:gating', (event) => event.sender.setAudioMuted(true));
   ipcMain.on('player:ready', (event) => {
@@ -107,16 +118,45 @@ async function runElectron() {
       for (const type of ['play', 'playing', 'loadedmetadata']) {
         media.addEventListener(type, () => observed.push({ type, volume: media.volume, rate: media.playbackRate }));
       }
+      const fixture = document.createElement('canvas');
+      const ctx = fixture.getContext('2d', { alpha: false });
+      function paintFixture() {
+        ctx.fillStyle = '#20c070'; ctx.fillRect(0, 0, fixture.width, fixture.height);
+        ctx.fillStyle = '#ee932f'; ctx.fillRect(0, 0, 20, fixture.height);
+        ctx.fillStyle = '#df2374'; ctx.fillRect(0, 0, fixture.width, 20);
+      }
+      setInterval(paintFixture, 30);
+      window.showFixture = async (width, height, replace = false) => {
+        let media = document.querySelector('video');
+        if (replace) {
+          const replacement = document.createElement('video');
+          replacement.style.cssText = media.style.cssText;
+          media.replaceWith(replacement);
+          media = replacement;
+        }
+        fixture.width = width;
+        fixture.height = height;
+        paintFixture();
+        if (!media.srcObject) {
+          media.removeAttribute('src');
+          media.srcObject = fixture.captureStream(30);
+          await media.play();
+        }
+      };
     </script></body></html>`);
-  fs.writeFileSync(hostPath, '<!doctype html><html><body></body></html>');
+  const styles = pathToFileURL(path.join(sourceDir, 'renderer', 'style.css')).href;
+  fs.writeFileSync(hostPath, `<!doctype html><link rel="stylesheet" href="${styles}">
+    <div id="app"><main id="stage"></main></div><script>
+      window.api.onWinState(({ immersion }) => document.getElementById('app').classList.toggle('video-only', immersion));
+    </script>`);
   await host.loadURL(pathToFileURL(hostPath).href);
-  const preloadUrl = pathToFileURL(path.resolve(__dirname, '../src/webview-preload.js')).href;
+  const preloadUrl = pathToFileURL(path.join(sourceDir, 'webview-preload.js')).href;
   await host.webContents.executeJavaScript(`{
     const view = document.createElement('webview');
     view.id = 'test-player';
     view.setAttribute('preload', ${JSON.stringify(preloadUrl)});
     view.setAttribute('src', ${JSON.stringify(pathToFileURL(pagePath).href)});
-    document.body.appendChild(view);
+    document.getElementById('stage').appendChild(view);
     void 0;
   }`);
 
@@ -143,6 +183,63 @@ async function runElectron() {
   async function waitForReports(count) {
     await guest.executeJavaScript(`new Promise((resolve) => setTimeout(resolve, 50))`);
     assert.equal(reports.length, count);
+  }
+
+  async function waitForVideoSize(width, height, since) {
+    const matches = () => videoSizes.slice(since).some((size) => size.width === width && size.height === height);
+    if (matches()) return;
+    let check;
+    try {
+      await withTimeout(new Promise((resolve) => {
+        check = () => { if (matches()) resolve(); };
+        sizeWaiters.add(check);
+      }), `等待视频尺寸 ${width}×${height}`);
+    } finally {
+      sizeWaiters.delete(check);
+    }
+  }
+
+  async function expectUncroppedVideo(width, height, replace = false) {
+    const since = videoSizes.length;
+    await guest.executeJavaScript(`showFixture(${width}, ${height}, ${replace})`);
+    await waitForVideoSize(width, height, since);
+    await withTimeout(guest.executeJavaScript(`new Promise((resolve) => {
+      function waitForPaint() {
+        const media = document.querySelector('video');
+        if (media.readyState < 2 || Math.abs(innerHeight - innerWidth * ${height} / ${width}) > 4) {
+          setTimeout(waitForPaint, 25);
+          return;
+        }
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }
+      waitForPaint();
+    })`), '等待适配窗口渲染');
+    const image = await guest.capturePage();
+    const scaleFactor = Math.max(...image.getScaleFactors());
+    const pixels = image.toBitmap({ scaleFactor });
+    const imageSize = image.getSize(scaleFactor);
+    assert.equal(pixels.length, imageSize.width * imageSize.height * 4);
+    const pixel = (column, row) => {
+      const offset = (row * imageSize.width + column) * 4;
+      return pixels.subarray(offset, offset + 3);
+    };
+    const midX = Math.floor(imageSize.width / 2);
+    const midY = Math.floor(imageSize.height / 2);
+    const black = (sample) => sample.every((value) => value < 12);
+    const sides = [offset => pixel(midX, offset), offset => pixel(midX, imageSize.height - 1 - offset),
+      offset => pixel(offset, midY), offset => pixel(imageSize.width - 1 - offset, midY)];
+    const bars = sides.map((sample) => {
+      let size = 0;
+      while (size < 5 && black(sample(size))) size += 1;
+      return size;
+    });
+    const label = `${width}×${height} → ${imageSize.width}×${imageSize.height}，黑边上/下/左/右：${bars.join('/')}`;
+    assert.ok(bars.every((size) => size <= Math.ceil(scaleFactor)), label);
+    const top = pixel(midX, bars[0] + 3);
+    const left = pixel(bars[2] + 3, midY);
+    assert.ok(top[2] > 160 && top[1] < 90, '顶部标记不得被裁掉；' + label);
+    assert.ok(left[2] > 160 && left[1] > 90, '左侧标记不得被裁掉；' + label);
+    console.log('PASS  沉浸保留视频边缘，' + label);
   }
 
   try {
@@ -294,8 +391,10 @@ async function runElectron() {
     await expectMedia('松开后回到最新常规倍率且不额外保存', { rate: 1.5, defaultRate: 1.5 });
     await waitForReports(5);
 
-    guest.send('player', { cmd: 'presentation', videoOnly: true });
-    await guest.executeJavaScript(`new Promise((resolve) => setTimeout(resolve, 50))`);
+    const originalBounds = host.getBounds();
+    const startSizes = videoSizes.length;
+    assert.equal(immersion.setImmersion(true), true);
+    await waitForVideoSize(0, 0, startSizes);
     const presentation = await guest.executeJavaScript(`(() => {
       const media = document.querySelector('video');
       const overlay = document.createElement('div');
@@ -308,18 +407,86 @@ async function runElectron() {
     })()`);
     assert.equal(presentation.controls, 'hidden');
     assert.equal(presentation.video, 'visible');
-    assert.equal(presentation.width, presentation.viewportWidth);
-    assert.equal(presentation.height, presentation.viewportHeight);
-    console.log('PASS 沉浸时隐藏网页控件，视频覆盖整个访客区域');
-    guest.send('player', { cmd: 'presentation', videoOnly: false });
+    assert.ok(Math.abs(presentation.width - presentation.viewportWidth) < 1);
+    assert.ok(Math.abs(presentation.height - presentation.viewportHeight) < 1);
+    assert.deepEqual(host.getBounds(), originalBounds);
+    console.log('PASS 沉浸在视频未就绪时隐藏控件，暂不调整窗口');
+
+    await expectUncroppedVideo(896, 504);
+    assert.ok(host.getBounds().height < originalBounds.height - 30);
+    await expectUncroppedVideo(960, 720);
+    await expectUncroppedVideo(504, 896, true);
+
+    previous = released;
+    const sizesBeforeReload = videoSizes.length;
+    const fittedBeforeReload = host.getBounds();
+    await guest.reload();
+    await waitForReady(previous);
+    await waitForVideoSize(0, 0, sizesBeforeReload);
+    assert.deepEqual(host.getBounds(), fittedBeforeReload);
+    assert.equal(await guest.executeJavaScript(`getComputedStyle(document.querySelector('video')).objectFit`), 'contain');
+    await expectUncroppedVideo(896, 504);
+
+    assert.equal(immersion.setImmersion(false), false);
+    assert.deepEqual(host.getBounds(), originalBounds);
+    await guest.executeJavaScript(`{
+      const controls = document.createElement('div');
+      controls.id = 'fake-player-controls';
+      document.body.appendChild(controls);
+    }`);
     await guest.executeJavaScript(`new Promise((resolve) => setTimeout(resolve, 50))`);
     assert.equal(await guest.executeJavaScript(`getComputedStyle(document.getElementById('fake-player-controls')).visibility`), 'visible');
     console.log('PASS 退出沉浸恢复网页控件，不残留隐藏样式');
+
+    const sizesBeforeEntry = videoSizes.length;
+    assert.equal(immersion.setImmersion(true), true);
+    await waitForVideoSize(896, 504, sizesBeforeEntry);
+    const minimized = once(host, 'minimize');
+    host.minimize();
+    await withTimeout(minimized, '等待测试窗口最小化');
+    assert.equal(immersion.setImmersion(false), false);
+    assert.equal(host.isMinimized(), true);
+    const restored = once(host, 'restore');
+    host.restore();
+    await withTimeout(restored, '等待测试窗口还原');
+    assert.deepEqual(host.getBounds(), originalBounds);
+    console.log('PASS 最小化时退出不唤醒窗口，还原后恢复原位置和尺寸');
     console.log('媒体回归全部通过');
   } finally {
     host.destroy();
     app.quit();
   }
+}
+
+function loadImmersionHarness(host, screen, sourceDir, guestPlaybackSettings) {
+  const listeners = new Map();
+  const context = vm.createContext({
+    win: host, consoleWin: null, screen, guestPlaybackSettings,
+    playbackGuest: null, playbackToken: 0, playbackGate: 0,
+    immersion: false, immersionSession: 0, immersionBounds: null, immersionAspect: 0, restoredImmersionBounds: null,
+    hoverFaded: false, hoverTimer: null, hoverCandidate: false, hoverCandidateAt: 0,
+    settings: { opacity: 1, clickThrough: false, hoverFadeEnabled: false, hotkeys: {} },
+    setInterval, clearInterval,
+    ipcMain: { on: (name, listener) => listeners.set(name, listener), handle() {} }
+  });
+  const source = fs.readFileSync(path.join(sourceDir, 'main.js'), 'utf8');
+  const names = [
+    'isPlaybackGuest', 'isPlaybackMessage', 'attachPlaybackGuest', 'sendTo', 'broadcast', 'showNotice',
+    'floatState', 'notifyFloatState', 'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade',
+    'sameWindowBounds', 'fitImmersionWindow', 'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore',
+    'setImmersion', 'registerIpc'
+  ];
+  for (const name of names) {
+    const definition = new RegExp(`^function ${name}\\([^)]*\\) \\{[\\s\\S]*?^\\}`, 'm').exec(source);
+    assert.ok(definition, `找不到主进程函数 ${name}`);
+    vm.runInContext(definition[0], context);
+  }
+  context.registerIpc();
+  host.on('restore', context.syncImmersionBoundsAfterRestore);
+  return {
+    attachPlaybackGuest: context.attachPlaybackGuest, setImmersion: context.setImmersion,
+    onSettings: listeners.get('player:settings'), onVideoSize: listeners.get('player:video-size')
+  };
 }
 
 function withTimeout(promise, label) {

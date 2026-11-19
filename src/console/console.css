@@ -494,17 +494,16 @@ label.setting { cursor: pointer; }
   border-width: 1.5px 1.5px 0 0;
   transform: translateY(-50%) rotate(45deg);
 }
-/* 已标定：箭头换成绿色对勾（console.js 的 fillSettings 切 .done） */
-.step-btn.done { border-color: rgba(108, 203, 95, 0.4); }
-/* 第三颗「③ 自动定心」横跨两列：它是主流程的收尾动作，比排查工具重要 */
-.step-btn.span2 { grid-column: 1 / -1; }
-.step-btn.done::after {
-  width: 5px;
-  height: 9px;
-  border-color: var(--green);
-  border-width: 0 1.8px 1.8px 0;
-  transform: translateY(-65%) rotate(45deg);
+.layout-row {
+  flex: 1 0 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-left: 32px;
 }
+.layout-row[hidden] { display: none; }
+.layout-row .sel, .layout-row input[type="text"] { flex: 0 1 280px; }
 /* 正在摆放红圈：整颗按钮变成强调色，提醒「再点一次才锁定」 */
 .step-btn.active,
 .step-btn.active:hover:not(:disabled) {
