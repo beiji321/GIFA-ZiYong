@@ -21,9 +21,13 @@
     "test:data-dir": "node scripts/data-dir-test.js",
     "test:playback": "node scripts/playback-settings-test.js && node scripts/playback-media-test.js",
     "test:login": "node scripts/login-test.js",
+    "test:sandbox": "node scripts/sandbox-fallback-test.js && node scripts/sandbox-fallback-live-test.js",
+    "test:gamepad": "node scripts/gamepad-poller-test.js && node --test scripts/gamepad-controls-test.js",
     "test:controls": "node scripts/hold-hotkeys-test.js && node scripts/hotkey-config-test.js && node scripts/immersion-speed-test.js",
     "test:autocenter": "node scripts/vision-probe/autocenter-500.js",
-    "test:cone": "node scripts/vision-probe/cone-edge-regress.js"
+    "test:cone": "node scripts/vision-probe/cone-edge-regress.js",
+    "test:snow": "node scripts/vision-probe/snow-sample-regress.js",
+    "test:bearing-view": "node scripts/vision-probe/view-pending-test.js && node scripts/vision-probe/bearing-invalid-view-test.js"
   },
   "devDependencies": {
     "electron": "^45.0.0",

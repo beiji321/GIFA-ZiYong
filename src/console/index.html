@@ -910,6 +910,27 @@
                 </p>
               </div>
             </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                <div class="card-heading">
+                  <h2>手柄快捷键 <span class="hint">按住 L3 弹出圆盘</span></h2>
+                  <p>推右摇杆指向方位，回中触发；一个动作可以绑到多个方位</p>
+                </div>
+                <button id="btnResetGp" class="small head-action">恢复默认</button>
+              </div>
+              <div class="card-body">
+                <div class="gp-body">
+                  <canvas id="gpDisc" class="gp-disc"></canvas>
+                  <div id="gpList" class="hk-list gp-list"></div>
+                </div>
+                <p class="tip">
+                  左边就是弹出后的圆盘：扇区上的 <b>n</b> 是正北（向上推右摇杆），<b>e</b> 是正东，其余依此类推。圆盘只在按住 L3 时出现，抬起即收起；未回中就抬杆算取消，不会触发。
+                  改完立刻生效，不用重启。<b>长按加速</b>反过来用：推过锁存线就开始临时加速，回中、滑到别的方向或抬起 L3 才恢复原倍速 —— 加速多久就是摇杆推多久。
+                </p>
+              </div>
+            </section>
           </div>
         </div>
 
@@ -917,6 +938,8 @@
     </div>
 
     <div id="toast"></div>
+    <!-- 手柄卡片里的圆盘参考图和浮窗共用同一套画法，见 src/disc/disc-draw.js -->
+    <script src="../disc/disc-draw.js"></script>
     <script src="console.js"></script>
   </body>
 </html>

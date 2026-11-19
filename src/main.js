@@ -10,6 +10,7 @@ const {
   BrowserWindow,
   Menu,
   Tray,
+  dialog,
   globalShortcut,
   ipcMain,
   nativeImage,
@@ -25,7 +26,10 @@ const fs = require('node:fs');
 const { execFileSync, spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const hookHotkeys = require('./hook-hotkeys');
+const gamepad = require('./gamepad');
 const { mergeHotkeys, prepareHotkeyUpdate } = require('./hotkey-config');
+const { DEFAULT_GAMEPAD, GAMEPAD_ACTION_ALLOWLIST, L3_BUTTON_INDEX, mergeGamepadSettings, createChordState, stepChord, isHoldAction } = require('./gamepad-config');
+const sandboxFallback = require('./sandbox-fallback');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -334,6 +338,11 @@ app.setPath('userData', USER_DATA_DIR);
 app.setPath('sessionData', USER_DATA_DIR);
 /* [DATA-DIR-END] ---------------------------------------------------------- */
 
+// 管理员权限下，部分 Windows 起不了 Chromium 沙箱子进程：GPU 进程连续 launch-failed，
+// 约一秒后主进程被 Chromium 主动结束，用户只看到「双击没反应」。这里在第一个子进程
+// 创建之前接管：记录启动诊断日志，失败时自动改用兼容模式重启。详见 sandbox-fallback.js。
+const sandboxGuard = sandboxFallback.install({ app, dialog, dataDir: USER_DATA_DIR, beforeExit: stopGamepadPoller });
+
 
 // 支持 `npm start -- --open BV1xx411c7mD`：从命令行/快捷方式直接带视频启动
 function argValue(flag) {
@@ -379,17 +388,34 @@ const PLAYBACK_RATES = [1, 1.25, 1.5, 2];
 const HOLD_PLAYBACK_RATES = [1.25, 1.5, 2, 2.5, 3];
 
 const HOTKEY_META = [
-  { key: 'togglePlay', label: '播放 / 暂停' },
-  { key: 'seekBack', label: '后退 5 秒' },
-  { key: 'seekFwd', label: '前进 5 秒' },
-  { key: 'prevPart', label: '上一分 P' },
-  { key: 'nextPart', label: '下一分 P' },
-  { key: 'toggleVisible', label: '隐藏 / 显示浮窗' },
-  { key: 'togglePass', label: '鼠标穿透 开 / 关' },
-  { key: 'toggleOpacity', label: '半透明 开 / 关' },
-  { key: 'toggleImmersion', label: '纯视频沉浸 开 / 关' },
-  { key: 'cycleSpeed', label: '循环倍速 1 / 1.25 / 1.5 / 2' },
-  { key: 'holdSpeed', label: '长按临时加速（松开恢复）', hold: true }
+  // short 是给手柄圆盘扇区用的窄标签，启动器列表仍用 label
+  { key: 'togglePlay', label: '播放 / 暂停', short: '暂停' },
+  { key: 'seekBack', label: '后退 5 秒', short: '后退' },
+  { key: 'seekFwd', label: '前进 5 秒', short: '前进' },
+  { key: 'prevPart', label: '上一分 P', short: '上一P' },
+  { key: 'nextPart', label: '下一分 P', short: '下一P' },
+  { key: 'toggleVisible', label: '隐藏 / 显示浮窗', short: '显隐' },
+  { key: 'togglePass', label: '鼠标穿透 开 / 关', short: '穿透' },
+  { key: 'toggleOpacity', label: '半透明 开 / 关', short: '透明' },
+  { key: 'toggleImmersion', label: '纯视频沉浸 开 / 关', short: '沉浸' },
+  { key: 'cycleSpeed', label: '循环倍速 1 / 1.25 / 1.5 / 2', short: '倍速' },
+  { key: 'holdSpeed', label: '长按临时加速（松开恢复）', short: '加速', hold: true }
+];
+
+/**
+ * 启动器「手柄快捷键」的八个方位行，显示顺序按罗盘从北顺时针。
+ * key 必须是 gamepad-config.js 的 DIRECTION_NAMES 之一 —— 行名和圆盘参考图扇区上的字
+ * 都用它；label 只留给下拉框的悬停说明。
+ */
+const GAMEPAD_DIR_UI = [
+  { key: 'n', label: '北' },
+  { key: 'ne', label: '东北' },
+  { key: 'e', label: '东' },
+  { key: 'se', label: '东南' },
+  { key: 's', label: '南' },
+  { key: 'sw', label: '西南' },
+  { key: 'w', label: '西' },
+  { key: 'nw', label: '西北' }
 ];
 
 /**
@@ -562,7 +588,9 @@ const DEFAULT_SETTINGS = {
     yRatio: null,
     displayId: null,
     displayBounds: null
-  }
+  },
+  // 手柄：L3 按住弹八方向圆盘，右摇杆选动作。结构与出厂值都在 gamepad-config.js
+  gamepad: DEFAULT_GAMEPAD
 };
 
 /**
@@ -629,6 +657,7 @@ let saveTimer = null;
 let typingInField = false;
 let capturingHotkey = false;
 let holdSpeedActive = false;
+const holdSpeedSources = new Set();
 let immersion = false;
 let hoverFaded = false;
 let hoverTimer = null;
@@ -680,7 +709,8 @@ function loadSettings() {
         roiBy,
         // 清完一条不剩，就别再标榜「已标定」，否则界面显示 0 处却不去引导框选
         calibrated: !!rawBearing.calibrated && rois.length > 0
-      }
+      },
+      gamepad: mergeGamepadSettings(DEFAULT_SETTINGS.gamepad, raw.gamepad)
     };
   } catch {
     settings = structuredClone(DEFAULT_SETTINGS);
@@ -750,8 +780,10 @@ function cyclePlaybackRate() {
   return playbackRate;
 }
 
-function setHoldSpeed(on) {
-  const next = !!on && !!win && !win.isDestroyed();
+function setHoldSpeed(on, source = 'keyboard') {
+  if (on && win && !win.isDestroyed()) holdSpeedSources.add(source);
+  else holdSpeedSources.delete(source);
+  const next = holdSpeedSources.size > 0;
   if (next === holdSpeedActive) return;
   holdSpeedActive = next;
   publishPlaybackSettings();
@@ -759,6 +791,8 @@ function setHoldSpeed(on) {
 }
 
 function cancelTemporarySpeed() {
+  holdSpeedSources.clear();
+  resetGamepadSession();
   setHoldSpeed(false);
   hookHotkeys.cancelHeld();
 }
@@ -1521,6 +1555,7 @@ function createConsole() {
 
   consoleWin.once('ready-to-show', () => {
     consoleWin.show();
+    sandboxGuard.startupComplete();
     notifyFloatState();
   });
 
@@ -1540,7 +1575,7 @@ function createConsole() {
     // 屏幕上、进程也不退出，用户还得再去任务栏手动关一次。
     if (quittingFromConsole) return;
     quittingFromConsole = true;
-    for (const w of [win, overlayWin, loginWin]) {
+    for (const w of [win, overlayWin, loginWin, discWin]) {
       try {
         if (w && !w.isDestroyed()) w.destroy();
       } catch (err) {
@@ -2948,6 +2983,182 @@ function sendDanmakuSlice(t, seek, playing = true) {
   else send();
 }
 
+/* ---------------------------------------------------- 手柄八方向圆盘 */
+
+let discWin = null;
+let discReady = false;
+let discShown = false;
+let discHighlight = '';
+let chordState = createChordState();
+let gamepadSlot = null;
+let gamepadNeedsRelease = true;
+const gamepadPauses = new Set();
+
+function discSize() {
+  // 与 overlaySize 同一条余量规则：半径 ×2 再留 12%，扇区文字才不会被窗口边裁掉
+  return Math.round(Math.max(60, Number(settings.gamepad.disc.radius) || 132) * 2.24);
+}
+
+function discBounds() {
+  const size = discSize();
+  const area = screen.getPrimaryDisplay().workArea;
+  // 圆盘只在按住 L3 时出现，没定位过就摆主屏正中，手边就是
+  const cx = Number.isFinite(settings.gamepad.disc.x) ? settings.gamepad.disc.x : area.x + area.width / 2;
+  const cy = Number.isFinite(settings.gamepad.disc.y) ? settings.gamepad.disc.y : area.y + area.height / 2;
+  return {
+    x: Math.round(cx - size / 2),
+    y: Math.round(cy - size / 2),
+    width: size,
+    height: size
+  };
+}
+
+/** 扇区标签取自 HOTKEY_META.short，和启动器里的动作名同一份出处 */
+function discLabels() {
+  const shortByKey = new Map(HOTKEY_META.map((meta) => [meta.key, meta.short || meta.label]));
+  const labels = {};
+  for (const [direction, action] of Object.entries(settings.gamepad.map)) {
+    labels[direction] = action ? shortByKey.get(action) || action : '未绑定';
+  }
+  return labels;
+}
+
+function createDisc() {
+  if (discWin && !discWin.isDestroyed()) return discWin;
+
+  const window = new BrowserWindow({
+    ...discBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'disc', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false
+    }
+  });
+
+  discWin = window;
+  discReady = false;
+  window.setIgnoreMouseEvents(true, { forward: true });
+  window.on('closed', () => {
+    if (discWin !== window) return;
+    discWin = null;
+    discReady = false;
+    resetGamepadSession();
+  });
+  window.webContents.on('render-process-gone', () => {
+    if (!window.isDestroyed()) window.destroy();
+  });
+  window.once('ready-to-show', () => {
+    if (discWin !== window || window.isDestroyed()) return;
+    discReady = true;
+    if (discShown) window.showInactive();
+  });
+  window.webContents.on('did-finish-load', () => {
+    if (discWin === window && !window.isDestroyed()) {
+      window.webContents.send('disc:ui', discUiState(discHighlight));
+    }
+  });
+  window.loadFile(path.join(__dirname, 'disc', 'index.html')).catch((err) => {
+    if (window.isDestroyed()) return;
+    console.warn('[gamepad] 圆盘加载失败：', err.message);
+    window.destroy();
+  });
+  return window;
+}
+
+function discUiState(highlight) {
+  // hold 由高亮扇区现算，不用额外记状态：同一份映射下它只随 highlight 变
+  return {
+    highlight,
+    labels: discLabels(),
+    hold: isHoldAction(settings.gamepad.map[highlight] || '')
+  };
+}
+
+function pushDiscState(highlight, force = false) {
+  if (!force && highlight === discHighlight) return;
+  discHighlight = highlight;
+  if (discWin && !discWin.isDestroyed() && !discWin.webContents.isLoading()) {
+    discWin.webContents.send('disc:ui', discUiState(discHighlight));
+  }
+}
+
+function showDisc() {
+  const window = createDisc();
+  window.setAlwaysOnTop(true, 'screen-saver');
+  window.setBounds(discBounds());
+  discShown = true;
+  pushDiscState('', true);
+  if (discReady) window.showInactive();
+}
+
+function hideDisc() {
+  // 只 hide 不 destroy：圆盘要能反复弹，而重建窗口会连渲染进程一起重新排队
+  if (discWin && !discWin.isDestroyed()) discWin.hide();
+  discShown = false;
+  discHighlight = '';
+}
+
+function resetGamepadSession() {
+  if (chordState.l3) gamepadNeedsRelease = true;
+  chordState = createChordState();
+  if (discShown) hideDisc();
+  setHoldSpeed(false, 'gamepad');
+}
+
+function handleGamepadFrame(frame) {
+  if (!settings.gamepad.enabled || !frame?.connected) {
+    resetGamepadSession();
+    gamepadSlot = null;
+    gamepadNeedsRelease = true;
+    return;
+  }
+  if (frame.slot !== gamepadSlot) {
+    resetGamepadSession();
+    gamepadSlot = frame.slot;
+    gamepadNeedsRelease = true;
+  }
+  const pressed = !!frame.buttons[L3_BUTTON_INDEX];
+  if (gamepadPauses.size || typingInField || capturingHotkey ||
+      (loginWin && BrowserWindow.getFocusedWindow() === loginWin)) {
+    resetGamepadSession();
+    gamepadNeedsRelease = pressed;
+    return;
+  }
+  if (gamepadNeedsRelease) {
+    if (!pressed) gamepadNeedsRelease = false;
+    return;
+  }
+  const step = stepChord(chordState, frame, settings.gamepad);
+  chordState = step.state;
+
+  if (step.active && !discShown) showDisc();
+  else if (!step.active && discShown) hideDisc();
+  if (step.active) pushDiscState(step.highlighted);
+  if (step.release) handleHotkey(step.release, 'up', 'gamepad');
+  if (step.press) handleHotkey(step.press, 'down', 'gamepad');
+  if (step.fired) handleHotkey(step.fired);
+}
+
+function stopGamepadPoller() {
+  try {
+    gamepad.stop();
+  } catch (err) {
+    console.warn('[gamepad] 停止轮询失败：', err.message);
+  }
+}
 /* -------------------------------------------------------------- 全局热键 */
 
 function sendPlayerAction(action) {
@@ -2965,8 +3176,8 @@ function sendPlayerAction(action) {
 }
 
 /** 热键动作的唯一入口：键盘加速器和鼠标侧键都走这里 */
-function handleHotkey(key, phase) {
-  if (key === 'holdSpeed') return setHoldSpeed(phase === 'down');
+function handleHotkey(key, phase, source = 'keyboard') {
+  if (key === 'holdSpeed') return setHoldSpeed(phase === 'down', source);
   if (capturingHotkey) return;
   if (key === 'cycleSpeed' && (typingInField || (loginWin && !loginWin.isDestroyed() && BrowserWindow.getFocusedWindow() === loginWin))) return;
   if (key === 'cycleSpeed') return cyclePlaybackRate();
@@ -3274,6 +3485,9 @@ function registerIpc() {
       floatState: floatState(),
       playbackState: playbackState(),
       hotkeys: HOTKEY_META,
+      // 手柄圆盘的可绑动作表要连白名单一起给界面，否则启动器会列出圆盘其实不认的动作
+      gamepadDirs: GAMEPAD_DIR_UI,
+      gamepadActions: GAMEPAD_ACTION_ALLOWLIST,
       failedHotkeys,
       initialUrl: OPEN_ARG,
       nav,
@@ -3303,11 +3517,18 @@ function registerIpc() {
     // 而这边也已经退出 —— 用户看到的现象就是「点了按钮，程序直接消失」。
     if (saveTimer) flushSettings();
     const hadLock = app.hasSingleInstanceLock();
+    stopGamepadPoller();
+    resetGamepadSession();
+    gamepadNeedsRelease = true;
     if (hadLock) app.releaseSingleInstanceLock();
     const result = await relaunchElevated();
     // UAC 被取消：把锁要回来，继续以普通权限运行
-    if (!result.ok && hadLock) app.requestSingleInstanceLock();
-    if (result.ok) setTimeout(() => app.exit(0), 400);
+    if (!result.ok) {
+      if (hadLock) app.requestSingleInstanceLock();
+      if (settings.gamepad.enabled) gamepad.start(handleGamepadFrame);
+    } else {
+      setTimeout(() => app.exit(0), 400);
+    }
     return result;
   });
 
@@ -3867,6 +4088,16 @@ function registerIpc() {
     return { hotkeys: settings.hotkeys, failed, hookRunning: hookHotkeys.isRunning() };
   });
 
+  const saveGamepadMap = (map) => {
+    resetGamepadSession();
+    settings.gamepad = mergeGamepadSettings(settings.gamepad, { map });
+    persist();
+    broadcast('settings:changed', settings);
+    return settings.gamepad;
+  };
+  ipcMain.handle('gamepad:update', (_e, map = {}) => saveGamepadMap(map));
+  ipcMain.handle('gamepad:reset', () => saveGamepadMap(DEFAULT_GAMEPAD.map));
+
   ipcMain.handle('win:action', (_e, action, payload) => {
     // 下面这几个动作主要由启动器发起，而启动器点它们的时候浮窗往往还没起，
     // 所以必须放在「浮窗存在」的守卫之前；否则按钮点了没有任何反应。
@@ -4071,9 +4302,17 @@ if (!gotLock) {
     // 保证窗口最小化后全局钩子照常工作（这正是「在游戏里按热键」的核心场景）。
     powerSaveBlocker.start('prevent-app-suspension');
     if (process.platform === 'win32') app.setAppUserModelId('com.finallawer.genshin-route-buddy');
-    powerMonitor.on('suspend', cancelTemporarySpeed);
-    powerMonitor.on('lock-screen', cancelTemporarySpeed);
+    powerMonitor.on('suspend', () => {
+      gamepadPauses.add('suspend');
+      cancelTemporarySpeed();
+    });
+    powerMonitor.on('lock-screen', () => {
+      gamepadPauses.add('lock');
+      cancelTemporarySpeed();
+    });
+    powerMonitor.on('unlock-screen', () => gamepadPauses.delete('lock'));
     powerMonitor.on('resume', () => {
+      gamepadPauses.delete('suspend');
       cancelTemporarySpeed();
       hookHotkeys.rearm();
     });
@@ -4090,6 +4329,9 @@ if (!gotLock) {
     createTray(); // 先建托盘：启动器被收进托盘后还要有个入口能叫回来
     createConsole(); // 先出启动器，配置好了再点「启动跟跑」
     registerHotkeys();
+    // XInput 轮询是个常驻子进程，关掉了就不该起它。手柄状态属 OS 层，
+    // 不存在「窗口建晚了要等解锁」这种事，随时起都行。
+    if (settings.gamepad.enabled) gamepad.start(handleGamepadFrame);
 
     // 外接屏拔插 / 改分辨率：全屏透明层要重新铺满，否则只盖住半个屏幕
     screen.on('display-metrics-changed', () => {
@@ -4131,6 +4373,7 @@ if (!gotLock) {
     cancelTemporarySpeed();
     if (saveTimer) flushSettings();
     globalShortcut.unregisterAll();
+    stopGamepadPoller();
     try {
       hookHotkeys.apply({}, null); // 清空映射并停止钩子
     } catch (err) {

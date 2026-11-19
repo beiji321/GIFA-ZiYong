@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { normalizeAccelerator, mergeHotkeys, prepareHotkeyUpdate } = require('../src/hotkey-config');
+const { DEFAULT_GAMEPAD, mergeGamepadSettings } = require('../src/gamepad-config');
 
 const projectRoot = path.resolve(__dirname, '..');
 const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8');
@@ -124,6 +125,7 @@ function createHarness(options = {}) {
     normalizeAccelerator,
     mergeHotkeys,
     prepareHotkeyUpdate,
+    mergeGamepadSettings,
     app: {
       getPath(kind) {
         assert.equal(kind, 'userData');
@@ -146,7 +148,10 @@ function createHarness(options = {}) {
     },
     broadcast: (channel, payload) => broadcasts.push({ channel, payload: plain(payload) }),
     globalShortcut: { unregisterAll() {} },
-    hookHotkeys: { apply() {}, cancelHeld: () => { heldCancellations += 1; } }
+    hookHotkeys: { apply() {}, cancelHeld: () => { heldCancellations += 1; } },
+    resetGamepadSession() {},
+    stopGamepadPoller() {},
+    DEFAULT_GAMEPAD
   });
   const declarations = [
     ...['DEFAULT_HOTKEYS', 'HOLD_PLAYBACK_RATES', 'LEGACY_SEED_ROIS', 'DEFAULT_SETTINGS'].map((name) => extractConstant(mainSource, name)),
@@ -157,6 +162,7 @@ function createHarness(options = {}) {
     'let playbackToken = 0;',
     'let playbackGate = 0;',
     'let holdSpeedActive = false;',
+    'const holdSpeedSources = new Set();',
     'let immersion = false;',
     'let hoverFaded = false;',
     'let hoverTimer = null;',

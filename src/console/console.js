@@ -54,6 +54,8 @@ async function init() {
   setFloatState(state.boot.floatState);
   fillSettings(s);
   renderHotkeys();
+  renderGamepad();
+  paintGamepadDisc();
   applyNav(state.boot.nav);
 
   // 上次看过的视频先填进输入框，省得每次重新粘。
@@ -1014,6 +1016,12 @@ function wireHotkeys() {
     renderHotkeys();
     reportFailed(res.failed);
   });
+
+  $('btnResetGp').addEventListener('click', async () => {
+    state.boot.settings.gamepad = await window.api.resetGamepad();
+    renderGamepad();
+    toast('手柄方位已恢复出厂映射');
+  });
 }
 
 function renderHotkeys() {
@@ -1039,6 +1047,73 @@ function renderHotkeys() {
 
   renderHookState();
   renderPlaybackHints();
+}
+
+/**
+ * 手柄八方向的动作绑定表。可选项来自 app:boot 的白名单，圆盘不认的动作不会出现在这里；
+ * 「未绑定」是合法选择，圆盘上那一格显示「未绑定」，松杆什么都不做。
+ * 行名用映射表里的方位 key（n / ne / e…），和左边参考图扇区上的字是同一串。
+ */
+function renderGamepad() {
+  const list = $('gpList');
+  const map = (state.boot.settings.gamepad || {}).map || {};
+  const labelByKey = new Map(state.boot.hotkeys.map((meta) => [meta.key, meta.label]));
+  const options = [
+    { value: '', text: '未绑定' },
+    ...(state.boot.gamepadActions || []).map((key) => ({ value: key, text: labelByKey.get(key) || key }))
+  ];
+
+  list.textContent = '';
+  for (const dir of state.boot.gamepadDirs || []) {
+    const row = document.createElement('div');
+    row.className = 'hk-row';
+
+    const label = document.createElement('span');
+    label.className = 'gp-key';
+    label.textContent = dir.key;
+
+    const select = document.createElement('select');
+    select.className = 'sel';
+    select.title = `${dir.label}方向绑定的动作`;
+    for (const option of options) {
+      const item = document.createElement('option');
+      item.value = option.value;
+      item.textContent = option.text;
+      select.appendChild(item);
+    }
+    select.value = map[dir.key] || '';
+    select.addEventListener('change', async () => {
+      // 用主进程返回值重画：非法动作被白名单挡掉的结果也能立刻看得见
+      state.boot.settings.gamepad = await window.api.updateGamepad({ [dir.key]: select.value });
+      renderGamepad();
+    });
+
+    row.append(label, select);
+    list.appendChild(row);
+  }
+}
+
+/** 参考图边长（CSS 像素）。写在 JS 里：非活动的标签页是 display:none，从样式上量不到尺寸 */
+const GP_DISC_SIZE = 232;
+
+/**
+ * 卡片左边那张圆盘参考图。画法用的是浮窗同一份 disc-draw.js，不传 labels 时扇区
+ * 就退回方位 key，于是图上标的 n / ne / e 和右边行名一一对上。
+ */
+function paintGamepadDisc() {
+  const canvas = $('gpDisc');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = `${GP_DISC_SIZE}px`;
+  canvas.style.height = `${GP_DISC_SIZE}px`;
+  canvas.width = Math.round(GP_DISC_SIZE * dpr);
+  canvas.height = Math.round(GP_DISC_SIZE * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  window.GdiscDraw.drawDisc(ctx, {
+    width: GP_DISC_SIZE,
+    height: GP_DISC_SIZE,
+    hint: '按住 L3 弹出'
+  });
 }
 
 /**

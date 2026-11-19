@@ -73,6 +73,7 @@ function harness({ withVideo = true, destroyThrows = false } = {}) {
     win: withVideo ? mkWindow('video') : null,
     overlayWin: mkWindow('overlay'),
     loginWin: mkWindow('login'),
+    discWin: mkWindow('disc'),
     screen: { getPrimaryDisplay: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }) },
     consoleBounds: () => ({ width: 1280, height: 720, x: 0, y: 0 }),
     BrowserWindow: function BrowserWindow() { return fakeConsoleWin; },
@@ -90,6 +91,7 @@ function harness({ withVideo = true, destroyThrows = false } = {}) {
     let win = deps.win;
     let overlayWin = deps.overlayWin;
     let loginWin = deps.loginWin;
+    let discWin = deps.discWin;
     let quittingFromConsole = false;
     const screen = deps.screen;
     const consoleBounds = deps.consoleBounds;
@@ -120,6 +122,7 @@ console.log('--- 1. 开着跟跑时关启动器：三个窗口一起收掉并退
   check('销毁跟跑视频窗', h.calls.filter((c) => c === 'destroy:video').length, 1);
   check('销毁方位叠加层', h.calls.filter((c) => c === 'destroy:overlay').length, 1);
   check('销毁登录窗', h.calls.filter((c) => c === 'destroy:login').length, 1);
+  check('销毁手柄圆盘窗', h.calls.filter((c) => c === 'destroy:disc').length, 1);
   check('调用 app.quit()', h.calls.filter((c) => c === 'app.quit').length, 1);
   check('consoleWin 已置空', h.consoleWinNull(), true);
   check('退出标志已置位', h.quitting(), true);

@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
+const { DEFAULT_GAMEPAD } = require('../src/gamepad-config');
 
 const projectRoot = path.resolve(__dirname, '..');
 const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8');
@@ -223,6 +224,11 @@ function createHarness(options = {}) {
     Date: class MockDate extends Date { static now() { return clock.now(); } },
     console,
     clampBounds: (bounds) => ({ ...bounds }),
+    // DEFAULT_SETTINGS 现在带 gamepad 分区，出厂值取自真实模块，不在这里重抄一遍
+    DEFAULT_GAMEPAD,
+    resetGamepadSession() {},
+    stopGamepadPoller() {},
+    gamepadPauses: new Set(),
     overlayWin: null
   });
   const declarations = [
@@ -235,6 +241,7 @@ function createHarness(options = {}) {
     'let playbackGate = 0;',
     'let saveTimer = null;',
     'let holdSpeedActive = false;',
+    'const holdSpeedSources = new Set();',
     'let immersion = false;',
     'let hoverFaded = false;',
     'let hoverTimer = null;',

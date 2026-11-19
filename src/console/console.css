@@ -693,6 +693,15 @@ button.small { flex: 0 0 auto; height: 28px; padding: 0 11px; font-size: 12px; }
 }
 .hk-row > span { color: var(--fg-2); font-size: 12.5px; }
 
+/* 手柄卡片：左边是圆盘参考图，右边八个方位的绑定。参考图由 src/disc/disc-draw.js
+   现场画（截图不进仓库，也不能和浮窗长得不一样），尺寸和 DPI 铺像素都在 console.js 里，
+   免得不活动的标签页 display:none 时量出 0。 */
+.gp-body { display: flex; flex-wrap: wrap; align-items: center; gap: 22px; }
+.gp-disc { flex: 0 0 auto; }
+.gp-list { flex: 1 1 auto; }
+/* 方位名直接用设置里的 key（n / ne / e…），和参考图扇区上的字一一对上 */
+.hk-row > .gp-key { font-family: "Cascadia Mono", Consolas, monospace; letter-spacing: 0.4px; }
+
 /* 键位按钮：平时只露出键帽，悬停才显出可点的底，录制时整颗变蓝 */
 .kbd {
   display: inline-flex;

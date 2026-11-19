@@ -1047,6 +1047,8 @@ function analyzeCone(img, size, step) {
       cell,
       mask: new Uint8Array(nx * nx),
       tmp: new Uint8Array(nx * nx),
+      whiteCore: new Uint8Array(nx * nx),
+      whiteQueue: new Int32Array(nx * nx),
       sR: new Float32Array(NC),
       sG: new Float32Array(NC),
       sB: new Float32Array(NC),
@@ -1079,6 +1081,8 @@ function analyzeCone(img, size, step) {
    * 阈值取得很高（最暗通道 ≥ 236）：白膜叠在浅色地形上最多到 230 上下，
    * 不能把扇形自己当图标剔掉；图标的灰边交给下面的膨胀。 */
   let cyanHits = 0;
+  let whiteCount = 0;
+  let paleCount = 0;
   for (let gy = 0; gy < nx; gy += 1) {
     const row = gy * step * size;
     const o = gy * nx;
@@ -1088,29 +1092,75 @@ function analyzeCone(img, size, step) {
       const g = d[i + 1];
       const b = d[i + 2];
       if ((g < b ? g : b) - r >= 80) cyanHits += 1;
-      if (r >= 236 && g >= 236 && b >= 236 && (r >= 244 || g >= 244 || b >= 244)) tmp[o + gx] = 1;
+      if (r >= 232 && g >= 232 && b >= 232) paleCount += 1;
+      if (r >= 236 && g >= 236 && b >= 236 && (r >= 244 || g >= 244 || b >= 244)) {
+        tmp[o + gx] = 1;
+        whiteCount += 1;
+      }
     }
   }
   const cyanFrac = nx > 0 ? cyanHits / (nx * nx) : 0;
+  const paleBackground = paleCount > nx * nx / 2;
+  if (paleBackground) {
+    whiteCount = 0;
+    for (let gy = 0; gy < nx; gy += 1) {
+      for (let gx = 0; gx < nx; gx += 1) {
+        const offset = (gy * step * size + gx * step) * 4;
+        const white = d[offset] >= 252 && d[offset + 1] >= 252 && d[offset + 2] >= 252;
+        tmp[gy * nx + gx] = white ? 1 : 0;
+        if (white) whiteCount += 1;
+      }
+    }
+  }
 
-  /* ---- 白核向外膨胀 size/90 像素（363px 窗口约 4px）----
-   * 图标边缘的抗锯齿 / 压缩晕边是「白 + 底色」的混合，恰好等价于一层 α 很大的白膜，
-   * 不剔掉就会在图标两侧各造出一对假边。先横向后纵向做方形膨胀，各两趟线扫。 */
+  /* ---- 只膨胀紧凑白核，不把整片雪地 / 浅色建筑当图标 ----
+   * 白色标点的抗锯齿晕边需要剔除，否则会制造两对假边；但雪地和大块地图建筑
+   * 也会满足单点白阈值。先按连通块筛掉大面积近白区域，再对保留下来的小核膨胀。
+   * 这样保留图标保护，同时不给近白底图制造大洞。 */
+  const { whiteCore: whiteKeep, whiteQueue } = sc;
+  whiteKeep.fill(0);
+  const maxWhiteArea = Math.max(12, Math.floor(nx * nx * 0.06));
+  if (whiteCount <= maxWhiteArea) {
+    whiteKeep.set(tmp);
+  } else {
+    for (let seed = 0; seed < tmp.length; seed += 1) {
+      if (!tmp[seed]) continue;
+      tmp[seed] = 0;
+      whiteQueue[0] = seed;
+      let count = 1;
+      for (let head = 0; head < count; head += 1) {
+        const current = whiteQueue[head];
+        const row = (current / nx) | 0;
+        const col = current - row * nx;
+        for (let yy = Math.max(0, row - 1); yy <= Math.min(nx - 1, row + 1); yy += 1) {
+          for (let xx = Math.max(0, col - 1); xx <= Math.min(nx - 1, col + 1); xx += 1) {
+            const neighbor = yy * nx + xx;
+            if (!tmp[neighbor]) continue;
+            tmp[neighbor] = 0;
+            whiteQueue[count++] = neighbor;
+          }
+        }
+      }
+      if (count <= maxWhiteArea) {
+        for (let index = 0; index < count; index += 1) whiteKeep[whiteQueue[index]] = 1;
+      }
+    }
+  }
+
   const D = Math.max(1, Math.round(size / 90 / step));
   for (let gy = 0; gy < nx; gy += 1) {
     const o = gy * nx;
     let last = -1e9;
     for (let gx = 0; gx < nx; gx += 1) {
-      if (tmp[o + gx] === 1) last = gx;
+      if (whiteKeep[o + gx]) last = gx;
       if (gx - last <= D) mask[o + gx] = 1;
     }
     last = 1e9;
     for (let gx = nx - 1; gx >= 0; gx -= 1) {
-      if (tmp[o + gx] === 1) last = gx;
+      if (whiteKeep[o + gx]) last = gx;
       if (last - gx <= D) mask[o + gx] = 1;
     }
   }
-  // 纵向：mask（横向结果）→ tmp 记成 2，避免和白核的 1 混淆
   for (let gx = 0; gx < nx; gx += 1) {
     let last = -1e9;
     for (let gy = 0; gy < nx; gy += 1) {
@@ -1200,8 +1250,10 @@ function analyzeCone(img, size, step) {
       const Hg = 255 - og;
       const Hb = 255 - ob;
       const den = Hr * Hr + Hg * Hg + Hb * Hb;
-      if (den < 300) continue;
+      const nearWhite = Math.max(Hr, Hg, Hb) < 18;
+      if (den < 300 && (!nearWhite || den < 108)) continue;
       const a = ((hr - or) * Hr + (hg - og) * Hg + (hb - ob) * Hb) / den;
+      if (nearWhite && Math.max(Math.abs(hr - or), Math.abs(hg - og), Math.abs(hb - ob)) < 1.5) continue;
       if (a > A_MAX) continue;
       /* 三通道必须解出同一个 α：残差容限 = 4 级底噪 + 预期抬升的 30%。
        * 水→陆（R +106、G +77、B +5）联合解出 α≈0.38，但 B 通道残差 52 ≫ 21，判 0；
@@ -1493,13 +1545,67 @@ function markInvalid(reason, extra) {
   BEARING.ab.omega = 0;
   BEARING.ab.suspect = 0;
   BEARING.lastAngle = -1;
-  if (!BEARING.invalidSince) BEARING.invalidSince = Date.now();
-  if (Date.now() - BEARING.invalidSince < 1000) return;
-  if (BEARING.reportedValid === false) return;
+  const now = Date.now();
+  if (!BEARING.invalidSince) BEARING.invalidSince = now;
+  const arrowLost = now - BEARING.invalidSince >= 1000;
+  const viewAngle = typeof extra?.view === 'number' ? (90 - extra.view + 360) % 360 : -1;
+  const viewChanged = viewAngle >= 0 &&
+    (BEARING.view.sent < 0 || Math.abs(angDiff(viewAngle, BEARING.view.sent)) > 1.5);
+  const shouldClearArrow = arrowLost && BEARING.reportedValid !== false;
+  if (!shouldClearArrow && !viewChanged) return;
+  if (!shouldClearArrow && now - BEARING.lastSentAt < 250) return;
 
-  BEARING.reportedValid = false;
-  sendBearing( { ok: false, reason, angle: null, ...(extra || {}) });
+  if (arrowLost) BEARING.reportedValid = false;
+  BEARING.lastSentAt = now;
+  BEARING.view.sent = viewAngle;
+  sendBearing({ ok: false, reason: arrowLost ? reason : undefined, angle: null, ...(extra || {}) });
 }
+
+function centeredPatch(img, size, width, dx = 0, dy = 0) {
+  const data = new Uint8ClampedArray(width * width * 4);
+  const x = Math.round((size - width) / 2) + dx;
+  const y = Math.round((size - width) / 2) + dy;
+  for (let row = 0; row < width; row += 1) {
+    const start = ((y + row) * size + x) * 4;
+    data.set(img.data.subarray(start, start + width * 4), row * width * 4);
+  }
+  return { data, width, height: width };
+}
+
+function analyzeArrowWithRecovery(img, size, step) {
+  const base = analyze(img, size, step);
+  if (base.valid || size < 100 || base.cyans * step * step < size * size * 0.025) return base;
+  const shift = Math.round(size * 0.025);
+  const width = size - shift * 2;
+  const candidates = [];
+  for (const [dx, dy] of [[-shift, 0], [shift, 0], [0, -shift], [0, shift],
+    [-shift, -shift], [shift, shift], [-shift, shift], [shift, -shift]]) {
+    const result = analyze(centeredPatch(img, size, width, dx, dy), width, step);
+    if (!result.valid || result.conf < 0.5 || result.tipFrac > 0.28 ||
+        Math.hypot(result.bcX - result.center, result.bcY - result.center) > width * 0.1 ||
+        result.area * step * step > width * width * 0.1) continue;
+    candidates.push(result);
+  }
+  let cluster = [];
+  for (const candidate of candidates) {
+    const group = candidates.filter((other) => Math.abs(angDiff(other.angle, candidate.angle)) <= 12);
+    if (group.length > cluster.length) cluster = group;
+  }
+  if (cluster.length < 3 || cluster.length * 2 <= candidates.length) return base;
+  const best = cluster.reduce((choice, current) => current.conf > choice.conf ? current : choice);
+  const delta = cluster.reduce((sum, current) => sum + angDiff(current.angle, best.angle), 0) / cluster.length;
+  return { ...best, angle: (best.angle + delta + 360) % 360, conf: Math.min(best.conf, 0.68) };
+}
+
+function analyzeConeWithRecovery(img, size, step) {
+  const outer = analyzeCone(img, size, step);
+  if (size < 380 || outer.cyanFrac < MAP_CYAN_FRAC_MIN ||
+      (outer.valid && Math.min(outer.dbg.rise, outer.dbg.fall) >= 0.095)) return outer;
+  const width = Math.round(size * 0.64);
+  const inner = analyzeCone(centeredPatch(img, size, width), width, 1);
+  if (!inner.valid || Math.min(inner.dbg.rise, inner.dbg.fall) < 0.14 ||
+      (outer.valid && Math.abs(angDiff(inner.deg, outer.deg)) < 18)) return outer;
+  return { ...inner, cyanFrac: outer.cyanFrac, conf: Math.min(inner.conf, 0.75) };}
 
 function tickBearing() {
   if (!BEARING.enabled) return;
@@ -1543,8 +1649,9 @@ function tickBearing() {
     }
     if (!gc && !g) continue;
 
-    if (g) {
-      const r = analyze(g.img, g.size, g.step);
+    const arrow = g && analyzeArrowWithRecovery(g.img, g.size, g.step);
+    if (arrow) {
+      const r = arrow;
       if (!seen || r.conf > seen.conf) seen = r;
       if (r.valid && (!best || r.conf > best.conf)) {
         best = { ...r, size: g.size };
@@ -1561,10 +1668,10 @@ function tickBearing() {
     // 下面几行会立刻解引用它（cn.cyanFrac），整个 tickBearing 抛异常，
     // 结果连红箭头也一起没了。
     if (gc && BEARING.greenArc) {
-      const cn = analyzeCone(gc.img, gc.size, gc.step);
+      const cn = analyzeConeWithRecovery(gc.img, gc.size, gc.step);
       mapCyan = Math.max(mapCyan, cn.cyanFrac || 0);
-      // 扇形恒在：连 invalid 的结果也交给 updateView 走宽限，别在采集层就丢掉
-      if (!cone || cn.conf > cone.conf) cone = { ...cn, size: gc.size };
+      if ((arrow?.valid || cn.cyanFrac >= MAP_CYAN_FRAC_MIN) && cn.valid &&
+          (!cone || cn.conf > cone.conf)) cone = { ...cn, size: gc.size };
       if ((cn.cyanFrac || 0) > cyanBest) {
         cyanBest = cn.cyanFrac || 0;
         cyanGrab = gc;
@@ -1588,8 +1695,9 @@ function tickBearing() {
   }
 
   // 视角通道独立于行进通道，先把它算出来。几何彻底失效时它可能还有值。
-  // 门控只管「小地图在不在」，不管「这一帧有没有认出扇形」—— 后者由宽限兜。
-  const view = updateView(cone, now, mapCyan >= MAP_CYAN_FRAC_MIN);
+  // 门控只管「小地图在不在」：可信箭头也能证明地图存在，但扇形不能单独放行。
+  const mapPresent = mapCyan >= MAP_CYAN_FRAC_MIN || !!best;
+  const view = updateView(cone, now, mapPresent);
 
   if (!best) {
     // 只在第一次失配时打一行日志，避免每帧刷屏
@@ -1613,7 +1721,7 @@ function tickBearing() {
   // 三路一致性：几何说了算，扇形只加/减置信，不改角度。
   // 让扇形改角度是危险的 —— 镜头可以独立于角色转，一改就把行进方向带歪。
   let conf = best.conf;
-  if (cone && !best.fromCone) {
+  if (cone && cone.valid && cone.conf > 0.12 && !best.fromCone) {
     const d = Math.abs(angDiff(cone.deg, best.angle));
     if (d < 25) conf = Math.min(1, conf + 0.12);
     else if (d > 60 && conf < 0.55) conf *= 0.7;
@@ -1637,8 +1745,8 @@ function tickBearing() {
     best.angle,
     conf,
     now,
-    cone ? cone.deg : -1,
-    cone ? cone.conf : 0
+    cone && cone.valid && cone.conf > 0.12 ? cone.deg : -1,
+    cone && cone.valid && cone.conf > 0.12 ? cone.conf : 0
   );
   // 原始观测只留最近 5 帧，纯诊断用（state() 里能取到）
   BEARING.raw.push(best.angle);

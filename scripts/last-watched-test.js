@@ -225,7 +225,10 @@ check('--open 显式指定时不抢',
 
 const defaultsMatch = /const DEFAULT_SETTINGS = (\{[\s\S]*?\n\});/.exec(mainSrc);
 if (!defaultsMatch) throw new Error('找不到 DEFAULT_SETTINGS');
-const DEFAULTS = new Function('DEFAULT_HOTKEYS', 'return ' + defaultsMatch[1])({});
+const DEFAULTS = new Function('DEFAULT_HOTKEYS', 'DEFAULT_GAMEPAD', 'return ' + defaultsMatch[1])(
+  {},
+  require('../src/gamepad-config').DEFAULT_GAMEPAD
+);
 check('resumeOnLaunch 出厂默认开启', DEFAULTS.resumeOnLaunch, true);
 check('lastWatchedAt 出厂默认 0', DEFAULTS.lastWatchedAt, 0);
 check('lastTitle 出厂默认空', DEFAULTS.lastTitle, '');
