@@ -96,7 +96,11 @@ button {
   display: flex;
   align-items: center;
   gap: 7px;
-  flex: 0 0 auto;
+  /* 窗口窄的时候允许收缩：以前是 0 0 auto，载入视频后
+   * 分 P 下拉 + 一排图标把标题栏撑爆，右侧的 X 被 overflow:hidden 裁掉。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   font-weight: 600;
   letter-spacing: 0.3px;
   color: var(--fg-2);
@@ -175,6 +179,9 @@ button {
 .sel {
   -webkit-app-region: no-drag;
   max-width: 150px;
+  /* 窗口窄时可以缩：分 P 下拉是次要信息，宁可缩短也不要挤掉右侧按钮 */
+  flex: 1 1 auto;
+  min-width: 0;
   height: 22px;
   margin-right: 2px;
   padding: 0 4px;
@@ -207,9 +214,30 @@ button {
   display: none;
 }
 
-.layout-sel { max-width: 112px; }
+/* 浮窗标题栏里的「视频小地图布局」下拉。
+ * 标题栏一行要塞：品牌 + 片名 + 分 P + 这个布局下拉 + 六颗图标，
+ * 501px 宽根本放不下 —— 之前 .sel 是 flex:0 0 auto 不收缩，
+ * 结果右侧按钮被 overflow:hidden 裁掉，看起来就是「UI 挤出去」。
+ * 这里让它可收缩，并给一个更小的上限。 */
+.layout-sel {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 92px;
+}
 @media (max-width: 460px) {
+  /* 窗口真的很窄时才收起布局下拉。
+   * 之前我把阈值写成 620px，而用户窗口正好 501px —— 预设按钮直接被藏了，
+   * 看起来像「按钮没了」。501px 下让别的元素先缩，不必牺牲它。 */
   .sel.layout-sel { display: none; }
+}
+/* 分 P 下拉同样可收缩，但保底留出「P2/23」这点宽度 */
+.tools .sel:not(.layout-sel) { flex: 0 1 auto; min-width: 54px; max-width: 96px; }
+/* 标题栏按钮永远不许被压缩或换行 */
+.tools .tb, .tools .tb-sep { flex: 0 0 auto; }
+/* 品牌字在窄窗口下最不重要，先缩它给下拉和按钮让位 */
+@media (max-width: 560px) {
+  .brand .name { display: none; }
+  .vtitle { padding-left: 4px; }
 }
 
 /* ------------------------------------------------------------------ 按钮 */
@@ -739,4 +767,77 @@ body:not(.ui) #controls {
   *::after {
     transition: none !important;
   }
+}
+/* 魔改扩展：16:9 锁定按钮 —— 同一按钮里两枚图标，按 .locked 切换显示 */
+#btnRatio .i-ratio-locked,
+#btnRatio.locked .i-ratio-open {
+  display: none;
+}
+#btnRatio.locked .i-ratio-locked {
+  display: block;
+}
+#btnRatio.locked {
+  color: var(--accent, #49b2fc);
+  background: rgba(73, 178, 252, 0.16);
+}
+#btnRatio.locked:hover {
+  background: rgba(73, 178, 252, 0.28);
+  color: var(--accent, #49b2fc);
+}
+/* 锁定时底角缩放手柄点亮一下：还能拖，只是会等比缩放 */
+body.ratio-locked #grip {
+  filter: drop-shadow(0 0 3px var(--accent, #49b2fc));
+  opacity: 1;
+}
+
+/* 魔改扩展：贴边吸附提示线（照搬旧版） */
+/* ------------------------------------------------------ 贴边吸附提示线
+   4 条绝对定位的发光细线，贴哪条边亮哪条；贴角时两条同时亮。
+   平时 opacity: 0，不占视觉也不吃点击（pointer-events: none）。 */
+
+.snap-line {
+  position: absolute;
+  z-index: 65;
+  pointer-events: none;
+  opacity: 0;
+  background: rgba(0, 153, 255, 0.95);
+  box-shadow:
+    0 0 6px 2px rgba(0, 153, 255, 0.9),
+    0 0 16px 5px rgba(0, 153, 255, 0.4);
+  transition: opacity 0.14s ease;
+}
+
+.snap-line.show {
+  opacity: 1;
+}
+
+#snapL,
+#snapR {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+
+#snapL {
+  left: 0;
+}
+
+#snapR {
+  right: 0;
+}
+
+#snapT,
+#snapB {
+  left: 0;
+  right: 0;
+  height: 4px;
+}
+/* 魔改扩展：缩放冻结 —— 冻结期间关掉过渡，舞台铺黑底盖住边缘一像素的缝 */
+#stage webview.resize-freeze {
+  will-change: transform;
+  transition: none;
+  transform-origin: top left;
+}
+#stage.resizing {
+  background: #000;
 }

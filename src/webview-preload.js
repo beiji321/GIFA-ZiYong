@@ -364,6 +364,9 @@ function push(force) {
  */
 const BEARING = {
   enabled: false,
+  // 视觉绿弧（镜头朝向扇形识别）。默认关：低画质下极易乱飘，
+  // 而且每帧要扫一次 512px 窗口，关掉能省一大截 CPU。
+  greenArc: false,
   roi: null,
   layoutId: null,
   revision: 0,
@@ -376,6 +379,8 @@ const BEARING = {
   // requestVideoFrameCallback 的句柄：有新视频帧才算，天然和画面同步
   rvfc: null,
   loopKind: '',
+  // 视频元素被换掉（切分 P）时的守护定时器
+  guard: null,
   lastAngle: -1,
   // 自适应低通的当前值；-1 表示还没初始化
   smooth: -1,
@@ -1562,9 +1567,11 @@ function markInvalid(reason, extra, mapPresent = true) {
   sendBearing({ ok: false, reason: arrowLost ? reason : undefined, angle: null, clearAngle: shouldClearArrow, mapMissing, ...(extra || {}) });
 }
 
-function sendBearing(payload) {
-  ipcRenderer.sendToHost('bearing', { ...payload, layoutId: BEARING.layoutId, revision: BEARING.revision });
-}
+/* sendBearing 定义在文件后部（带 stats 的那份）。
+ * 合并上游时这里曾经留下过一份同名副本，后定义的会覆盖前一个 ——
+ * 结果上游那份带 layoutId/revision 的版本失效，所有 bearing 上报
+ * 都被主进程的布局校验丢掉，箭头和绿弧全都不显示。
+ * 只保留一份，不要再在这里重复定义。 */
 
 function centeredPatch(img, size, width, dx = 0, dy = 0) {
   const data = new Uint8ClampedArray(width * width * 4);
@@ -2002,10 +2009,16 @@ function autoCenterStep(roi, big, mapPresent, now) {
 /**
  * 启动识别循环。
  *
- * 用 requestVideoFrameCallback 而不是定时器：它只在**来了新视频帧**时回调，
- * 天然与画面同步，也不会把同一帧反复计算。旧版 110ms 定时器在 24fps 视频上
- * 会重复处理同一帧（无效平滑），在 60fps 上又会漏帧。
- * 视频暂停时不回调，箭头停在最后角度 —— 正是想要的行为。
+ * 曾经用 requestVideoFrameCallback 驱动：它只在来了新视频帧时回调，
+ * 天然与画面同步，也不会把同一帧反复计算。但那套方案有两个致命前提：
+ *   1. 视频暂停时不回调 —— 用户暂停下来看画面时，方向箭头直接消失；
+ *   2. 回调里靠 `video === v` 决定要不要重新注册，bind() 一换元素，
+ *      回调 return 且不再重挂，循环静默死掉，界面却仍显示「开关已开」。
+ * 合并上游后 setBearing 加了「配置没变就不做事」的门控，循环死了
+ * 也不会自愈，只能手动关开一次开关 —— 表现就是「识别 0 帧」。
+ *
+ * 现在改用定时器驱动：不关心播放状态、不关心元素是否被换过，
+ * 每次触发都重新读当前 video，并且用 busy 标志避免堆积。
  */
 function startBearingLoop() {
   stopBearingLoop();
@@ -2048,6 +2061,20 @@ function startBearingLoop() {
     BEARING.loopKind = 'timer';
     BEARING.timer = setInterval(tickBearing, 50);
   }
+
+  /* 守护：B 站切换分 P 时可能整个换掉 <video>，换了就重挂循环。
+   *
+   * 这段是上游/魔改版原来就有的自愈机制，合并 v0.2.6 时被整块吞掉了。
+   * 少了它，视频元素一被替换，rvfc 回调里的 `video !== v` 就永远成立、
+   * 直接 return 且不再重挂 —— 循环静默死掉，界面还显示「开关已开」。
+   * 我后来加的 pendingStart、自愈分支、定时器驱动都是在补这个缺失，
+   * 现在恢复原机制，那些补丁就都不需要了。 */
+  BEARING.guard = setInterval(() => {
+    if (!BEARING.enabled) return;
+    if (video && video.isConnected) return;
+    bind(pickVideo());
+    if (video) startBearingLoop();
+  }, 2000);
 }
 
 function stopBearingLoop() {
@@ -2116,7 +2143,7 @@ try {
       const r = analyze(g.img, g.size, g.step);
       // 顺手把扇形也跑一遍，方便一次拿到两路证据做对比（同样用大窗口）
       const gc = grabCenter(roi || BEARING.roi, 1.5, 512);
-      const c = gc ? analyzeCone(gc.img, gc.size, gc.step) : null;
+      const c = gc && BEARING.greenArc ? analyzeCone(gc.img, gc.size, gc.step) : null;
       return { ok: true, size: g.size, step: g.step, ...r, cone: c, ab: { ...BEARING.ab } };
     },
     // 放大导出：像素级看清箭头到底是三角形、还是只有描边的空心块
@@ -2503,6 +2530,10 @@ function setBearing(config = {}) {
     }
   }
 
+  // 视觉绿弧（镜头朝向扇形识别）：低画质下极易乱飘，默认关闭。
+  // 关掉时整段扇形识别都不跑，每帧省一次 512px 窗口扫描。
+  if (config.greenArc !== undefined) BEARING.greenArc = !!config.greenArc;
+
   if (config.dump) {
     const sample = BEARING.roi ? grabCenter(BEARING.roi) : null;
     if (!sample) {
@@ -2528,6 +2559,20 @@ function setBearing(config = {}) {
       });
     } catch (error) {
       console.warn('[跟跑助手] 导出小地图截图失败', error.message);
+    }
+  } else if (config.on === undefined) {
+    /* 既没开 dump、也没带 on 的配置 → 认为调用方要求停掉识别。
+     *
+     * 这里原来只判断「有循环状态就停」，而它挂在 dump 的 else 上 ——
+     * 主进程每次下发的正常配置
+     * （on=true、没有 dump）都会掉进这个分支，把上面刚启动的循环**立刻停掉**。
+     * 表现就是：日志里 startLoop 一直成功，但识别永远 0 帧，
+     * 因为循环活不过同一个函数调用。
+     *
+     * 现在明确要求「没有 on 字段」才停，正常配置不会误伤。 */
+    if (BEARING.timer || BEARING.rvfc || BEARING.guard) {
+      stopBearingLoop();
+      sendBearing({ ok: false });
     }
   }
 }
@@ -2562,6 +2607,48 @@ function apply(msg) {
     if (msg.token !== playbackToken) return;
     immersionSession = msg.immersionSession;
     setVideoOnly(!!msg.videoOnly);
+    return;
+  }
+
+  /* ---- 魔改扩展：隐藏播放器原生弹幕 ---- */
+  if (msg.cmd === 'danmaku-hide') {
+    setNativeDanmakuHidden(!!msg.on);
+    return;
+  }
+
+  /* ---- 魔改扩展：字幕精灵的开关与模式切换（不影响上面的原有分支） ---- */
+  if (msg.cmd === 'subtitle') {
+    setSubtitle(msg);
+    return;
+  }
+  if (msg.cmd === 'subtitle-api') {
+    // 主进程拿到了官方字幕轨：停掉 DOM 抓取，改按播放进度上报时间
+    const on = !!msg.on;
+    if (on === SUBTITLE.apiMode) return;
+    SUBTITLE.apiMode = on;
+    if (on) {
+      stopSubtitleTicker();
+      startSubtitleTimeFeed();
+      // 已有接口字幕，再点播放器按钮只会让原生字幕闪一下，白挂观察器
+      if (SUBTITLE.btnObserver) {
+        SUBTITLE.btnObserver.disconnect();
+        SUBTITLE.btnObserver = null;
+      }
+      if (SUBTITLE.panelObserver) {
+        SUBTITLE.panelObserver.disconnect();
+        SUBTITLE.panelObserver = null;
+      }
+    } else {
+      stopSubtitleTimeFeed();
+      if (SUBTITLE.on) {
+        startSubtitleTicker();
+        // 退回 DOM 抓取：这时才需要点按钮和观察面板
+        if (SUBTITLE.autoOpen) {
+          waitForSubtitleButton();
+          watchSubtitlePanel();
+        }
+      }
+    }
     return;
   }
   if (msg.cmd === 'rate' || msg.cmd === 'volume' || msg.cmd === 'mute') {
@@ -2608,6 +2695,7 @@ function apply(msg) {
     ipcRenderer.sendToHost('video-rect', videoRectInfo());
     return;
   }
+
   if (msg.cmd === 'ping') {
     if (!video) bind(pickVideo());
     push(true);
@@ -2768,10 +2856,672 @@ function boot() {
   }, 1000);
 }
 
+
 ipcRenderer.on('player', (_e, msg) => apply(msg));
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', boot, { once: true });
 } else {
   boot();
+}
+
+/* ================================================================ 魔改扩展
+ *
+ * 以下整段是自用版新增的字幕精灵实现，与上游代码没有交叉：
+ *   · 自动点开播放器字幕按钮（含 AI 字幕的语言菜单）
+ *   · 抓取字幕面板文本，按视频进度判断过期
+ *   · 官方字幕模式下不再抓 DOM，改由主进程按时间查表
+ *   · 把播放器原生字幕变透明，避免和字幕层重复显示
+ */
+
+/* ------------------------------------------------------------ 字幕精灵 */
+
+/**
+ * 自动点开 B 站播放器字幕，并把字幕文本镜像给浮窗。
+ *
+ * 为什么要「自动点一下」而不是直接读接口：B 站字幕面板是懒加载的，
+ * 只有用户点过字幕按钮之后，播放器才会把 <div class="bpx-player-subtitle-panel-text">
+ * 渲染进 DOM 并持续更新当前句。我们不去猜它的内部 JS 对象（preload 与页面
+ * 可能是隔离上下文，拿不到 window.player），只跟 DOM 打交道，稳且无害。
+ *
+ * 只有在视频确实带字幕（按钮出现 / subtitle-ready 的 exists=true）时才动手；
+ * 没有字幕节点的页面静默返回，不打印任何东西。
+ */
+/**
+ * 字幕相关日志同时转给宿主页：<webview> 的 console 默认只进它自己的 DevTools，
+ * 浮窗按 F12 是看不到的。转发一份到宿主，排查时一个控制台就够。
+ */
+function slog(...args) {
+  try {
+    console.log(...args);
+  } catch {
+    /* ignore */
+  }
+  try {
+    const line = args
+      .map((a) => {
+        if (typeof a === 'string') return a;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(' ');
+    ipcRenderer.sendToHost('guest-log', line);
+  } catch {
+    /* 页面正在卸载 */
+  }
+}
+
+const SUB_BTN_SEL = '.bpx-player-ctrl-btn.bpx-player-ctrl-subtitle';
+// 由窄到宽依次尝试：具体的文本节点优先，抓不到就退到整个面板容器取 innerText
+const SUB_PANEL_SELECTORS = [
+  '.bpx-player-subtitle-panel-text',
+  '.bpx-player-subtitle-panel',
+  '[class*="subtitle-panel"]',
+  '[class*="subtitle"][class*="text"]'
+];
+
+const SUBTITLE = {
+  on: false,
+  btnObserver: null,   // 等字幕按钮出现
+  panelObserver: null, // 盯字幕文字变化
+  clicked: false,      // 本轮视频是否已经点过
+  lastText: '',
+  url: location.href,
+  pollTimer: null,
+  /**
+   * 字幕的「视频时间」状态。
+   *
+   * 为什么不用墙上时间：字幕该显示多久取决于视频进度，不是真实时钟。
+   *   · 暂停时 currentTime 不推进 → 字幕保持不动（这正是我们要的）
+   *   · 一句说了 6 秒 → 6 秒后才收；说了 1 秒 → 1 秒就收
+   * 所以把「最后一句到达时的视频秒」记下来，用一个 250ms 的轻量 ticker
+   * 比对 currentTime 判断是否过期。
+   */
+  lastChangeAt: -1,   // 视频秒；-1 表示还没收到过
+  hold: 3,            // 秒，来自设置
+  ticker: null,
+  hidden: false,      // 已经通知过隐藏，避免重复发
+  /**
+   * 官方字幕模式。主进程成功拉到字幕轨后置 true：
+   *   · 不再抓 DOM（避免同一句话被两条路径各显示一次）
+   *   · 改按播放进度上报时间，由主进程查表决定显示哪一句
+   * 拉不到字幕轨时保持 false，退回原来的 DOM 抓取。
+   */
+  apiMode: false,
+  timeTimer: null,
+  hideNative: false,  // 是否把 B 站原生字幕变透明
+  autoOpen: true,     // 是否允许自动点开播放器字幕按钮
+  hideOnPause: false, // 暂停时是否隐藏字幕（DOM 模式用）
+  pausedHide: false   // 当前这次隐藏是不是因为暂停，恢复播放要补回去
+};
+
+/** 临时观察器（AI 语言菜单等），关闭开关时要一并断开 */
+const observers = new Set();
+
+function subtitleButton() {
+  try {
+    return document.querySelector(SUB_BTN_SEL);
+  } catch {
+    return null;
+  }
+}
+
+/** 播放器界面上的固定文案，不是台词。
+ * 我们为了自动开字幕会点一次字幕按钮，B 站会弹出「字幕设置」面板，
+ * 面板里的标题也命中宽泛选择器，结果被当成一句字幕显示出来 ——
+ * 就是用户看到的那个黑框「字幕设置」。
+ */
+const SUB_UI_TEXTS = new Set([
+  '字幕设置',
+  '字幕',
+  '关闭字幕',
+  '开启字幕',
+  '字幕大小',
+  '字幕样式',
+  '字幕位置',
+  '双语字幕',
+  '自动字幕',
+  'AI字幕',
+  'AI 字幕',
+  '设置'
+]);
+
+/** 命中节点是否落在播放器控件/设置面板里（这些地方的文字一律不是台词） */
+function insidePlayerUI(el) {
+  try {
+    return !!el.closest(
+      '[class*="subtitle-setting"], [class*="subtitle-panel-setting"], [class*="bpx-player-ctrl"], [class*="setting-panel"], [class*="bpx-player-ctrl-subtitle"]'
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** 面板里当前这一句：取最后一个非空节点（B 站会同时保留多行） */
+function currentSubtitleText() {
+  for (const sel of SUB_PANEL_SELECTORS) {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(sel);
+    } catch {
+      continue;
+    }
+    if (!nodes.length) continue;
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const el = nodes[i];
+      // textContent 对 AI 字幕的分段 span 也有效；innerText 在隐藏元素上会返回空
+      const t = String(el.textContent || el.innerText || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!t) continue;
+      // 过滤播放器 UI 文案与设置面板里的文字
+      if (SUB_UI_TEXTS.has(t) || insidePlayerUI(el)) continue;
+      // 过短又像是按钮标签的（2 字以内且没有句子特征）也跳过
+      if (t.length <= 2 && /^(字幕|设置|中文|英文|日文)$/.test(t)) continue;
+      return t;
+    }
+  }
+  return '';
+}
+
+function pushSubtitle(text) {
+  if (SUBTITLE.apiMode) return; // 官方字幕模式：文本由主进程按时间查表下发
+  if (!text || text === SUBTITLE.lastText) return;
+  SUBTITLE.lastText = text;
+  // 记下「这句是在视频第几秒出现的」，后续按视频进度判断过期
+  SUBTITLE.lastChangeAt = video && Number.isFinite(video.currentTime) ? video.currentTime : -1;
+  SUBTITLE.hidden = false;
+  slog('[subtitle] → host:', text);
+  try {
+    ipcRenderer.sendToHost('subtitle', { text });
+  } catch {
+    /* 页面正在卸载 */
+  }
+}
+
+/**
+ * 收起播放器自己的「字幕设置」弹层。
+ *
+ * 我们为了开字幕会模拟点一次字幕按钮，B 站就会弹出那个面板；
+ * 如果用户长久没说话、又或者自动选语言没成功，这个面板会一直挂在屏幕底部，
+ * 看起来就像「字幕框残留」。用一次 mousedown 点空白处让它自己关闭
+ * （B 站的面板是监听外部点击关闭的），比直接 dispatch Escape 安全 ——
+ * Escape 在播放器里还可能触发退出全屏。
+ */
+function dismissPlayerPopup() {
+  try {
+    const target = document.body || document.documentElement;
+    if (!target) return;
+    // 只发 mousedown / mouseup：B 站的面板是靠「外部按下」关闭的。
+    // 不发 click —— 父级播放器容器上绑着「点画面暂停/播放」，发了会误暂停。
+    const opts = { bubbles: true, cancelable: true, view: window };
+    target.dispatchEvent(new MouseEvent('mousedown', opts));
+    target.dispatchEvent(new MouseEvent('mouseup', opts));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 语言菜单：只有【AI 字幕】的视频，点主按钮不会直接开字幕，而是弹出语言列表。
+ * 参考 BiliPlus 的做法：菜单项带 data-lan 属性，AI 中文是 ai-zh，点它才算选中。
+ * 不点的话字幕面板根本不会出现，表现就是「有字幕但打不开」。
+ */
+const SUB_LANG_SEL = '[data-lan]';
+const AI_LANG = 'ai-zh';
+
+/**
+ * 点完主按钮后在 3 秒内盯着语言菜单；出现 ai-zh 就点它，然后立刻断开。
+ * 只看带 data-lan 的元素，不猜 B 站内部选择器；没有菜单就静默超时。
+ */
+function selectAiSubtitle() {
+  let timer = null;
+  const observer = new MutationObserver(() => {
+    let item = null;
+    try {
+      item =
+        document.querySelector(`[data-lan="${AI_LANG}"]`) ||
+        [...document.querySelectorAll(SUB_LANG_SEL)].find(
+          (el) => String(el.getAttribute('data-lan') || '').toLowerCase() === AI_LANG
+        );
+    } catch {
+      item = null;
+    }
+    if (!item) return;
+    observers.delete(observer);
+    observer.disconnect();
+    clearTimeout(timer);
+    try {
+      // 菜单项自己就绑了 click；冒泡派发即可，不 preventDefault
+      item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      slog('[subtitle] 已选择 AI 字幕（data-lan=ai-zh）');
+    } catch (err) {
+      slog('[subtitle] 点击 AI 字幕项失败', err && err.message);
+    }
+    // 选完语种后立刻再看一眼面板，别等下一次 mutation
+    setTimeout(() => {
+      pushSubtitle(currentSubtitleText());
+      // 关掉 B 站自己的「字幕设置」弹层，避免它一直挂在屏幕底部
+      dismissPlayerPopup();
+    }, 300);
+  });
+
+  observers.add(observer);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  timer = setTimeout(() => {
+    observers.delete(observer);
+    observer.disconnect();
+  }, 3000);
+
+  // 菜单可能已经渲染好了（主按钮点击是同步的），先主动查一次
+  const existing = (() => {
+    try {
+      return document.querySelector(`[data-lan="${AI_LANG}"]`);
+    } catch {
+      return null;
+    }
+  })();
+  if (existing) {
+    observers.delete(observer);
+    observer.disconnect();
+    clearTimeout(timer);
+    try {
+      existing.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      slog('[subtitle] 已选择 AI 字幕（data-lan=ai-zh，已存在）');
+    } catch (err) {
+      slog('[subtitle] 点击 AI 字幕项失败', err && err.message);
+    }
+  }
+}
+
+/** 点一下按钮内部的图标；成功立刻断开「等按钮」的观察器 */
+function clickSubtitleButton(btn) {
+  if (!btn || SUBTITLE.clicked) return;
+  SUBTITLE.clicked = true;
+  try {
+    const icon = btn.querySelector('.bpx-player-ctrl-subtitle-icon') || btn;
+    icon.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  } catch {
+    SUBTITLE.clicked = false;
+    return;
+  }
+  // 点完就不需要再找按钮了，留一个观察器白耗 CPU
+  if (SUBTITLE.btnObserver) {
+    SUBTITLE.btnObserver.disconnect();
+    SUBTITLE.btnObserver = null;
+  }
+  // 普通 CC 会直接开；AI 字幕会弹语言菜单，这里补一步选 ai-zh
+  selectAiSubtitle();
+
+  // 兜底：若 1.5 秒后仍然没有字幕文本，说明点了按钮但没开成，
+  // 把播放器弹出来的面板收起来，别留个空框在屏幕上。
+  setTimeout(() => {
+    if (!SUBTITLE.on) return;
+    if (currentSubtitleText()) return;
+    dismissPlayerPopup();
+  }, 1500);
+  setTimeout(() => pushSubtitle(currentSubtitleText()), 600);
+}
+
+/** 等字幕按钮出现；已经有了就直接点 */
+function waitForSubtitleButton() {
+  const btn = subtitleButton();
+  if (btn) {
+    clickSubtitleButton(btn);
+    return;
+  }
+  if (SUBTITLE.btnObserver) return;
+  SUBTITLE.btnObserver = new MutationObserver(() => {
+    const b = subtitleButton();
+    if (b) clickSubtitleButton(b);
+  });
+  SUBTITLE.btnObserver.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+/** 盯字幕面板的文字变化，把当前句发给浮窗 */
+/**
+ * 按**视频进度**判断当前字幕是否该收起来。
+ *
+ * 每 250ms 一次，只在字幕开关打开时跑。代价可以忽略（一次 currentTime 读取 +
+ * 一次数值比较），换来的是暂停/拖动/倍速下字幕时长都正确。
+ */
+/**
+ * 官方字幕模式：每 200ms 把播放进度报给主进程。
+ *
+ * 为什么由访客页报而不是主进程轮询：只有这里能直接读 video.currentTime，
+ * 暂停 / 拖动 / 倍速都是天然正确的，不需要额外同步状态。
+ */
+function startSubtitleTimeFeed() {
+  if (SUBTITLE.timeTimer) return;
+  SUBTITLE.timeTimer = setInterval(() => {
+    if (!SUBTITLE.on || !SUBTITLE.apiMode || !video) return;
+    const t = video.currentTime;
+    if (!Number.isFinite(t)) return;
+    try {
+      ipcRenderer.sendToHost('subtitle-time', { t, paused: !!video.paused });
+    } catch {
+      /* 页面正在卸载 */
+    }
+  }, 200);
+}
+
+function stopSubtitleTimeFeed() {
+  if (!SUBTITLE.timeTimer) return;
+  clearInterval(SUBTITLE.timeTimer);
+  SUBTITLE.timeTimer = null;
+}
+
+function startSubtitleTicker() {
+  if (SUBTITLE.ticker) return;
+  SUBTITLE.ticker = setInterval(() => {
+    if (!SUBTITLE.on || !video) return;
+    if (SUBTITLE.apiMode) return; // 官方字幕模式下由主进程查表，这里不猜
+    if (SUBTITLE.lastChangeAt < 0) return;
+    // 拖动进度：把去重记录清掉，否则拖回同一句时会被当成「重复」而不显示
+    if (video.seeking) {
+      SUBTITLE.lastText = '';
+      SUBTITLE.lastChangeAt = -1;
+      SUBTITLE.hidden = false;
+      return;
+    }
+    // 暂停：默认保持显示（currentTime 不推进，差值也不会增长）；
+    // 开了「暂停时隐藏」就主动收起，并记下来，恢复播放时补回去。
+    if (video.paused) {
+      if (SUBTITLE.hideOnPause && !SUBTITLE.pausedHide && SUBTITLE.lastText) {
+        SUBTITLE.pausedHide = true;
+        try {
+          ipcRenderer.sendToHost('subtitle', { off: true });
+        } catch {
+          /* 页面正在卸载 */
+        }
+      }
+      return;
+    }
+    // 恢复播放：把因暂停藏起来的那句补回去（面板文字没变，不会自己重推）
+    if (SUBTITLE.pausedHide) {
+      SUBTITLE.pausedHide = false;
+      SUBTITLE.lastText = '';
+      pushSubtitle(currentSubtitleText());
+    }
+    const t = video.currentTime;
+    if (!Number.isFinite(t)) return;
+    const hold = Math.min(10, Math.max(1, Number(SUBTITLE.hold) || 3));
+    if (t - SUBTITLE.lastChangeAt <= hold) return;
+    if (SUBTITLE.hidden) return;
+    SUBTITLE.hidden = true;
+    /* 注意**不要**清 lastText：观察器下一次 tick 会把面板里同一句再推一次，
+     * lastText 被清空的话就会被当成新字幕重新显示，字幕会一闪一闪。
+     * 新字幕到达时 pushSubtitle 会自己更新 lastText 并把 hidden 置回 false。 */
+    try {
+      ipcRenderer.sendToHost('subtitle', { off: true });
+    } catch {
+      /* 页面正在卸载 */
+    }
+  }, 250);
+}
+
+function stopSubtitleTicker() {
+  if (!SUBTITLE.ticker) return;
+  clearInterval(SUBTITLE.ticker);
+  SUBTITLE.ticker = null;
+}
+
+/* ---------------------------------------------- 隐藏 B 站原生字幕
+ *
+ * 我们点开播放器字幕按钮才能抓到文字，于是屏幕上会同时出现
+ * 「播放器自己的小字幕」和「字幕精灵的大字幕」两条。
+ * 这里把原生那条**变透明**（不是 display:none）：
+ *   · 视觉上看不见了
+ *   · 元素和文本仍在，textContent 照样能读到
+ *
+ * 注意：GenshinImpactVT 没有这一步 —— 它走官方接口拿字幕，
+ * 从不打开播放器字幕按钮，所以原生字幕压根不显示。
+ * 我们的 DOM 兜底路径必须点开按钮，所以才需要这一层。
+ */
+
+const HIDE_NATIVE_STYLE_ID = 'gifa-hide-native-subtitle';
+
+function setNativeSubtitleHidden(on) {
+  const exist = document.getElementById(HIDE_NATIVE_STYLE_ID);
+  if (!on) {
+    if (exist) exist.remove();
+    return;
+  }
+  if (exist) return;
+  const el = document.createElement('style');
+  el.id = HIDE_NATIVE_STYLE_ID;
+  el.textContent = `
+    .bpx-player-subtitle-panel-text,
+    .bpx-player-subtitle-panel-text *,
+    [class*="subtitle-panel"][class*="text"],
+    [class*="subtitle-panel"][class*="text"] * {
+      color: transparent !important;
+      -webkit-text-fill-color: transparent !important;
+      text-shadow: none !important;
+      -webkit-text-stroke: 0 !important;
+      background: transparent !important;
+    }
+  `;
+  document.documentElement.appendChild(el);
+}
+
+function watchSubtitlePanel() {
+  if (SUBTITLE.panelObserver) return;
+  const tick = () => {
+    if (!SUBTITLE.on) return;
+    const text = currentSubtitleText();
+    pushSubtitle(text);
+  };
+  SUBTITLE.panelObserver = new MutationObserver(tick);
+  SUBTITLE.panelObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+  tick();
+}
+
+/** 断开所有观察器（关闭开关时调用，必须真的全部断开） */
+function stopSubtitle() {
+  stopSubtitleTicker();
+  for (const ob of observers) {
+    try {
+      ob.disconnect();
+    } catch {
+      /* ignore */
+    }
+  }
+  observers.clear();
+  if (SUBTITLE.btnObserver) {
+    SUBTITLE.btnObserver.disconnect();
+    SUBTITLE.btnObserver = null;
+  }
+  if (SUBTITLE.panelObserver) {
+    SUBTITLE.panelObserver.disconnect();
+    SUBTITLE.panelObserver = null;
+  }
+  if (SUBTITLE.pollTimer) {
+    clearInterval(SUBTITLE.pollTimer);
+    SUBTITLE.pollTimer = null;
+  }
+  SUBTITLE.lastText = '';
+  SUBTITLE.clicked = false;
+}
+
+/** 换视频 / 换分 P：重置这一轮的点击状态，必要时重新找按钮 */
+function resetSubtitleForNewVideo() {
+  SUBTITLE.lastText = '';
+  SUBTITLE.clicked = false;
+  SUBTITLE.lastChangeAt = -1;
+  SUBTITLE.hidden = false;
+  SUBTITLE.pausedHide = false;
+  if (!SUBTITLE.on) return;
+  waitForSubtitleButton();
+  watchSubtitlePanel();
+}
+
+/**
+ * 调试用：把当前页面里所有 class 含 "subtitle" 的元素打出来，
+ * 方便对照 B 站实际 DOM 调整选择器（F12 控制台可直接看）。
+ */
+
+function setSubtitle(opts) {
+  const on = !!opts.on;
+  if (Number.isFinite(Number(opts.hold)) && Number(opts.hold) > 0) {
+    SUBTITLE.hold = Math.min(10, Math.max(1, Number(opts.hold)));
+  }
+  // 只有字幕精灵 + 开关都开着才藏原生字幕：只开转向提醒时不该动播放器
+  if (opts.hideNative !== undefined) SUBTITLE.hideNative = !!opts.hideNative;
+  if (opts.autoOpen !== undefined) SUBTITLE.autoOpen = !!opts.autoOpen;
+  if (opts.hideOnPause !== undefined) SUBTITLE.hideOnPause = !!opts.hideOnPause;
+
+  SUBTITLE.on = on;
+  if (!on) {
+    stopSubtitle();
+    stopSubtitleTicker();
+    stopSubtitleTimeFeed();
+    setNativeSubtitleHidden(false);
+    try {
+      ipcRenderer.sendToHost('subtitle', { text: '', off: true });
+    } catch {
+      /* 页面正在卸载 */
+    }
+    return;
+  }
+  startSubtitleTicker();
+  setNativeSubtitleHidden(SUBTITLE.hideNative);
+  // www 是常规视频页，player 是嵌入播放器页；两个都可能带字幕按钮
+  if (!/(^|\.)bilibili\.com$/i.test(location.hostname)) return;
+  SUBTITLE.url = location.href;
+
+  // SPA 换片不一定有导航事件：轮询 URL 兜底，变了就重来一轮。
+  // 这条和字幕来源无关，API / DOM 两种模式都要跑。
+  if (!SUBTITLE.pollTimer) {
+    SUBTITLE.pollTimer = setInterval(() => {
+      if (!SUBTITLE.on) return;
+      if (location.href === SUBTITLE.url) return;
+      SUBTITLE.url = location.href;
+      resetSubtitleForNewVideo();
+    }, 1000);
+  }
+  // 官方字幕模式已经有数据了，再点按钮只会让原生字幕闪一下，白挂一个观察器
+  if (SUBTITLE.apiMode) return;
+  // 用户明确关掉了自动点开：不动播放器，只等官方接口接管
+  if (!SUBTITLE.autoOpen) return;
+  waitForSubtitleButton();
+  watchSubtitlePanel();
+}
+
+/* ------------------------------------------------ 隐藏播放器原生弹幕
+ *
+ * 我们用的是官方 dm/list.so 接口，不依赖播放器把弹幕画出来。
+ * 所以投影层开着的时候，把播放器自己那层藏掉，避免同一批弹幕出现两遍。
+ *
+ * 用 opacity 而不是 display:none：弹幕层是绝对定位的覆盖层，
+ * 改 display 有可能让播放器内部的尺寸测量出现偏差（画中画/全屏切换时尤其明显），
+ * 透明度归零最保险，而且不影响我们读任何东西。
+ */
+
+const HIDE_NATIVE_DANMAKU_ID = 'gifa-hide-native-danmaku';
+
+function setNativeDanmakuHidden(on) {
+  const exist = document.getElementById(HIDE_NATIVE_DANMAKU_ID);
+  if (!on) {
+    if (exist) exist.remove();
+    return;
+  }
+  if (exist) return;
+  const el = document.createElement('style');
+  el.id = HIDE_NATIVE_DANMAKU_ID;
+  el.textContent = `
+    .bpx-player-dm-wrap,
+    .bpx-player-row-dm-wrap,
+    .bpx-player-dm,
+    [class*="danmaku-wrap"],
+    [class*="dm-wrap"],
+    [class*="danmaku-screen"] {
+      opacity: 0 !important;
+      pointer-events: none !important;
+    }
+  `;
+  document.documentElement.appendChild(el);
+}
+
+/* ------------------------------------------ 魔改扩展：识别健康度统计
+ *
+ * 用来回答「为什么画面上没有箭头」。独立一份状态，不动上游的 BEARING 对象。
+ * 每帧记一个结果码，滚动窗口 60 帧；主进程拿它算成功率并显示在控制台。
+ */
+
+const BEARING_STATS = {
+  ring: [],
+  window: 60,
+  total: 0,
+  lastReason: '',
+  lastOkAt: 0,
+  lastBadAt: 0
+};
+
+function noteBearingResult(code, reason) {
+  BEARING_STATS.ring.push(code);
+  if (BEARING_STATS.ring.length > BEARING_STATS.window) BEARING_STATS.ring.shift();
+  BEARING_STATS.total += 1;
+  const now = Date.now();
+  if (code === 'ok') {
+    BEARING_STATS.lastOkAt = now;
+    BEARING_STATS.lastReason = '';
+  } else {
+    BEARING_STATS.lastBadAt = now;
+    if (reason) BEARING_STATS.lastReason = reason;
+  }
+}
+
+function bearingStats() {
+  const st = BEARING_STATS;
+  const out = {
+    window: st.ring.length,
+    ok: 0,
+    noRoi: 0,
+    noMap: 0,
+    hold: 0,
+    total: st.total,
+    lastReason: st.lastReason,
+    lastOkAt: st.lastOkAt,
+    lastBadAt: st.lastBadAt
+  };
+  for (const c of st.ring) out[c] = (out[c] || 0) + 1;
+  return out;
+}
+
+/**
+ * 带统计的 bearing 上报。
+ * 结果码是**根据上报内容反推**的，不需要改上游的识别循环：
+ *   ok=false 且原因是「还没框选」→ noRoi
+ *   ok=false 其它原因             → noMap
+ *   有角度                        → ok
+ */
+function sendBearing(payload) {
+  const p = payload || {};
+  if (p.ok === false && p.reason) {
+    noteBearingResult(/框选/.test(String(p.reason)) ? 'noRoi' : 'noMap', p.reason);
+  } else if (typeof p.angle === 'number') {
+    noteBearingResult('ok', '');
+  }
+  try {
+    /* 注意：必须带上 layoutId / revision。
+     * 主进程合并上游后加了「布局对不上就丢弃」的校验，
+     * 少了这两个字段（undefined !== 'legacy-2'）所有识别结果都会被静默丢掉，
+     * 表现就是红箭头和绿弧全都不出来。 */
+    ipcRenderer.sendToHost('bearing', {
+      ...p,
+      layoutId: BEARING.layoutId,
+      revision: BEARING.revision,
+      stats: bearingStats()
+    });
+  } catch {
+    /* 页面正在卸载 */
+  }
 }

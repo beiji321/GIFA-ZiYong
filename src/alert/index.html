@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>GIFA 放大提醒</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    #box {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      /* 出现不渐变：点亮是「啪」一下到位，渐变只会显得磨蹭 */
+      transition: none;
+    }
+
+    #box.show { opacity: 1; }
+    /* 淡出要干脆：0.34s 看着像「粘在屏幕上半天不走」 */
+    #box.fade { opacity: 0; transition: opacity 0.16s ease; }
+
+    /* 圆形裁切：叠加层本身就是个圆环，方图看着别扭。
+       窗口仍是正方形（Electron 没有非矩形窗口），只把画面裁成圆。 */
+    #cv {
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      clip-path: circle(50% at 50% 50%);
+      /* 中性细边：只用来分出边界，不做彩色光晕 ——
+         原来那圈蓝色会盖住雷达自己的方向高亮，看着「一圈都是蓝的」。 */
+      box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.35),
+        0 3px 14px rgba(0, 0, 0, 0.45);
+    }
+
+    /* 放置模式下才允许拖动窗口；平时整窗穿透，不挡游戏点击 */
+    body.placing {
+      -webkit-app-region: drag;
+      cursor: move;
+    }
+
+    body.placing #box { opacity: 1; }
+
+    body.placing #cv {
+      box-shadow:
+        0 0 0 3px rgba(255, 196, 0, 0.95),
+        0 0 22px 6px rgba(255, 196, 0, 0.45);
+    }
+  </style>
+</head>
+<body>
+  <div id="box"><canvas id="cv"></canvas></div>
+  <script src="./alert.js"></script>
+</body>
+</html>

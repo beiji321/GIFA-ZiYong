@@ -1,0 +1,73 @@
+/* 全屏透明弹幕层。窗口铺满屏幕、整窗鼠标穿透，这里只负责弹幕的定位与飞行。 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  pointer-events: none;
+  user-select: none;
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+
+  /* 由主进程实时下发（见 console 的四个滑块） */
+  --dm-area: 50vh;
+  --dm-opacity: 0.8;
+  --dm-scale: 1;
+  --dm-duration: 8s;
+}
+
+/* 只在上半部（--dm-area）区域飘，超出的会被裁掉 */
+#layer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--dm-area);
+  overflow: hidden;
+  pointer-events: none;
+  opacity: var(--dm-opacity);
+}
+
+.dm {
+  position: absolute;
+  left: 100%;
+  white-space: nowrap;
+  /* 默认白字；B 站彩色弹幕会覆盖成它自己的颜色 */
+  color: #ffffff;
+  font-size: calc(26px * var(--dm-scale));
+  font-weight: var(--dm-weight, 700);
+  line-height: 1.2;
+  /* B 站经典四向黑描边，浅色背景也看得清；可在启动器里关掉 */
+  text-shadow: var(
+    --dm-shadow,
+    1px 0 1px #000,
+    0 1px 1px #000,
+    0 -1px 1px #000,
+    -1px 0 1px #000
+  );
+  will-change: transform;
+  animation-name: dm-fly;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+  animation-duration: var(--dm-duration);
+}
+
+@keyframes dm-fly {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(calc(-100vw - 100%));
+  }
+}
+
+/* 暂停视频时：正在飞的弹幕定在半空，恢复播放再继续 */
+#layer.paused .dm {
+  animation-play-state: paused;
+}

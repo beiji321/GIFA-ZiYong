@@ -5,6 +5,12 @@ const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
 
+/* 解析真实路径必须用 native 版本：
+ * Node 24 的 fs.realpathSync（libuv 实现）在 Windows 上不展开 junction，
+ * 目录链接指回项目时会被当成「项目外部」放过去，素材就被写进了仓库。
+ * fs.realpathSync.native 走系统 API，junction 会正确解析到真实目标。 */
+const realPath = (p) => fs.realpathSync.native(p);
+
 function assertExternalPath(value) {
   const target = path.resolve(value);
   const relative = path.relative(ROOT, target);
@@ -17,7 +23,7 @@ function assertExternalPath(value) {
     if (parent === ancestor) throw new Error('素材目录所在位置不可用：' + target);
     ancestor = parent;
   }
-  const actual = path.relative(fs.realpathSync(ROOT), fs.realpathSync(ancestor));
+  const actual = path.relative(realPath(ROOT), realPath(ancestor));
   if (!actual || (!path.isAbsolute(actual) && actual !== '..' && !actual.startsWith('..' + path.sep))) {
     throw new Error('素材目录实际指向项目内部：' + target);
   }

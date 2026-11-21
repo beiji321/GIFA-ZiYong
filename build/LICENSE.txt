@@ -1,6 +1,20 @@
 ﻿原神跟跑助手 / GI-Follow-Assist (GIFA)
 Copyright (c) 2026 FinalLawer
+Modifications Copyright (c) 2026 beiji321
 SPDX-License-Identifier: GPL-3.0-only
+
+这是 GIFA 的**修改版**（魔改自用版），不是上游原版。
+
+  上游原版：https://github.com/FinalLawer/GIFA
+  本修改版：https://github.com/beiji321/GIFA-ZiYong
+  修改起始：2026-11-14
+
+与原版的主要差异：独立字幕层与弹幕层（含官方字幕 / 弹幕接口）、系统托盘、
+四轴罗盘与识别健康度、16:9 比例锁定、贴边吸附与跨分辨率位置记忆等。
+逐条改动见本仓库提交历史。
+
+本修改版同样以 GPL-3.0-only 分发，不附加任何额外限制。
+若你分发本修改版的二进制，请同时提供本仓库对应版本的源码。
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

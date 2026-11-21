@@ -42,6 +42,13 @@ async function init() {
   state.boot = await window.api.boot();
   const s = state.boot.settings;
 
+  // 魔改扩展：字幕来源状态每秒刷新
+  pollSubtitleStatus();
+  setInterval(pollSubtitleStatus, 1000);
+  // 识别健康度和字幕状态一起刷
+  pollHealth();
+  setInterval(pollHealth, 1000);
+
   $('ver').textContent = 'v' + (state.boot.version || '');
 
   // 滑块拖动时同步左侧的填充；程序改值（fillSettings）那条路在 fillSettings 里单独调
@@ -392,6 +399,15 @@ function renderPlaybackHints() {
 function fillSettings(settings) {
   $('setPin').checked = !!settings.pinned;
   $('setPass').checked = !!settings.clickThrough;
+
+  // 沉浸模式防遮挡
+  $('setStoryHide').checked = !!(settings.storyAutoHide && settings.storyAutoHide.enabled);
+  // 老 settings.json 可能没有 showBox 字段，默认显示（排查期需要它）
+  $('setStoryBox').checked = !(settings.storyAutoHide && settings.storyAutoHide.showBox === false);
+  $('setAvoidHide').checked = settings.avoidHideEnabled !== false;
+  setRange('setAvoidHold', 'avoidHoldVal', settings.avoidHideHold, 4, 's');
+  $('setCombatFade').checked = settings.combatFadeEnabled !== false;
+  setRange('setCombatOpacity', 'combatOpacityVal', settings.combatOpacity, 75, '%');
   $('setImmersion').checked = state.immersion;
   $('setHoverFade').checked = settings.hoverFadeEnabled !== false;
   const holdRate = Number(settings.holdPlaybackRate);
@@ -415,10 +431,430 @@ function fillSettings(settings) {
 
   renderLayouts(b);
 
-  for (const id of ['setOpacity', 'setVolume', 'setBearingSize']) paintRange($(id));
+  // 所有滑块都要刷 --fill：只刷写死的那三个，其余滑块加载时
+  // 左边那段蓝色会停在 CSS 默认的 50%，和右边显示的数字对不上
+  for (const el of document.querySelectorAll('input[type="range"]')) paintRange(el);
+
+  // 魔改扩展：字幕 / 弹幕开关回填
+  $('setSubtitleSprite').checked = settings.enableSubtitleSprite === true;
+  $('setSubHideNative').checked = settings.subtitleHideNative !== false;
+  $('setDanmaku').checked = settings.enableDanmakuProjection === true;
+
+  // 字幕外观
+  setRange('setSubScale', 'subScaleVal', settings.subtitleScale, 100, '%');
+  setRange('setSubOffset', 'subOffsetVal', settings.subtitleOffset, 230, 'px');
+  setRange('setSubBg', 'subBgVal', settings.subtitleBgOpacity, 70, '%');
+  setRange('setSubRadius', 'subRadiusVal', settings.subtitleRadius, 8, 'px');
+  setRange('setSubWeight', 'subWeightVal', settings.subtitleWeight, 800, '');
+  setRange('setSubMaxWidth', 'subMaxWidthVal', settings.subtitleMaxWidth, 88, '%');
+  setRange('setSubHold', 'subHoldVal', settings.subtitleHold, 3, 's');
+  $('setSubColor').value = /^#[0-9a-f]{6}$/i.test(settings.subtitleColor || '')
+    ? settings.subtitleColor
+    : '#ffffff';
+  $('setSubStroke').value = settings.subtitleStroke || 'outline';
+
+  // 弹幕外观
+  setRange('setDmArea', 'dmAreaVal', settings.danmakuArea, 50, '%');
+  setRange('setDmOpacity', 'dmOpacityVal', settings.danmakuOpacity, 80, '%');
+  setRange('setDmScale', 'dmScaleVal', settings.danmakuScale, 100, '%');
+  setRange('setDmSpeed', 'dmSpeedVal', settings.danmakuSpeed, 50, '');
+  setRange('setDmWeight', 'dmWeightVal', settings.danmakuWeight, 700, '');
+  setRange('setDmMax', 'dmMaxVal', settings.danmakuMax, 60, '');
+  $('setDmStroke').checked = settings.danmakuStroke !== false;
+  $('setDmHideNative').checked = settings.danmakuHideNative !== false;
+
+  // 视觉绿弧
+  $('setGreenArc').checked = settings.enableVisionGreenArc === true;
+  $('setOverlayRadar').checked = settings.overlayRadar === true;
+  $('setAlertEnabled').checked = settings.alertEnabled === true;
+
+  // 播放与托盘
+  $('setPlaybackRate').value = String(settings.playbackRate ?? 1);
+  $('setRatioLock').checked = settings.ratioLocked === true;
+  setRange('setSnapAdjust', 'snapAdjustVal', settings.snapAdjustment, 0, 'px');
+  $('setMuted').checked = settings.muted === true;
+  $('setCloseToTray').checked = settings.closeToTray !== false;
+  $('setTrayClickFloat').checked = settings.trayClickAction === 'float';
+
+  // 转向提醒
+  $('setTurnReminder').checked = settings.enableTurnReminder !== false;
+  $('setTurnLR').checked = settings.turnEnableLR !== false;
+  $('setTurnUD').checked = settings.turnEnableUD !== false;
+
+  // 字幕行为开关
+  $('setSubUseApi').checked = settings.subtitleUseApi !== false;
+  $('setSubMergeOverlap').checked = settings.subtitleMergeOverlap !== false;
+  $('setSubHideOnPause').checked = settings.subtitleHideOnPause === true;
+  $('setSubAutoOpen').checked = settings.subtitleAutoOpen !== false;
+  $('setSubPos').value = settings.subtitlePos || 'center';
+  $('setSubKeepRatio').checked = settings.subtitleKeepRatio !== false;
+  $('setSubFade').checked = settings.subtitleFade !== false;
+
+  // 转向外观
+  setRange('setTurnOffset', 'turnOffsetVal', settings.turnOffset, 400, 'px');
+  setRange('setTurnScale', 'turnScaleVal', settings.turnScale, 100, '%');
+  setRange('setTurnDuration', 'turnDurationVal', settings.turnDuration, 2, 's');
+  setRange('setTurnOpacity', 'turnOpacityVal', settings.turnOpacity, 85, '%');
+  setRange('setTurnPosY', 'turnPosYVal', settings.turnPosY, 50, '%');
+  setRange('setTurnPosX', 'turnPosXVal', settings.turnPosX, 50, '%');
+  $('setTurnColor').value = /^#[0-9a-f]{6}$/i.test(settings.turnColor || '')
+    ? settings.turnColor
+    : '#49b2fc';
+}
+
+/**
+ * 字幕来源状态：每秒刷一次。
+ *
+ * 三种情况要能一眼分清 —— API 拿到字幕轨 / 接口没给而降级抓网页 / 两边都没有，
+ * 否则用户只会看到「屏幕上没有字幕」，不知道是哪一环出的问题。
+ */
+async function pollSubtitleStatus() {
+  const el = $('subSourceText');
+  if (!el) return;
+  try {
+    const st = await window.api.subtitleStatus();
+    if (!st) {
+      el.textContent = '等待视频载入…';
+      return;
+    }
+    if (!st.enabled) {
+      el.textContent = '字幕精灵未开启';
+      return;
+    }
+    if (st.mode === 'api') el.textContent = `官方接口加载成功（${st.count} 条）`;
+    else if (st.mode === 'dom') el.textContent = '接口无字幕，已降级为网页抓取';
+    else el.textContent = '未识别到字幕';
+  } catch {
+    el.textContent = '读取状态失败';
+  }
+}
+
+/** 把范围控件的值写进去，同时刷新右侧数值 */
+function setRange(id, valId, value, fallback, suffix) {
+  const el = $(id);
+  if (!el) return;
+  const v = Number.isFinite(Number(value)) ? Number(value) : fallback;
+  el.value = String(v);
+  const label = $(valId);
+  if (label) label.textContent = `${v}${suffix}`;
+  // 设完值必须重画填充条，否则蓝色那段还停在旧位置
+  paintRange(el);
+}
+
+/**
+ * 绑定一个字幕/弹幕外观滑块：拖动时实时下发，松手才落盘。
+ *
+ * 用 input 事件做实时预览、change 事件做持久化，避免拖动过程中
+ * 每一帧都写一次 settings.json。
+ */
+function bindStyleRange(id, valId, suffix, makePatch) {
+  const el = $(id);
+  if (!el) return;
+  const label = $(valId);
+  const paint = () => {
+    if (label) label.textContent = `${el.value}${suffix}`;
+  };
+  el.addEventListener('input', () => {
+    paint();
+    window.api.save(makePatch(Number(el.value)));
+  });
+  el.addEventListener('change', () => {
+    paint();
+    window.api.save(makePatch(Number(el.value)));
+  });
+}
+
+/**
+ * 识别健康度：最近 60 帧的成功率与失败分类。
+ * 用来回答「为什么画面上没有箭头」—— 区分「识别停了」和「在跑但认不出来」。
+ */
+function renderHealth(st) {
+  const sum = $('healthSummary');
+  const ok = $('healthLastOk');
+  const why = $('healthReason');
+  if (!sum || !ok || !why) return;
+
+  if (!st) {
+    sum.textContent = '等待视频载入…';
+    sum.classList.remove('bad');
+    ok.textContent = '—';
+    why.textContent = '—';
+    return;
+  }
+
+  const win = st.window || 0;
+  const good = st.ok || 0;
+  const pct = win ? Math.round((good / win) * 100) : 0;
+  const parts = [`最近 ${win} 帧 成功 ${good}（${pct}%）`];
+  if (st.noMap) parts.push(`无小地图 ${st.noMap}`);
+  if (st.noRoi) parts.push(`未框选 ${st.noRoi}`);
+  if (st.hold) parts.push(`疑似反向 ${st.hold}`);
+  sum.textContent = parts.join(' · ');
+  sum.classList.toggle('bad', win > 0 && good === 0);
+
+  // 超过 5 秒没有更新：识别循环停了（视频暂停 / 开关关闭）
+  if (st.ageMs != null && st.ageMs > 5000) {
+    ok.textContent = `识别已停止更新（${Math.round(st.ageMs / 1000)} 秒前）`;
+    ok.classList.add('bad');
+  } else if (st.lastOkAt) {
+    const agoSec = Math.max(0, Math.round((Date.now() - st.lastOkAt) / 100) / 10);
+    ok.textContent = `${agoSec} 秒前`;
+    ok.classList.remove('bad');
+  } else {
+    ok.textContent = '还没成功过';
+    ok.classList.add('bad');
+  }
+
+  why.textContent = st.lastReason || (good ? '正常' : '—');
+  why.classList.toggle('bad', !!st.lastReason);
+}
+
+async function pollHealth() {
+  try {
+    renderHealth(await window.api.bearingStats());
+  } catch {
+    /* 主进程还没就绪 */
+  }
 }
 
 function wireSettings() {
+  /* ---- 魔改扩展：字幕 / 弹幕 ---- */
+  $('setSubtitleSprite').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.enableSubtitleSprite = on;
+    window.api.save({ enableSubtitleSprite: on });
+    toast(on ? '已启用底部字幕精灵' : '已关闭字幕精灵');
+    pollSubtitleStatus();
+  });
+  $('setSubHideNative').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.subtitleHideNative = on;
+    window.api.save({ subtitleHideNative: on });
+    toast(on ? '已隐藏播放器原生字幕' : '原生字幕恢复显示');
+  });
+  $('setDanmaku').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.enableDanmakuProjection = on;
+    window.api.save({ enableDanmakuProjection: on });
+    toast(on ? '已启用全屏弹幕投影' : '已关闭弹幕投影');
+  });
+  $('btnSubRefetch').addEventListener('click', async () => {
+    const btn = $('btnSubRefetch');
+    btn.disabled = true;
+    try {
+      const r = await window.api.subtitleRefetch();
+      if (!r || !r.ok) {
+        const why =
+          r && r.reason === 'no-video'
+            ? '还没有载入视频'
+            : r && r.reason === 'api-off'
+              ? '官方字幕接口已关闭'
+              : '读取失败';
+        toast(why, true);
+      } else if (r.count) {
+        toast(`已读取 ${r.count} 条字幕`);
+      } else {
+        toast('该视频没有可用字幕轨，继续使用网页抓取', true);
+      }
+    } catch {
+      toast('读取失败', true);
+    } finally {
+      btn.disabled = false;
+      pollSubtitleStatus();
+    }
+  });
+
+  /* ---- 魔改扩展：字幕外观 ---- */
+  bindStyleRange('setSubScale', 'subScaleVal', '%', (v) => ({ subtitle: { scale: v } }));
+  bindStyleRange('setSubOffset', 'subOffsetVal', 'px', (v) => ({ subtitle: { offset: v } }));
+  bindStyleRange('setSubBg', 'subBgVal', '%', (v) => ({ subtitle: { bgOpacity: v } }));
+  bindStyleRange('setSubRadius', 'subRadiusVal', 'px', (v) => ({ subtitle: { radius: v } }));
+  bindStyleRange('setSubWeight', 'subWeightVal', '', (v) => ({ subtitle: { weight: v } }));
+  bindStyleRange('setSubMaxWidth', 'subMaxWidthVal', '%', (v) => ({ subtitle: { maxWidth: v } }));
+  bindStyleRange('setSubHold', 'subHoldVal', 's', (v) => ({ subtitle: { hold: v } }));
+
+  $('setSubColor').addEventListener('change', (event) => {
+    window.api.save({ subtitle: { color: event.target.value } });
+  });
+  $('setSubStroke').addEventListener('change', (event) => {
+    window.api.save({ subtitle: { stroke: event.target.value } });
+  });
+
+  /* ---- 魔改扩展：弹幕外观 ---- */
+  bindStyleRange('setDmArea', 'dmAreaVal', '%', (v) => ({ danmaku: { area: v } }));
+  bindStyleRange('setDmOpacity', 'dmOpacityVal', '%', (v) => ({ danmaku: { opacity: v } }));
+  bindStyleRange('setDmScale', 'dmScaleVal', '%', (v) => ({ danmaku: { scale: v } }));
+  bindStyleRange('setDmSpeed', 'dmSpeedVal', '', (v) => ({ danmaku: { speed: v } }));
+  bindStyleRange('setDmWeight', 'dmWeightVal', '', (v) => ({ danmaku: { weight: v } }));
+  bindStyleRange('setDmMax', 'dmMaxVal', '', (v) => ({ danmaku: { max: v } }));
+  $('setDmHideNative').addEventListener('change', (event) => {
+    state.boot.settings.danmakuHideNative = event.target.checked;
+    window.api.save({ danmakuHideNative: event.target.checked });
+    toast(event.target.checked ? '已隐藏播放器原生弹幕' : '原生弹幕恢复显示');
+  });
+  $('setDmStroke').addEventListener('change', (event) => {
+    window.api.save({ danmaku: { stroke: event.target.checked } });
+  });
+
+  /* ---- 魔改扩展：数据目录 / 字幕外观重置 ---- */
+  $('btnOpenData').addEventListener('click', () => {
+    window.api.action('open-data');
+  });
+
+  $('btnSubReset').addEventListener('click', () => {
+    // 字幕外观恢复出厂：只动外观，不动开关和来源设置
+    const def = {
+      scale: 100,
+      color: '#ffffff',
+      stroke: 'outline',
+      pos: 'center',
+      offset: 230,
+      bgOpacity: 70,
+      keepRatio: true,
+      fade: true,
+      hold: 3,
+      maxWidth: 88,
+      weight: 800,
+      radius: 8
+    };
+    window.api.save({ subtitle: def }).then(() => {
+      state.boot.settings = {
+        ...state.boot.settings,
+        subtitleScale: def.scale,
+        subtitleColor: def.color,
+        subtitleStroke: def.stroke,
+        subtitlePos: def.pos,
+        subtitleOffset: def.offset,
+        subtitleBgOpacity: def.bgOpacity,
+        subtitleKeepRatio: def.keepRatio,
+        subtitleFade: def.fade,
+        subtitleHold: def.hold,
+        subtitleMaxWidth: def.maxWidth,
+        subtitleWeight: def.weight,
+        subtitleRadius: def.radius
+      };
+      fillSettings(state.boot.settings);
+      toast('字幕外观已恢复默认');
+    });
+  });
+
+  /* ---- 魔改扩展：视觉绿弧 / 播放 / 托盘 ---- */
+  $('setAlertEnabled').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.alertEnabled = on;
+    window.api.save({ alertEnabled: on });
+    toast(on ? '已开启放大提醒' : '已关闭放大提醒');
+  });
+
+
+  $('btnAlertPlace').addEventListener('click', async () => {
+    if (!state.boot.settings.alertEnabled) {
+      toast('先打开「放大提醒」再拖位置', true);
+      return;
+    }
+    const placing = await window.api.alertPlace();
+    $('btnAlertPlace').textContent = placing ? '完成（点这里锁定）' : '拖动提醒窗位置';
+    toast(placing ? '直接拖动屏幕上的提醒窗，拖好再点一次' : '提醒窗位置已记住');
+  });
+
+  $('setOverlayRadar').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.overlayRadar = on;
+    window.api.save({ overlayRadar: on });
+    toast(on ? '已切换到四轴罗盘雷达' : '已切回原版圆环箭头');
+  });
+
+  $('setGreenArc').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.enableVisionGreenArc = on;
+    window.api.save({ enableVisionGreenArc: on });
+    toast(on ? '已开启镜头朝向绿弧（可能乱飘）' : '已关闭绿弧，扇形识别不再运行');
+  });
+
+  $('setPlaybackRate').addEventListener('change', (event) => {
+    const rate = Number(event.target.value);
+    state.boot.settings.playbackRate = rate;
+    window.api.playbackUpdate({ playbackRate: rate });
+    toast(`常规倍速 ${rate}×`);
+  });
+
+  bindStyleRange('setSnapAdjust', 'snapAdjustVal', 'px', (v) => ({ snapAdjustment: v }));
+
+  $('setRatioLock').addEventListener('change', (event) => {
+    const on = event.target.checked;
+    state.boot.settings.ratioLocked = on;
+    window.api.save({ ratioLocked: on });
+    toast(on ? '已锁定 16:9' : '已解除比例锁定');
+  });
+
+  $('setMuted').addEventListener('change', (event) => {
+    state.boot.settings.muted = event.target.checked;
+    window.api.playbackUpdate({ muted: event.target.checked });
+  });
+
+  $('setCloseToTray').addEventListener('change', (event) => {
+    state.boot.settings.closeToTray = event.target.checked;
+    window.api.save({ closeToTray: event.target.checked });
+    toast(event.target.checked ? '关闭启动器时会收进托盘' : '关闭启动器会直接退出');
+  });
+
+  $('setTrayClickFloat').addEventListener('change', (event) => {
+    const action = event.target.checked ? 'float' : 'launcher';
+    state.boot.settings.trayClickAction = action;
+    window.api.save({ trayClickAction: action });
+    toast(event.target.checked ? '托盘单击切换浮窗' : '托盘单击显示启动器');
+  });
+
+  /* ---- 魔改扩展：字幕行为开关 ---- */
+  const subSwitch = (id, key, onText, offText) => {
+    $(id).addEventListener('change', (event) => {
+      const on = event.target.checked;
+      state.boot.settings[key] = on;
+      window.api.save({ [key]: on });
+      if (onText) toast(on ? onText : offText);
+    });
+  };
+  subSwitch('setSubUseApi', 'subtitleUseApi', '优先使用官方字幕接口', '只用网页抓取');
+  subSwitch('setSubMergeOverlap', 'subtitleMergeOverlap', '多行字幕合并显示', '只显示最新一条');
+  subSwitch('setSubHideOnPause', 'subtitleHideOnPause', '暂停时隐藏字幕', '暂停时保持显示');
+  subSwitch('setSubAutoOpen', 'subtitleAutoOpen', '会自动点开播放器字幕', '不会改动播放器字幕按钮');
+
+  $('setSubPos').addEventListener('change', (event) => {
+    window.api.save({ subtitle: { pos: event.target.value } });
+  });
+  $('setSubKeepRatio').addEventListener('change', (event) => {
+    window.api.save({ subtitle: { keepRatio: event.target.checked } });
+  });
+  $('setSubFade').addEventListener('change', (event) => {
+    window.api.save({ subtitle: { fade: event.target.checked } });
+  });
+
+  /* ---- 魔改扩展：转向外观 ---- */
+  bindStyleRange('setTurnOffset', 'turnOffsetVal', 'px', (v) => ({ turn: { offset: v } }));
+  bindStyleRange('setTurnScale', 'turnScaleVal', '%', (v) => ({ turn: { scale: v } }));
+  bindStyleRange('setTurnDuration', 'turnDurationVal', 's', (v) => ({ turn: { duration: v } }));
+  bindStyleRange('setTurnOpacity', 'turnOpacityVal', '%', (v) => ({ turn: { opacity: v } }));
+  bindStyleRange('setTurnPosY', 'turnPosYVal', '%', (v) => ({ turn: { posY: v } }));
+  bindStyleRange('setTurnPosX', 'turnPosXVal', '%', (v) => ({ turn: { posX: v } }));
+  $('setTurnColor').addEventListener('change', (event) => {
+    window.api.save({ turn: { color: event.target.value } });
+  });
+
+  /* ---- 魔改扩展：转向提醒 ---- */
+  $('setTurnReminder').addEventListener('change', (event) => {
+    state.boot.settings.enableTurnReminder = event.target.checked;
+    window.api.save({ enableTurnReminder: event.target.checked });
+    toast(event.target.checked ? '已启用转向提醒' : '已关闭转向提醒');
+  });
+  $('setTurnLR').addEventListener('change', (event) => {
+    state.boot.settings.turnEnableLR = event.target.checked;
+    window.api.save({ turn: { enableLR: event.target.checked } });
+  });
+  $('setTurnUD').addEventListener('change', (event) => {
+    state.boot.settings.turnEnableUD = event.target.checked;
+    window.api.save({ turn: { enableUD: event.target.checked } });
+  });
+
   $('setImmersion').addEventListener('change', async (event) => {
     try {
       await window.api.action('immersion', event.target.checked);
@@ -446,6 +882,39 @@ function wireSettings() {
   });
 
   $('setPin').addEventListener('change', (e) => window.api.action('pin', e.target.checked));
+
+  $('setAvoidHide').addEventListener('change', (e) => {
+    const on = e.target.checked;
+    state.boot.settings.avoidHideEnabled = on;
+    window.api.save({ avoidHideEnabled: on });
+  });
+
+  bindStyleRange('setAvoidHold', 'avoidHoldVal', 's', (v) => ({ avoidHideHold: v }));
+
+  $('setStoryHide').addEventListener('change', (e) => {
+    const on = e.target.checked;
+    state.boot.settings.storyAutoHide = state.boot.settings.storyAutoHide || {};
+    state.boot.settings.storyAutoHide.enabled = on;
+    // 浮窗隐藏并进这个总开关：用户要的是「剧情时全部收起」，
+    // 分成两个开关只会让人不确定该开哪个。
+    state.boot.settings.storyAutoHide.hideFloat = on;
+    window.api.save({ storyAutoHide: { enabled: on, hideFloat: on } });
+  });
+
+  $('setStoryBox').addEventListener('change', (e) => {
+    const on = e.target.checked;
+    state.boot.settings.storyAutoHide = state.boot.settings.storyAutoHide || {};
+    state.boot.settings.storyAutoHide.showBox = on;
+    window.api.save({ storyAutoHide: { showBox: on } });
+  });
+
+  $('setCombatFade').addEventListener('change', (e) => {
+    const on = e.target.checked;
+    state.boot.settings.combatFadeEnabled = on;
+    window.api.save({ combatFadeEnabled: on });
+  });
+
+  bindStyleRange('setCombatOpacity', 'combatOpacityVal', '%', (v) => ({ combatOpacity: v }));
 
   $('setPass').addEventListener('change', (e) => {
     window.api.action('pass', e.target.checked);
@@ -738,7 +1207,7 @@ function paintKeys(kbd, acc) {
     kbd.textContent = '未设置';
     return;
   }
-  const parts = /^Mouse[45]$/i.test(acc) ? [acc] : String(acc).split('+');
+  const parts = /^(RMB\+)?Mouse[45]$/i.test(acc) ? [acc] : String(acc).split('+');
   parts.forEach((part, i) => {
     if (i) {
       const plus = document.createElement('span');
@@ -767,7 +1236,11 @@ function renderHookState() {
   const hookActions = new Set((state.boot.hotkeys || [])
     .filter((meta) => meta.hold || meta.key === 'cycleSpeed').map((meta) => meta.key));
   const hookKeys = Object.entries(hotkeys).filter(([action, accelerator]) =>
-    accelerator && (hookActions.has(action) || !String(accelerator).includes('+')));
+    accelerator &&
+    (hookActions.has(action) ||
+      !String(accelerator).includes('+') ||
+      // 右键+侧键是带 + 的，但它走钩子而不是 globalShortcut
+      /^RMB\+Mouse[45]$/i.test(accelerator)));
   const running = !!state.boot.hookRunning;
 
   if (!hookKeys.length) {
@@ -830,13 +1303,17 @@ function captureHotkey(kbd, key) {
   window.api.capturing(true);
 
   kbd.classList.add('capturing');
-  kbd.textContent = '按键位或鼠标侧键…';
+  kbd.textContent = '按键位、侧键，或按住右键再按侧键…';
+
+  // 录制期间右键是否按着：用来拼「右键 + 侧键」
+  let rightDown = false;
 
   const cleanup = () => {
     window.api.capturing(false);
     kbd.classList.remove('capturing');
     document.removeEventListener('keydown', onKey, true);
     document.removeEventListener('mousedown', onMouse, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
     if (activeCapture === cleanup) activeCapture = null;
   };
 
@@ -881,17 +1358,26 @@ function captureHotkey(kbd, key) {
     await commit(acc);
   };
 
-  // 鼠标侧键：DOM 里 button 3 = 后退侧键、4 = 前进侧键
+  // 鼠标：DOM 里 button 2 = 右键、3 = 后退侧键、4 = 前进侧键
   const onMouse = async (e) => {
+    if (e.button === 2) {
+      rightDown = true; // 右键本身不当作键位，只作为组合前缀
+      return;
+    }
     if (e.button !== 3 && e.button !== 4) return;
     e.preventDefault();
     e.stopPropagation();
-    await commit(`Mouse${e.button + 1}`);
+    await commit(`${rightDown ? 'RMB+' : ''}Mouse${e.button + 1}`);
+  };
+
+  const onMouseUp = (e) => {
+    if (e.button === 2) rightDown = false;
   };
 
   activeCapture = cleanup;
   document.addEventListener('keydown', onKey, true);
   document.addEventListener('mousedown', onMouse, true);
+  document.addEventListener('mouseup', onMouseUp, true);
 }
 
 function reportFailed(failed, focusKey) {
@@ -954,6 +1440,8 @@ function prettify(acc) {
   if (!acc) return '未设置';
   if (/^Mouse4$/i.test(acc)) return '鼠标侧键 ◀';
   if (/^Mouse5$/i.test(acc)) return '鼠标侧键 ▶';
+  if (/^RMB\+Mouse4$/i.test(acc)) return '右键+侧键 ◀';
+  if (/^RMB\+Mouse5$/i.test(acc)) return '右键+侧键 ▶';
   return String(acc)
     .replace(/\bSuper\b/g, 'Win')
     .replace(/\bLeft\b/g, '←')
