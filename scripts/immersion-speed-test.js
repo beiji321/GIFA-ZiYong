@@ -132,6 +132,25 @@ function createWindow(options = {}) {
   window.setFullScreen = (value) => { window.fullScreen = !!value; };
   window.getBounds = () => ({ ...window.bounds });
   window.getContentBounds = () => window.getBounds();
+  /* 真实 Electron 里 getContentSize 是「内容区尺寸」，不含边框。
+   * 这里按 frame 尺寸模拟：内容 = 外框 - frame。
+   * 之前直接返回外框尺寸，导致 frameW/frameH 恒为 0，
+   * 「用 setContentSize 会让窗口整体位移」这类问题在测试里根本暴露不出来。 */
+  const frameOf = () => options.frame || { width: 0, height: 0 };
+  window.getContentSize = () => {
+    const f = frameOf();
+    return [Math.max(0, window.bounds.width - f.width), Math.max(0, window.bounds.height - f.height)];
+  };
+  /* setContentSize 的真实语义：保持内容区左上角的**屏幕绝对坐标**不变，
+   * 外框向右下扩展。chrome 高度变化时 y 就会跟着动 —— 这正是 bug 的来源。 */
+  window.setContentSize = (w, h) => {
+    const f = frameOf();
+    const before = window.getBounds();
+    window.calls.push({ method: 'setContentSize', value: { width: w, height: h } });
+    window.bounds.width = w + f.width;
+    window.bounds.height = h + f.height;
+    if (before.width !== window.bounds.width || before.height !== window.bounds.height) window.emit('resize');
+  };
   window.setBounds = (bounds) => {
     const previous = window.getBounds();
     window.calls.push({ method: 'setBounds', value: { ...bounds } });
@@ -252,7 +271,57 @@ function createHarness(options = {}) {
     activeBearingLayout,
     resetGamepadSession() {},
     stopGamepadPoller() {},
-    gamepadPauses: new Set()
+    // 托盘是我们加的：notifyFloatState 会顺手刷新托盘菜单，测试里给个空实现
+    rebuildTrayMenu() {},
+    // 诊断日志：只往文件里写，测试里给空实现
+    diag: { init() {}, log() {} },
+    scheduleCidRetry() {},
+    switchPartData() {},
+    // 以下是我们的增量：位置比例恢复、比例锁定、叠加层、雷达配置。
+    // 这个测试只关心沉浸与 bounds 语义，这些给空实现即可。
+    saveWindowRatio() {},
+    restoreWindowRatio: () => null,
+    saveBearingRatio() {},
+    /* applyRatioLock 在这里是空桩：本文件的用例不覆盖比例锁定的几何。
+     * 试过把它换成真实实现来测「进出沉浸后窗口往下漂」，但模拟窗口的
+     * frame 恒为 0，setContentSize 和 setBounds 结果一致，测不出区别，
+     * 那条用例等于永远通过 —— 删掉比留着假绿更诚实。
+     * 位置漂移靠实机验证，日志看 [ratio] 与 [immersion] 两行的 bounds。 */
+    applyRatioLock() {},
+    ensureOverlayVisible() {},
+    pushRadarConfig() {},
+    pushDanmakuConfig() {},
+    destroySubtitleWindow() {},
+    destroyDanmakuWindow() {},
+    destroyAlertWindow() {},
+    gamepadPauses: new Set(),
+    overlayWin: null,
+    /* 这些是 main.js 顶层的 const/函数，测试只抽了部分函数进沙箱，
+     * 于是引用它们的代码会报 ReferenceError。按真实语义补齐即可：
+     * bootAt 是启动时刻（测试里就是现在），restoreBearingRatio 没存储时返回 null。 */
+    bootAt: Date.now(),
+    restoreBearingRatio: () => null,
+    // createOverlay 的 did-finish-load 会调它；本测试不关心叠加层配置内容
+    pushOverlayBoot() {},
+    showOverlay: () => null,
+    ensureOverlayReachable() {},
+    // 用真实实现：叠加层用例要靠它在 settings.bearing.layouts 里找当前布局
+    activeBearingLayout,
+    /* main.js 的顶层可变状态。测试只抽取了部分函数进沙箱，
+     * 这些 let 不会跟着过来，引用它们的代码会抛 ReferenceError。
+     * 初值与 main.js 保持一致。 */
+    chromeHeight: 64,
+    overlayPlacing: false,
+    lastBearing: null,
+    lastBearingStats: null,
+    ratioGuard: false,
+    // effectiveOpacity 读它决定剧情期间是否全透明；这个测试不涉及剧情
+    storyHidden: false,
+    // applyRatioLock 用的重入锁，main.js 里是模块级 let
+    ratioApplying: false,
+    // 注意：不要在这里放 settings —— 下面第 300 行的
+    // `let settings = {...DEFAULT_SETTINGS}` 才是它的真正来源，
+    // 在这里塞 undefined 会把声明提前覆盖掉，守卫就全部失效了。
   });
   const declarations = [
     ...['DEFAULT_HOTKEYS', 'PLAYBACK_RATES', 'HOLD_PLAYBACK_RATES', 'DEFAULT_SETTINGS'].map((name) => extractConstant(mainSource, name)),
@@ -277,14 +346,19 @@ function createHarness(options = {}) {
     'let hoverTimer = null;',
     'let hoverCandidate = false;',
     'let hoverCandidateAt = 0;',
+    // 沉浸防遮挡（effectiveOpacity 要用）
+    'let avoidUntil = 0;',
+    'let combatUntil = 0;',
     ...[
       'settingsFile', 'flushSettings', 'persist', 'playbackSettings', 'updatePlaybackSettings',
       'isPlaybackGuest', 'isPlaybackMessage', 'playbackState', 'guestPlaybackSettings',
       'publishPlaybackSettings', 'showNotice', 'cyclePlaybackRate', 'setHoldSpeed', 'cancelTemporarySpeed',
       'attachPlaybackGuest', 'applyPin', 'createWindow', 'sendTo', 'broadcast', 'floatState', 'notifyFloatState',
+      'effectiveOpacity',
       'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'sameWindowBounds', 'fitImmersionWindow',
       'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore', 'setImmersion', 'registerIpc',
-      'clearBearingOverlay', 'overlaySize', 'overlayBounds', 'createOverlay', 'showOverlay', 'setOverlayPlacing', 'setBearingEnabled'
+      'clearBearingOverlay', 'overlaySize', 'overlayBounds', 'createOverlay', 'showOverlay', 'setOverlayPlacing', 'setBearingEnabled',
+      // 比例锁定：位置漂移就是在这几个函数里发生的，必须是真实实现
     ].map((name) => extractFunction(mainSource, name)),
     `globalThis.testApi = {
       createWindow, setImmersion, fitImmersionWindow, syncHoverFade, updateHoverFade, cyclePlaybackRate,
@@ -354,7 +428,15 @@ function notices(harness) {
 
 function assertNoPersistence(harness) {
   assert.equal(harness.fileWrites.length, 0, '临时显示或临时倍速不得写设置文件');
-  assert.equal(harness.clock.pending().filter((timer) => !timer.repeat).length, 0, '临时操作不得排队保存设置');
+  /* 只拦「保存设置」这一个定时器。
+   * persist() 的 debounce 是唯一会在这里排队的保存动作；
+   * 窗口的 resize-phase 通知（140ms）是纯 UI 消息，跟设置无关，
+   * 一起算进来会误报成「偷偷保存了设置」。 */
+  const saving = harness.clock
+    .pending()
+    .filter((timer) => !timer.repeat)
+    .filter((timer) => /flushSettings|persist/.test(String(timer.callback)));
+  assert.equal(saving.length, 0, '临时操作不得排队保存设置');
 }
 
 function settleHover(harness, point) {

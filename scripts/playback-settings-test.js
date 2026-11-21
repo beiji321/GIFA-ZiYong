@@ -152,6 +152,9 @@ function createHarness(options = {}) {
     hookHotkeys: { apply() {}, cancelHeld: () => { heldCancellations += 1; } },
     resetGamepadSession() {},
     stopGamepadPoller() {},
+    // 托盘是我们加的：退出回调会销毁托盘、刷新菜单，测试里给空实现
+    destroyTray() {},
+    rebuildTrayMenu() {},
     DEFAULT_GAMEPAD,
     DEFAULT_BEARING_LAYOUTS,
     loadBearingLayouts

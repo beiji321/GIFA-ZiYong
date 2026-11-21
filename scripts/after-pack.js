@@ -17,7 +17,8 @@ module.exports = async function afterPack({ appOutDir, electronPlatformName }) {
 
   const archive = outputPath('resources/app.asar');
   asar.uncache(archive);
-  const allowedRoots = new Set(['src', 'build', 'node_modules', 'package.json']);
+  // assets/ 是剧情识别的模板图和抓图脚本，属于产品资源，不是素材。
+  const allowedRoots = new Set(['src', 'build', 'assets', 'node_modules', 'package.json']);
   const unexpected = asar.listPackage(archive)
     .map((entry) => entry.replace(/\\/g, '/').replace(/^\//, ''))
     .filter((entry) => !allowedRoots.has(entry.split('/')[0]));

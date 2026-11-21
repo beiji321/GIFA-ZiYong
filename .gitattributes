@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+# Windows 专用的 PowerShell / C# 脚本保持原样交给 git 判断，
+# 但脚本文件本身必须带 BOM（见 capture.ps1 的注释），这一点 git 不会改。
+*.ps1 text eol=lf
+*.cs  text eol=lf
+
+# 二进制资源不参与换行符转换
+*.png binary
+*.ico binary
+*.bmp binary
+*.exe binary
+*.zip binary
+*.tgz binary
+
+# 素材目录在仓库外，这里只是防御

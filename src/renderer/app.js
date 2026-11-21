@@ -30,9 +30,15 @@ let wv = null;
 
 /** B 站视频页 URL 读 ?p=（1 起）；读不到返回 0 */
 function partFromUrl(u) {
-  const m = /[?&](?:p|page)=(\d+)/.exec(String(u || ''));
-  const n = m ? Number(m[1]) : 0;
-  return Number.isFinite(n) && n > 0 ? n : 0;
+  const s = String(u || '');
+  const m = /[?&](?:p|page)=(\d+)/.exec(s);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  // 第一 P 的地址通常就是 /video/BVxxx/ 不带 p 参数。
+  // 以前这里返回 0，从 P2 自动回到 P1 时下拉框和弹幕都不会跟着退。
+  return /\/video\/(?:BV[0-9A-Za-z]{10}|av\d+)/i.test(s) ? 1 : 0;
 }
 
 /** 读 /video/BVxxx/ 或 /video/av123/，用来过滤旧页面迟到的状态心跳 */
@@ -50,7 +56,9 @@ function idFromUrl(u) {
 function syncPartFromGuest(v, fromGuest) {
   const n = Number(v && v.p);
   if (!Number.isFinite(n) || n < 1 || n === state.p) return;
-  if (!state.pages.length || n > state.pages.length) return;
+  // 分 P 列表读不到（开机时接口偶发失败）不能把自动连播一起挡死：
+  // 页码照收，cid 由主进程按 p 自己去查。
+  if (state.pages.length && n > state.pages.length) return;
   const vid = String((v && v.vid) || '').toLowerCase();
   if (vid && state.id && vid !== String(state.id).toLowerCase()) return;
   if (fromGuest && Date.now() - state.loadIssuedAt < 1500) return;
@@ -65,6 +73,14 @@ function setCurrentPart(n, auto) {
   resetLayoutHint();
   renderParts();
   if (!auto) return;
+  // 自动连播时弹幕/字幕在主进程里按 cid 缓存，必须让它按新的 P 换 cid。
+  // 少了这一步，全屏弹幕会一直放上一 P 的（手动切 P 走 bili:load，不经过这里）。
+  try {
+    const r = window.api.part({ id: state.id, p: n });
+    if (r && typeof r.catch === 'function') r.catch(() => {});
+  } catch {
+    /* 换 P 失败不影响继续播 */
+  }
   try {
     const r = window.api.save({ lastPart: n });
     if (r && typeof r.catch === 'function') r.catch(() => {});
@@ -85,7 +101,12 @@ async function init() {
   state.pages = [];
   applyImmersionState(!!(state.boot.floatState && state.boot.floatState.immersion));
 
+  // 魔改扩展：按设置初始化 16:9 锁定按钮的状态
+  $('btnRatio').classList.toggle('locked', s.ratioLocked === true);
+  document.body.classList.toggle('ratio-locked', s.ratioLocked === true);
+
   createWebview();
+  wireChromeHeight();
   renderLayoutSelect();
   wireUi();
   wireHotkeys();
@@ -120,6 +141,58 @@ async function init() {
 
 /* --------------------------------------------------------------- webview */
 
+/**
+ * 把 chrome 高度（标题栏 + 控制条）实时报给主进程。
+ *
+ * 比例锁定要用它算视频区高度，而它只有布局稳定后才是真的：
+ * 主进程自己在 ready-to-show 那一刻去量，量到的是布局完成前的值
+ * （日志里稳定量到 105，真实只有 66），高度就算错了，而且再没人纠正。
+ * 改由渲染层在布局真的变了的时候报告，主进程照着用。
+ */
+function wireChromeHeight() {
+  const stage = $('stage');
+  if (!stage || typeof ResizeObserver !== 'function') return;
+  let last = -1;
+  let timer = null;
+  let firstAt = 0;
+  const flush = () => {
+    timer = null;
+    firstAt = 0;
+    const h = Math.round(window.innerHeight - stage.clientHeight);
+    if (!Number.isFinite(h) || h < 0 || h >= 400 || h === last) return;
+    last = h;
+    try {
+      window.api.action('chrome-height', { h });
+    } catch {
+      /* 报不上去就还是用主进程自己量的兜底值 */
+    }
+  };
+  const report = () => {
+    const now = Date.now();
+    if (!firstAt) firstAt = now;
+    clearTimeout(timer);
+    /* 布局稳定 300ms 之后再报。
+     * 刚打开窗口那一刻量到的是半成品（地址栏还没收起来，量出 105，
+     * 真实是 66），报上去会把已知正确的高度改坏，窗口还会当场弹一下。
+     * 最多等 1.5 秒，避免一直不稳定时一次都报不上去。 */
+    timer = setTimeout(flush, now - firstAt > 1500 ? 0 : 300);
+  };
+  new ResizeObserver(report).observe(stage);
+  window.addEventListener('resize', report);
+  report();
+  // 再补一段定时采样：地址栏收起、控制条重排这类变化有时不触发
+  // ResizeObserver（父容器尺寸没动），只靠它可能一次都报不上来。
+  // 启动这八秒管够了，之后布局不再变。
+  const until = Date.now() + 8000;
+  const poll = setInterval(() => {
+    if (Date.now() > until) {
+      clearInterval(poll);
+      return;
+    }
+    report();
+  }, 400);
+}
+
 function createWebview() {
   wv = document.createElement('webview');
   wv.id = 'view';
@@ -150,6 +223,41 @@ function createWebview() {
       window.api.action('fullscreen', !!(e.args && e.args[0]));
       return;
     }
+    /* ---- 魔改扩展：字幕精灵相关通道 ---- */
+    if (e.channel === 'guest-log') {
+      /* 访客页的调试日志。
+       * 以前只 console.log 到浮窗控制台（要开 F12 才看得到），
+       * 排查「识别 0 帧」时等于没有证据。现在同时写进 startup.log。 */
+      const text = String((e.args && e.args[0]) || '');
+      console.log('[guest]', text);
+      if (/^\[bearing\]/.test(text)) {
+        try {
+          window.api.diag('guestBearing', { line: text.slice(0, 200) });
+        } catch {
+          /* 日志失败不影响功能 */
+        }
+      }
+      return;
+    }
+    if (e.channel === 'subtitle-time') {
+      // 官方字幕模式下访客页每 200ms 报一次播放进度（比心跳更细）
+      window.api.subtitleTime(e.args && e.args[0]);
+      return;
+    }
+    if (e.channel === 'subtitle') {
+      const p = e.args && e.args[0];
+      window.api.subtitle(p || {});
+      // 同一条字幕顺带判一次转向和绝对方位：
+      //   detectTurn   → 相对指令（左转/右转），画面边缘弹大箭头
+      //   detectCompassDir → 绝对方位（往东/东北），雷达模式点亮对应扇形
+      if (p && !p.off && p.text) {
+        detectTurn(p.text);
+        detectCompassDir(p.text);
+        // 智能防遮挡：这句在讲地图 / 锚点 / 传送，说明要看画面，别淡掉
+        if (/地图|锚点|传送/.test(p.text)) window.api.avoidHide();
+      }
+      return;
+    }
     if (e.channel === 'bearing') {
       onGuestBearing(e.args && e.args[0]);
       return;
@@ -173,6 +281,14 @@ function createWebview() {
     state.guestReady = true;
     sendPlayer({ cmd: 'clean', on: true });
     syncBearingToGuest();
+    syncSubtitleToGuest();
+    syncDanmakuHideToGuest();
+    // 魔改扩展：比例锁定状态可能从控制台改的，按钮要跟上
+    if (next.ratioLocked !== undefined) {
+      $('btnRatio').classList.toggle('locked', !!next.ratioLocked);
+      document.body.classList.toggle('ratio-locked', !!next.ratioLocked);
+    }
+    maybeAutoDump();
     if (state.autoPlay) {
       sendPlayer({ cmd: 'play' });
       setTimeout(() => sendPlayer({ cmd: 'play' }), 700);
@@ -236,6 +352,40 @@ function currentLayout() {
   return bearing.layouts.find((layout) => layout.id === bearing.activeLayoutId);
 }
 
+function syncSubtitleToGuest() {
+  const st = state.boot && state.boot.settings;
+  if (!st) return;
+  const sprite = !!st.enableSubtitleSprite;
+  sendPlayer({
+    cmd: 'subtitle',
+    on: sprite || !!st.enableTurnReminder,
+    // 停留时长：由访客页按视频进度判断过期（暂停不推进、倍速正确）
+    hold: Number(st.subtitleHold) || 3,
+    // 字幕精灵 + 「隐藏原生字幕」都开着时才把播放器那条变透明
+    hideNative: sprite && st.subtitleHideNative !== false,
+    // 是否允许自动点开播放器字幕按钮
+    autoOpen: st.subtitleAutoOpen !== false
+  });
+}
+/** 主进程拉到官方字幕轨后通知，转发给访客页切换模式 */
+/**
+ * 隐藏播放器原生弹幕。
+ *
+ * 投影层开着 + 开关开着才藏；否则播放器那条照常显示，
+ * 不然用户会以为「弹幕没了」。
+ */
+function syncDanmakuHideToGuest() {
+  const st = state.boot && state.boot.settings;
+  if (!st) return;
+  sendPlayer({
+    cmd: 'danmaku-hide',
+    on: !!st.enableDanmakuProjection && st.danmakuHideNative !== false
+  });
+}
+function syncSubtitleApiToGuest(st) {
+  sendPlayer({ cmd: 'subtitle-api', on: !!(st && st.on) });
+}
+
 function renderLayoutSelect() {
   const bearing = state.boot.settings.bearing;
   const select = $('layoutSelect');
@@ -255,17 +405,36 @@ function matchesCurrentLayout(payload) {
   return layout && payload && payload.layoutId === layout.id && payload.revision === layout.revision;
 }
 
-function syncBearingToGuest() {
+function syncBearingToGuest(extra) {
   const bearing = state.boot.settings.bearing;
   const layout = currentLayout();
-  sendPlayer({
+  const cfg = {
     cmd: 'bearing',
     on: !!bearing.enabled,
     roi: layout?.roi || null,
     layoutId: layout?.id,
     revision: layout?.revision,
-    autoCenter: !!layout && !layout.centered
-  });
+    autoCenter: !!layout && !layout.centered,
+    // 视觉绿弧：之前没传，访客页一直是默认的 false，所以绿弧永远不画
+    greenArc: state.boot.settings.enableVisionGreenArc === true,
+    ...(extra || {})
+  };
+  /* 发出去的是「能不能启动识别」的全部依据：
+   * on / roi / layoutId / greenArc。箭头不出来时先看这一行，
+   * 就能分清是没下发、还是下发错了、还是访客页收到后没启动。 */
+  try {
+    window.api.diag('bearingSent', {
+      on: cfg.on,
+      hasRoi: !!cfg.roi,
+      layoutId: cfg.layoutId,
+      revision: cfg.revision,
+      greenArc: cfg.greenArc,
+      guestReady: !!state.guestReady
+    });
+  } catch {
+    /* 日志失败不影响功能 */
+  }
+  sendPlayer(cfg);
 }
 
 let layoutHintTimer = null;
@@ -302,7 +471,10 @@ function onGuestBearing(payload) {
     viewWidth: payload.viewWidth || 0,
     hold: !!payload.hold,
     clear: !!payload.clear,
-    clearAngle: !!payload.clearAngle
+    clearAngle: !!payload.clearAngle,
+    // 魔改扩展：识别健康度随每帧一起上报，主进程拿它算成功率。
+    // 不带上这个字段，控制台的「识别/最近/原因」永远是空的。
+    stats: payload.stats || null
   });
 }
 
@@ -619,6 +791,13 @@ function applyState(v) {
   $('timeText').textContent = `${fmt(v.current)} / ${fmt(v.duration)}`;
 
   if (v.title && v.title !== '哔哩哔哩') $('videoTitle').textContent = v.title;
+
+  // 魔改扩展：把播放进度转给主进程 —— 字幕按它查表，弹幕按它切片。
+  // 复用上游已有的心跳（timeupdate 触发），不再单独开定时器。
+  if (v.found) {
+    window.api.subtitleTime({ t: v.current, paused: !v.playing });
+    reportDanmakuTime(v);
+  }
 }
 
 function paintProgress(cur, total) {
@@ -657,6 +836,12 @@ function wireUi() {
     savePlaybackPreference({ muted: !state.boot.settings.muted });
   });
   $('btnSpeed').addEventListener('click', () => window.api.action('cycle-speed'));
+  // 魔改扩展：16:9 比例锁定
+  $('btnRatio').addEventListener('click', async () => {
+    const locked = await window.api.action('ratio-lock');
+    $('btnRatio').classList.toggle('locked', !!locked);
+    document.body.classList.toggle('ratio-locked', !!locked);
+  });
   window.api.onNotice((text) => {
     if (text) toast(text);
   });
@@ -702,6 +887,19 @@ function wireUi() {
   });
 
   // 启动器改了设置（方位开关、标记大小、音量等），浮窗这边跟着更新
+  /* 接口字幕模式的方位判定入口。
+   *
+   * 这条通道走的是 preload 的 ipcRenderer.on，属于**浮窗主渲染进程**；
+   * 而 webview 的 ipc-message 是另一条独立通道，两者不能混用。
+   * 之前把它写在 webview 分支里，主进程发的文本根本没人收 ——
+   * 表现就是「接口字幕模式下罗盘永远不亮」，切 P 后尤其明显。 */
+  window.api.onCompassText((p) => {
+    if (!p || !p.text) return;
+    detectTurn(p.text);
+    detectCompassDir(p.text);
+    if (/地图|锚点|传送/.test(p.text)) window.api.avoidHide();
+  });
+
   window.api.onSettingsChanged((next) => {
     if (!next) return;
     const previous = state.boot.settings.bearing;
@@ -711,7 +909,32 @@ function wireUi() {
     if (previous.activeLayoutId !== next.bearing.activeLayoutId || previous.enabled !== next.bearing.enabled ||
         JSON.stringify(previous.layouts) !== JSON.stringify(next.bearing.layouts)) renderLayoutSelect();
     syncBearingToGuest();
+    syncSubtitleToGuest();
+    syncDanmakuHideToGuest();
+    // 关掉开关时立刻清屏，不等停留时长走完
+    if (!next.enableSubtitleSprite) hideSubtitleSprite();
+    if (!next.enableTurnReminder) hideTurnHint();
   });
+
+  // 魔改扩展：缩放冻结 —— 拖窗口边缘时把 webview 按旧尺寸 transform 拉伸，
+  // 避免它每帧重新布局导致边缘闪黑边
+  window.api.onResizePhase((payload) => {
+    if (payload && payload.active) beginResizeFreeze();
+    else endResizeFreeze();
+  });
+
+  // 魔改扩展：贴边吸附提示线
+  window.api.onSnapEdges((payload) => {
+    const edges = (payload && payload.edges) || [];
+    const map = { left: 'snapL', right: 'snapR', top: 'snapT', bottom: 'snapB' };
+    for (const [edge, id] of Object.entries(map)) {
+      const el = $(id);
+      if (el) el.classList.toggle('show', edges.includes(edge));
+    }
+  });
+
+  // 主进程拉到官方字幕轨后通知：转发给访客页切换成「按时间查表」模式
+  window.api.onSubtitleApi((st) => syncSubtitleApiToGuest(st));
 
   // 全屏时标题栏/控制条浮层化（设置入口在启动器里，这里只是为了不挡画面）
   window.api.onWinState((s) => {
@@ -852,6 +1075,9 @@ function applyImmersionState(on) {
     closeCalib();
     state.seeking = false;
   }
+  // 魔改扩展：chrome 高度从 64 变成 0（或反过来），让主进程重新量一次并对齐比例，
+  // 否则沉浸模式下 16:9 视频会上下留黑边
+  window.api.action('ratio-refit');
 }
 
 /* -------------------------------------------------------------- 快捷键 */
@@ -945,4 +1171,442 @@ function toast(text, ms = 2400) {
   el.classList.add('show');
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+/* ================================================================ 魔改扩展
+ * 转向提醒：字幕里出现「左转 / 往东」这类词时，在画面边缘弹一个大箭头。
+ * 整段独立，不引用上游的私有状态。
+ */
+
+const TURN_RULES = [
+  { dir: 'left', group: 'lr', label: '左', re: /(左转|向左|往左|左前|左侧|左边|左拐|左方|靠左)/ },
+  { dir: 'right', group: 'lr', label: '右', re: /(右转|向右|往右|右前|右侧|右边|右拐|右方|靠右)/ },
+  // 抬头 / 低头 也算「上」「下」：都是让你把视线或人往上下挪，不必分两套提示
+  {
+    dir: 'up',
+    group: 'ud',
+    label: '上',
+    re: /(抬头|抬一下头|往上看|向上看|看上面|看上方|上面看|向前|往前|直行|直走|一直走|前行|上楼|往上|向上)/
+  },
+  {
+    dir: 'down',
+    group: 'ud',
+    label: '下',
+    re: /(低头|低一下头|往下看|向下看|看下面|看下方|下面看|向后|往后|后退|倒退|掉头|回头|下楼|往下|向下)/
+  }
+];
+
+let lastTurnAt = 0;
+let lastTurnDir = '';
+
+/** 命中「左」或「右」就发给字幕层；同一方向 1.2 秒内不重复弹 */
+function detectTurn(text) {
+  if (!state.boot || !state.boot.settings.enableTurnReminder) return;
+
+  // 分开启用：只匹配开启的那一组（左右 / 上下）
+  const lr = state.boot.settings.turnEnableLR !== false;
+  const ud = state.boot.settings.turnEnableUD !== false;
+  if (!lr && !ud) return;
+
+  const hit = TURN_RULES.find((r) => {
+    if (r.group === 'lr' && !lr) return false;
+    if (r.group === 'ud' && !ud) return false;
+    return r.re.test(text);
+  });
+  if (!hit) return;
+
+  const now = Date.now();
+  if (hit.dir === lastTurnDir && now - lastTurnAt < 1200) return;
+  lastTurnDir = hit.dir;
+  lastTurnAt = now;
+  console.log('[turn] 命中', hit.dir, '←', text);
+  // 只发单字，UI 里不再拼「转」之类的后缀
+  window.api.turn({ dir: hit.dir, label: hit.label, text });
+}
+
+function hideSubtitleSprite() {
+  window.api.subtitle({ off: true });
+}
+
+/** 收起转向提示（换片 / 关开关时用） */
+function hideTurnHint() {
+  lastTurnDir = '';
+  lastTurnAt = 0;
+  window.api.turn({ off: true });
+}
+
+/* ------------------------------------------------ 魔改扩展：缩放冻结
+ *
+ * 拖窗口边缘时，webview 每帧都要重新布局，边缘会闪黑边。
+ * 做法：冻结时记下 webview 的旧尺寸，用 transform 把它拉伸铺满新的 stage，
+ * 松手后再恢复真实尺寸让 Chromium 重排一次。
+ */
+
+let freezeRect = null;
+let freezeTimer = null;
+
+function beginResizeFreeze() {
+  if (!wv) return;
+  if (!freezeRect) {
+    freezeRect = { width: wv.offsetWidth || 1, height: wv.offsetHeight || 1 };
+    wv.classList.add('resize-freeze');
+    const stage = $('stage');
+    if (stage) stage.classList.add('resizing');
+  }
+  paintResizeFreeze();
+  clearTimeout(freezeTimer);
+  freezeTimer = setTimeout(endResizeFreeze, 180);
+}
+
+function endResizeFreeze() {
+  clearTimeout(freezeTimer);
+  freezeTimer = null;
+  freezeRect = null;
+  if (!wv) return;
+  wv.classList.remove('resize-freeze');
+  wv.style.width = '';
+  wv.style.height = '';
+  wv.style.transform = '';
+  const stage = $('stage');
+  if (stage) stage.classList.remove('resizing');
+}
+
+function paintResizeFreeze() {
+  const stage = $('stage');
+  if (!wv || !freezeRect || !stage) return;
+  const w = stage.clientWidth || 1;
+  const h = stage.clientHeight || 1;
+  wv.style.width = `${freezeRect.width}px`;
+  wv.style.height = `${freezeRect.height}px`;
+  wv.style.transform = `scale(${w / freezeRect.width}, ${h / freezeRect.height})`;
+}
+
+/* ================================================================ 魔改扩展
+ * 字幕方位解析：从字幕里认出「往东 / 东北 / 地图左下角」这类指令，
+ * 转成绝对方位角发给叠加层（雷达模式下点亮对应扇形）。
+ * 上游叠加层没有雷达，收到 cue 也不会响应，所以这套解析可以常开。
+ */
+
+const DIR_NAMES = [
+  { deg: 0, label: '北' },
+  { deg: 45, label: '东北' },
+  { deg: 90, label: '东' },
+  { deg: 135, label: '东南' },
+  { deg: 180, label: '南' },
+  { deg: 225, label: '西南' },
+  { deg: 270, label: '西' },
+  { deg: 315, label: '西北' }
+];
+
+function nearestDirName(deg) {
+  let best = DIR_NAMES[0];
+  let bestD = 999;
+  for (const d of DIR_NAMES) {
+    const diff = Math.abs(((deg - d.deg + 540) % 360) - 180);
+    if (diff < bestD) {
+      bestD = diff;
+      best = d;
+    }
+  }
+  return best.label;
+}
+
+/**
+ * 抽方位原子。返回 Set，元素是 '东'/'西'/'南'/'北' 的子集。
+ * 七步清洗，顺序不能换（尤其「切分」必须在「归一化」之前）。
+ */
+/**
+ * 把一句话拆成「带句内位置的方位片段」。
+ *
+ *   「先往东然后往北」        → [{f:0.00, 东}, {f:0.50, 北}]
+ *   「然后来西南方向地图左下角」→ [{f:0.00, 西南}]
+ *   「我们走吧然后往东」       → [{f:0.60, 东}]
+ *
+ * fraction 是这一小段在整句里的字符位置占比，用来决定它该在什么时候点亮。
+ *
+ * 注意「再」用前瞻切分：只吃掉「再」，保留后面的「往/向/朝」。
+ * 否则「再往东北一点」会被切成「东北一点」，「往」这个上下文就丢了，
+ * 后面的上下文校验会把它当裸字直接跳过。
+ */
+function directionSegments(text) {
+  const raw = String(text || '').replace(/\s+/g, '').slice(0, 500);
+  if (!raw) return [];
+
+  const parts = raw.split(/然后|接着|随后|再(?=往|向|朝|走|去)/);
+  const out = [];
+  let cursor = 0;
+  for (const part of parts) {
+    if (!part) continue;
+    const at = raw.indexOf(part, cursor);
+    const start = at < 0 ? cursor : at;
+    cursor = start + part.length;
+    const atoms = atomsInPhrase(part);
+    if (!atoms.size) continue;
+    out.push({
+      // 夹到 0.95：最后一段也不该排到句子结束之后
+      fraction: Math.min(0.95, start / Math.max(1, raw.length)),
+      atoms
+    });
+  }
+  return out;
+}
+
+
+/** 在**单个**片段里抽方位原子（七步清洗的后六步） */
+function atomsInPhrase(text) {
+  let s = String(text || '');
+  if (!s) return new Set();
+
+  // 2) 剔除含方位字但根本不是方向的词（「这东西不错」「东北虎」）
+  s = s.replace(/东西南北|东西(?:方)?|北京|南京|东京|西瓜|东北虎|东风|南瓜/g, '');
+
+  // 3) 口语说法归一化：北偏东 / 东偏北 → 东北
+  s = s.replace(/北偏东|东偏北/g, '东北');
+  s = s.replace(/南偏东|东偏南/g, '东南');
+  s = s.replace(/北偏西|西偏北/g, '西北');
+  s = s.replace(/南偏西|西偏南/g, '西南');
+
+  // 4) 否定句不触发：「不要往东」「别往南走」。
+  //    原来那套硬正则会把「不要往东」点亮成东，直接指反方向。
+  s = s.replace(
+    /(?:不要|别|不能|不是|不往|不向|不朝)[^，。；！？,;!?]{0,6}?[东西南北](?:[东西南北])?(?:方向|边|方)?/g,
+    ''
+  );
+
+  // 5) 匹配 1~2 个方位字，但**要求上下文**，避免「上面有个宝箱」这类裸字误触发
+  const found = new Set();
+  const re = /[东西南北]{1,2}/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const word = m[0];
+    const before = s.slice(Math.max(0, m.index - 4), m.index);
+    const after = s.slice(m.index + word.length, m.index + word.length + 4);
+    const ok =
+      s === word ||
+      s === '正' + word ||
+      /往|向|朝|面|转|偏/.test(before) ||
+      /^(方向|边|方|侧|面|角|走|前进|这边)/.test(after);
+    if (!ok) continue;
+    for (const ch of word) found.add(ch);
+  }
+  return found;
+}
+
+
+/**
+ * 原子集合 → 罗盘角（0=北、顺时针）。
+ * 冲突（东西同时出现 / 南北同时出现）或空集返回 null。
+ */
+function atomsToCompass(active) {
+  if (!active || !active.size) return null;
+  if (active.has('东') && active.has('西')) return null;
+  if (active.has('南') && active.has('北')) return null;
+  const x = (active.has('东') ? 1 : 0) - (active.has('西') ? 1 : 0);
+  const y = (active.has('南') ? 1 : 0) - (active.has('北') ? 1 : 0);
+  if (!x && !y) return null;
+  // atan2(x, -y)：正北 = 0°，正东 = 90°，正南 = 180°，正西 = 270°
+  let deg = (Math.atan2(x, -y) * 180) / Math.PI;
+  if (deg < 0) deg += 360;
+  return deg;
+}
+
+/** 每来一句新字幕就 +1；延时任务发现 token 变了就放弃，避免旧句子的方向串到新句子 */
+let compassToken = 0;
+/** 上一次点亮的方位与时间，用于同方位去抖（800ms 内不重复点亮） */
+let lastCompassCue = { deg: -1, at: 0 };
+/** 上一次处理过的字幕原文：同一句被反复推送时不再重复点亮 */
+let lastCompassText = '';
+/**
+ * 最近一次解析出的方位角。
+ *
+ * 用来判断「延时点亮的那个方向是不是已经过时了」：AI 字幕是逐字上屏的，
+ * 每 100~200ms 就送来一条新文本，句子里那个方位却一直没变。
+ * 原来只看 token 变没变，于是每次都在 240ms 的等待期里被下一条顶掉，
+ * 定时器永远到不了点亮那一步 —— 表现就是「字幕说了方向，雷达不亮」。
+ */
+let lastCompassDegs = [];
+
+/** 上一次续期的时间：同一句字幕反复推送时，按节奏续期而不是每次都发 */
+let lastCompassRefresh = 0;
+
+/**
+ * 续期：光晕还在、字幕也没走，就把它再往后延一延。
+ *
+ * 不能走 fireCompassCue —— 那里有「同方位 3 秒内不重复」的去抖，
+ * 正是为了防逐字上屏时反复闪。续期要的恰好是相反的语义：
+ * 不重新播开头的脉冲，只把 cueAt 往后推（叠加层那边 same 分支就是这么做的）。
+ */
+function refreshCompassCue(deg) {
+  if (!Number.isFinite(deg)) return;
+  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg), text: lastCompassText.slice(0, 50) });
+}
+
+/** 真正点亮一个方位（带同方位去抖） */
+function fireCompassCue(deg) {
+  const now = Date.now();
+  // 同一方位在停留时间内不重复点亮。
+  // 按文字去重不够：AI 字幕会逐字上屏，同一句话每次都是不同的字符串，
+  // 每次都算「新字幕」就每次都点亮一次，看着就是不停闪。按角度去重才可靠。
+  if (Math.abs(deg - lastCompassCue.deg) < 1 && now - lastCompassCue.at < 3000) {
+    // 同方位 3 秒内不重复点亮。记一条，免得和「根本没识别出来」混为一谈。
+    if (window.api.compassNone) {
+      window.api.compassNone({ text: lastCompassText.slice(0, 50), reason: 'dedupe', deg: Math.round(deg) });
+    }
+    return;
+  }
+  lastCompassCue = { deg, at: now };
+  // 留一行日志：F12 打开浮窗控制台就能看到每次点亮，
+  // 判断「闪两下」到底是同方位重复触发还是两个不同方位交替。
+  console.log('[compass] 点亮', Math.round(deg), nearestDirName(deg), '←', lastCompassText.slice(0, 40));
+  window.api.compassCue({ deg: Math.round(deg), label: nearestDirName(deg), text: lastCompassText.slice(0, 50) });
+}
+
+/**
+ * 一句字幕里可能有多条方向指令，按句内位置依次点亮。
+ *
+ *   「先往东然后往北」→ 立刻亮东，约半句之后亮北
+ *
+ * 时长怎么估：我们没有字幕的精确 from/to（那是官方字幕接口才有的），
+ * 只能按字数估口播时长 —— 中文攻略口播约 5 字/秒，取 0.18 秒/字，
+ * 夹在 1.2~8 秒之间。误差肯定有，但「同一句里第二个方向要不要亮」
+ * 这件事本身比精确时刻更重要。
+ */
+/**
+ * 去掉括号里的补充说明。
+ *
+ * 「东方向 地图右边（西方向 地图左边）」括号里是对同一位置的复述，
+ * 但它带着「西」字，和前面的「东」一起送进 atomsToCompass 会被判成
+ * 自相矛盾，整句直接不亮 —— 明明字幕说得很清楚，雷达却没反应。
+ */
+function stripParens(text) {
+  return String(text || '').replace(/[（(][^）)]*[）)]/g, '');
+}
+
+/** 地图方位 → 角度。小地图固定北朝上，所以右边就是东。 */
+const MAP_POS_DEG = {
+  上: 0, 右上: 45, 右: 90, 右下: 135,
+  下: 180, 左下: 225, 左: 270, 左上: 315
+};
+
+/**
+ * 认「地图右边 / 地图左下角 / 小地图上方」这类位置说法。
+ * 顺序有意义：右上要排在右前面，否则「右上」会被当成「右」。
+ */
+function mapPositionSegments(text) {
+  const raw = String(text || '').replace(/\s+/g, '').slice(0, 500);
+  if (!raw) return [];
+
+  const re = /(?:小?地图)(?:的)?(右上|右下|左上|左下|上|下|左|右)(?:边|侧|角|方向|方位|位置)?/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(raw))) {
+    const deg = MAP_POS_DEG[m[1]];
+    if (typeof deg !== 'number') continue;
+    out.push({ fraction: Math.min(0.95, m.index / Math.max(1, raw.length)), deg });
+  }
+  return out;
+}
+
+function detectCompassDir(text) {
+  // 播放器会把同一句字幕反复推送（面板每次刷新都算一次），
+  // 每次推送都点亮的话，开头那段双闪动画就会反复播，看起来像「闪两下」。
+  // 同一句只认第一次。
+  const key = String(text || '').replace(/\s+/g, '');
+  if (!key) return;
+  if (key === lastCompassText) {
+    /* 同一句还在屏幕上。叠加层的光晕只亮 3.2 秒就淡出，
+     * 而字幕往往要挂十几秒 —— 用户看到字、再抬头看小地图，光早就没了，
+     * 于是每次都以为「没亮」。这里按节奏续期，字还在光就在。 */
+    if (lastCompassDegs.length && Date.now() - lastCompassRefresh > 900) {
+      lastCompassRefresh = Date.now();
+      for (const d of lastCompassDegs) refreshCompassCue(d);
+    }
+    return;
+  }
+  lastCompassText = key;
+
+  // 优先认地图位置：字幕里出现「地图右边」时它就是权威描述，
+  // 同一句里的「东方向」通常只是复述，两边一起点亮会互相打架。
+  const mapSegs = mapPositionSegments(stripParens(text));
+  const segs = mapSegs.length
+    ? mapSegs
+    : directionSegments(text)
+        .map((seg) => ({ fraction: seg.fraction, deg: atomsToCompass(seg.atoms) }))
+        .filter((seg) => seg.deg !== null); // 自相矛盾的方向直接跳过
+
+  if (!segs.length) {
+    lastCompassDegs = [];
+    // 句子里明明有方位字或「地图」，却没解析出方向 —— 这才是真该查的
+    if (window.api.compassNone && /[东西南北]|地图/.test(key)) {
+      window.api.compassNone({ text: key.slice(0, 50), reason: 'unparsed' });
+    }
+    return;
+  }
+  lastCompassDegs = segs.map((seg) => seg.deg);
+  lastCompassRefresh = 0;
+
+  const token = ++compassToken;
+  const len = String(text || '').replace(/\s+/g, '').length;
+  /* 按方位在句子里的位置做一点推迟，让点亮大致跟上语音。
+   * 但上限必须压住：原来最长 8 秒，字幕早就翻到下一句了圈还没亮，
+   * 用户感知就是「雷达慢半拍」。现在最多 2 秒，短句基本是立刻。 */
+  const est = Math.min(2, Math.max(0.6, len * 0.12));
+
+  for (const seg of segs) {
+    const delay = Math.round(seg.fraction * est * 1000);
+    if (delay <= 0) {
+      fireCompassCue(seg.deg);
+      continue;
+    }
+    setTimeout(() => {
+      /* 这中间来了新字幕。只有当新字幕里**不再有这个方向**时才算过时 ——
+       * AI 字幕逐字上屏时，同一句话会连推十几次，方位一直都在，
+       * 那种情况必须照常点亮，否则一次都亮不起来。 */
+      if (token !== compassToken && !lastCompassDegs.includes(seg.deg)) return;
+      fireCompassCue(seg.deg);
+    }, delay);
+  }
+}
+
+/* ------------------------------------------ 魔改扩展：弹幕时间上报
+ *
+ * 不能直接把心跳里的 current 转发出去 —— 那样拖动进度条时不会带 seek 标记，
+ * 弹幕层还按旧队列继续飘，看起来就是「拖完弹幕全乱」。
+ *
+ * 三条规则：
+ *   · 播放/暂停立刻上报（不能被节流吞掉，否则暂停后还要再飘一秒）
+ *   · 进度跳变 > 2 秒判定为拖动，带 seek 标记让弹幕层清队重排
+ *   · 其余情况 1 秒节流，避免每帧都发 IPC
+ */
+
+let lastDmTime = -1;
+let lastDmReport = 0;
+let lastDmPlaying = null;
+
+function reportDanmakuTime(v) {
+  if (!state.boot || !state.boot.settings.enableDanmakuProjection) return;
+  if (!v || !v.found || !Number.isFinite(v.current)) return;
+
+  const now = Date.now();
+
+  if (lastDmPlaying !== v.playing) {
+    lastDmPlaying = v.playing;
+    lastDmTime = v.current;
+    lastDmReport = now;
+    window.api.danmakuTime({ t: v.current, playing: !!v.playing });
+    return;
+  }
+
+  const jumped = lastDmTime >= 0 && Math.abs(v.current - lastDmTime) > 2;
+  if (jumped) {
+    lastDmTime = v.current;
+    lastDmReport = now;
+    window.api.danmakuTime({ t: v.current, seek: true, playing: !!v.playing });
+    return;
+  }
+
+  lastDmTime = v.current;
+  if (now - lastDmReport < 1000) return;
+  lastDmReport = now;
+  window.api.danmakuTime({ t: v.current, playing: !!v.playing });
 }

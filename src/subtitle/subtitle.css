@@ -1,0 +1,226 @@
+/* 全屏透明字幕层：窗口铺满屏幕，这里只画底部那一条字幕。
+   背景透明，避免盖住游戏画面。外观全部由 JS 按设置写内联 style / CSS 变量。 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  pointer-events: none;
+  user-select: none;
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+}
+
+#sub {
+  position: fixed;
+  bottom: var(--sub-bottom, 80px);
+  left: var(--sub-left, 50%);
+  right: var(--sub-right, auto);
+  /* 居中时 -50%；靠左/靠右时 0。Y 方向用来做淡入时的轻微上浮 */
+  transform: translate(var(--sub-tx, -50%), var(--sub-ty, 10px));
+  max-width: var(--sub-max-width, 88vw);
+  padding: 10px 22px;
+  border-radius: var(--sub-radius, 8px);
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: var(--sub-font, 30px);
+  font-weight: var(--sub-weight, 800);
+  line-height: 1.35;
+  letter-spacing: 0.6px;
+  text-align: center;
+  /* 描边由 subtitle.js 的 applyStroke() 按设置动态写入：
+   * 优先 -webkit-text-stroke + paint-order，不支持时才退回四向 text-shadow。
+   * 这里不能再留默认阴影，否则两种描边会叠加，字会糊。 */
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0;
+  /* visibility 一起参与过渡：淡出结束后彻底不渲染，
+     否则空的黑色背景框会一直留在屏幕上（实测挂机后会出现「字幕设置」空框） */
+  visibility: hidden;
+  pointer-events: none;
+  /* 「淡入淡出」关掉时由 JS 把这个变量设成 0s */
+  transition:
+    opacity var(--sub-fade, 0.2s) ease,
+    transform var(--sub-fade, 0.2s) ease,
+    visibility 0s linear var(--sub-fade, 0.2s);
+}
+
+#sub.show {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(var(--sub-tx, -50%), 0);
+  transition:
+    opacity var(--sub-fade, 0.2s) ease,
+    transform var(--sub-fade, 0.2s) ease,
+    visibility 0s;
+}
+
+/* ------------------------------------------------------------ 转向提示
+   极简版：一枚贴边发光箭头，只做边缘点缀。
+   左/右 → 贴左右边缘垂直居中；上/下 → 贴上下边缘水平居中。
+   尺寸随 --turn-scale，距边距离随 --turn-offset，2 秒后淡出。 */
+
+#turn {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  /* 尺寸随 --turn-scale 缩放（默认 100% ≈ 108px 宽） */
+  width: calc(108px * var(--turn-scale, 1));
+  padding: calc(12px * var(--turn-scale, 1)) 0;
+  border-radius: calc(14px * var(--turn-scale, 1));
+  /* 半透明黑底 + 一圈淡淡的发光边，压住画面但不抢眼 */
+  background: rgba(0, 0, 0, calc(0.46 * var(--turn-opacity, 0.85) / 0.85));
+  border: 1px solid var(--turn-accent, #49b2fc);
+  box-shadow: 0 0 18px -4px var(--turn-accent, #49b2fc);
+  pointer-events: none;
+
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.22s ease,
+    transform 0.22s ease,
+    visibility 0s linear 0.22s;
+}
+
+/* 左：贴左边缘，垂直居中 */
+#turn,
+#turn[data-side="left"] {
+  top: var(--turn-pos-y, 50%);
+  left: var(--turn-offset, 400px);
+  right: auto;
+  bottom: auto;
+  transform: translateY(-50%) translateX(-12px);
+}
+
+#turn[data-side="left"].show {
+  transform: translateY(-50%) translateX(0);
+}
+
+/* 右：贴右边缘，垂直居中 */
+#turn[data-side="right"] {
+  top: var(--turn-pos-y, 50%);
+  left: auto;
+  right: var(--turn-offset, 400px);
+  bottom: auto;
+  transform: translateY(-50%) translateX(12px);
+}
+
+#turn[data-side="right"].show {
+  transform: translateY(-50%) translateX(0);
+}
+
+/* 上：贴上边缘，水平居中 */
+#turn[data-side="up"] {
+  top: var(--turn-offset, 400px);
+  left: var(--turn-pos-x, 50%);
+  right: auto;
+  bottom: auto;
+  transform: translateX(-50%) translateY(-12px);
+}
+
+#turn[data-side="up"].show {
+  transform: translateX(-50%) translateY(0);
+}
+
+/* 下：贴下边缘，水平居中 */
+#turn[data-side="down"] {
+  top: auto;
+  bottom: var(--turn-offset, 400px);
+  left: var(--turn-pos-x, 50%);
+  right: auto;
+  transform: translateX(-50%) translateY(12px);
+}
+
+#turn[data-side="down"].show {
+  transform: translateX(-50%) translateY(0);
+}
+
+#turn.show {
+  opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 0.22s ease,
+    transform 0.22s ease,
+    visibility 0s;
+}
+
+.turn-arrow {
+  font-size: calc(46px * var(--turn-scale, 1));
+  line-height: 1;
+  font-weight: 900;
+  color: var(--turn-accent, #49b2fc);
+  text-shadow:
+    0 0 12px var(--turn-accent, #49b2fc),
+    0 2px 6px rgba(0, 0, 0, 0.9);
+}
+
+/* 箭头朝对应方向轻微呼吸，指示方向感 */
+#turn.show .turn-arrow {
+  animation: turn-breathe 0.9s ease-in-out infinite alternate;
+}
+
+@keyframes turn-breathe {
+  from {
+    transform: translateX(-3px);
+  }
+  to {
+    transform: translateX(3px);
+  }
+}
+
+#turn[data-side="right"].show .turn-arrow {
+  animation-name: turn-breathe-right;
+}
+
+/* 上下方向的箭头改成纵向呼吸，横向抖动看着不对 */
+#turn[data-side="up"].show .turn-arrow {
+  animation-name: turn-breathe-up;
+}
+
+#turn[data-side="down"].show .turn-arrow {
+  animation-name: turn-breathe-down;
+}
+
+@keyframes turn-breathe-up {
+  from {
+    transform: translateY(-3px);
+  }
+  to {
+    transform: translateY(3px);
+  }
+}
+
+@keyframes turn-breathe-down {
+  from {
+    transform: translateY(3px);
+  }
+  to {
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes turn-breathe-right {
+  from {
+    transform: translateX(3px);
+  }
+  to {
+    transform: translateX(-3px);
+  }
+}
+
+.turn-label {
+  font-size: calc(26px * var(--turn-scale, 1));
+  font-weight: 800;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+}
