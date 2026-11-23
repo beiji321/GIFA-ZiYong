@@ -268,6 +268,11 @@ test('the video guest samples only the selected layout and clears stale directio
   vm.runInNewContext(mainCode.slice(start, end), {
     ipcMain: { on: (name, callback) => { listeners[name] = callback; } },
     win, activeBearingLayout, lastBearing: null, settings: { bearing }, overlayWin: {},
+    // 主进程里的这几个是模块级 let 变量，抽取时不在函数体里，
+    // 必须由 harness 显式提供，否则 handler 读不到就抛 ReferenceError。
+    lastBearingStats: null,
+    lastBearingDropAt: 0,
+    diag: { log() {} },
     sendTo: (_win, _channel, payload) => onScreen.push(payload)
   });
   bearing.enabled = true;
@@ -297,13 +302,14 @@ test('the video guest samples only the selected layout and clears stale directio
     angDiff: (first, second) => first - second,
     console: { log() {} },
     Date: { now: () => now },
+    BEARING_STATS: { ring: [], window: 60, total: 0, lastReason: '', lastOkAt: 0, lastBadAt: 0 },
     MAP_CYAN_FRAC_MIN: 0.02,
     ipcRenderer: { sendToHost: (_channel, payload) => app.onGuestBearing(payload) },
     startBearingLoop: () => { guestState.invalidSince = 0; guestState.lastAngle = -1; guest.sendBearing({ clear: true }); },
     resetAutoCenter: () => {},
     beginAutoCenter: () => assert.fail('the fixture does not request centering')
   });
-  vm.runInContext(['setBearing', 'tickBearing', 'markInvalid', 'sendBearing']
+  vm.runInContext(['noteBearingResult', 'bearingStats', 'setBearing', 'tickBearing', 'markInvalid', 'sendBearing']
     .map((name) => declaration(guestCode, name)).join('\n'), guest);
   app.syncBearingToGuest();
   guest.tickBearing();

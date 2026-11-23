@@ -356,6 +356,7 @@ function createHarness(options = {}) {
       'attachPlaybackGuest', 'applyPin', 'createWindow', 'sendTo', 'broadcast', 'floatState', 'notifyFloatState',
       'effectiveOpacity',
       'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'sameWindowBounds', 'fitImmersionWindow',
+      'immersionPlacement',
       'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore', 'setImmersion', 'registerIpc',
       'clearBearingOverlay', 'overlaySize', 'overlayBounds', 'createOverlay', 'showOverlay', 'setOverlayPlacing', 'setBearingEnabled',
       // 比例锁定：位置漂移就是在这几个函数里发生的，必须是真实实现

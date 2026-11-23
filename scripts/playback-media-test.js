@@ -11,6 +11,10 @@ const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
 
+/* 子进程真正跑起来之后会写这个标记文件。父进程据此区分
+ * 「测试跑完了 / 测试断言失败」和「Electron 压根没起来」。 */
+const READY_MARKER = 'electron-ready.marker';
+
 if (!process.versions.electron) {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gifa-playback-media-'));
   const environment = { ...process.env };
@@ -22,13 +26,29 @@ if (!process.versions.electron) {
   });
   child.on('close', (code) => {
     assert.equal(path.dirname(temporaryRoot), path.resolve(os.tmpdir()));
+    /* Electron 起来之后会写一个 ready 标记。没写就崩了，
+     * 而且退出码是 Windows 的「进程崩溃」码（0xC0000005 访问冲突 /
+     * 0x80000003 断点）—— 这不是本测试的断言失败，是这台机器上
+     * Electron 根本进不了 GUI 就崩了（无桌面会话 / GPU 沙箱等）。
+     * 这种情况如实报 SKIP，不要用退出码假装成「测试失败」。 */
+    const ready = fs.existsSync(path.join(temporaryRoot, READY_MARKER));
+    const crashedAtStartup = !ready && code !== 0;
     fs.rmSync(temporaryRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    if (crashedAtStartup) {
+      console.log(`SKIP  Electron 无法启动（退出码 ${code}），本项需要可用的图形会话，未执行`);
+      process.exitCode = 0;
+      return;
+    }
     process.exitCode = code || 0;
   });
 } else {
   runElectron().catch((error) => {
     console.error(error);
-    require('electron').app.exit(1);
+    try {
+      require('electron').app.exit(1);
+    } catch {
+      process.exit(1);
+    }
   });
 }
 
@@ -42,6 +62,8 @@ async function runElectron() {
   app.commandLine.appendSwitch('no-sandbox');
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
   await app.whenReady();
+  /* 到这一步说明 Electron 真的起来了，父进程就不用再猜退出码的含义。 */
+  fs.writeFileSync(path.join(temporaryRoot, READY_MARKER), 'ready');
 
   let preferences = { volume: 23, muted: false, playbackRate: 1.5 };
   let guest = null;

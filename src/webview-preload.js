@@ -1551,17 +1551,6 @@ function markInvalid(reason, extra, mapPresent = true) {
   const now = Date.now();
   if (!BEARING.invalidSince) BEARING.invalidSince = now;
   const arrowLost = now - BEARING.invalidSince >= 1000;
-  /* 失败原因必须定期落盘：否则「箭头时不时消失」只能看到 tick 在跑、
-   * 看不到为什么失败（尺寸太小？青色不够？扇形没找到？）。 */
-  if (now - (BEARING.lastInvalidLog || 0) > 5000) {
-    BEARING.lastInvalidLog = now;
-    try {
-      ipcRenderer.sendToHost('guest-log', `[bearing] 无效帧：${reason} ` +
-        `连续=${Math.round(now - BEARING.invalidSince)}ms src=${video && video.videoWidth}x${video && video.videoHeight}`);
-    } catch {
-      /* 页面正在卸载 */
-    }
-  }
   const viewAngle = typeof extra?.view === 'number' ? (90 - extra.view + 360) % 360 : -1;
   const viewChanged = viewAngle >= 0 &&
     (BEARING.view.sent < 0 || Math.abs(angDiff(viewAngle, BEARING.view.sent)) > 1.5);
@@ -1632,21 +1621,6 @@ function analyzeConeWithRecovery(img, size, step) {
 }
 
 function tickBearing() {
-  /* 「识别 0 帧」时要能分清两种可能：
-   * 循环根本没跑（tick 没进来），还是循环在跑但每次都判无效。
-   * 每 3 秒最多记一条，避免刷屏。 */
-  try {
-    BEARING.tickCount = (BEARING.tickCount || 0) + 1;
-    const now = Date.now();
-    if (BEARING.tickCount === 1 || now - (BEARING.lastTickLog || 0) > 3000) {
-      BEARING.lastTickLog = now;
-      ipcRenderer.sendToHost('guest-log', `[bearing] tick #${BEARING.tickCount} ` +
-        `paused=${!!(video && video.paused)} ready=${video && video.readyState} ` +
-        `size=${video && video.videoWidth}x${video && video.videoHeight} kind=${BEARING.loopKind}`);
-    }
-  } catch {
-    /* 页面正在卸载 */
-  }
   if (!BEARING.enabled) return;
   BEARING.ticks = (BEARING.ticks || 0) + 1;
 
@@ -1666,23 +1640,6 @@ function tickBearing() {
 
   const seen = small && analyzeArrowWithRecovery(small.img, small.size, small.step);
   const best = seen?.valid ? { ...seen, size: small.size } : null;
-  /* 「方向一点都不准 / 识别不到」时，光看「无效帧」不够 ——
-   * 需要知道这一帧到底读出了什么：置信度多少、青色像素够不够、
-   * 窗口尺寸多大。每 5 秒记一条，能直接看出是「没找到箭头」
-   * 还是「找到了但置信度太低被判无效」。 */
-  if (Date.now() - (BEARING.lastSeenLog || 0) > 5000) {
-    BEARING.lastSeenLog = Date.now();
-    try {
-      ipcRenderer.sendToHost('guest-log',
-        `[bearing] 分析 size=${small && small.size} valid=${!!(seen && seen.valid)} ` +
-        `conf=${seen ? Math.round((seen.conf || 0) * 100) / 100 : '-'} ` +
-        `deg=${seen && seen.valid ? Math.round(seen.deg) : '-'} ` +
-        `cyans=${seen ? Math.round(seen.cyans || 0) : '-'} ` +
-        `roi=${JSON.stringify(BEARING.roi)}`);
-    } catch {
-      /* 页面正在卸载 */
-    }
-  }
   const candidate = large && analyzeConeWithRecovery(large.img, large.size, large.step);
   const mapPresent = !!best || (candidate?.cyanFrac || 0) >= MAP_CYAN_FRAC_MIN;
   const cone = mapPresent && candidate?.valid ? { ...candidate, size: large.size } : null;
@@ -2065,15 +2022,6 @@ function autoCenterStep(roi, big, mapPresent, now) {
  */
 function startBearingLoop() {
   stopBearingLoop();
-  /* 「抓一帧核对」能出画面、但持续识别 0 帧，说明 video 在、坐标对，
-   * 只有循环没跑起来。这里把启动时的关键状态记下来：
-   * video 是否存在、enabled 是否为真、roi 有没有 —— 三者缺一个就不会有循环。 */
-  try {
-    ipcRenderer.sendToHost('guest-log', `[bearing] startLoop video=${!!video} ` +
-      `enabled=${!!BEARING.enabled} roi=${JSON.stringify(BEARING.roi)} rvfc=${typeof (video || {}).requestVideoFrameCallback}`);
-  } catch {
-    /* 页面正在卸载 */
-  }
   BEARING.raw.length = 0;
   BEARING.smooth = -1;
   BEARING.ab.theta = -1;
@@ -2568,15 +2516,6 @@ function videoRectInfo() {
 function setBearing(config = {}) {
   if (config.on !== undefined) {
     const changed = BEARING.enabled !== !!config.on || BEARING.layoutId !== config.layoutId || BEARING.revision !== config.revision;
-    /* 「识别 0 帧、已停止更新」时，必须能看出是没收到配置、还是
-     * changed 为 false（配置没变所以没重新启动）、还是 video 还没就绪。
-     * 这三条以前完全没有日志，只能靠猜。 */
-    try {
-      ipcRenderer.sendToHost('guest-log', `[bearing] 收到配置 on=${config.on} changed=${changed} ` +
-        `video=${!!video} roi=${JSON.stringify(config.roi)} id=${config.layoutId} rev=${config.revision}`);
-    } catch {
-      /* 页面正在卸载 */
-    }
     if (changed) {
       resetAutoCenter('布局或显示状态变化');
       const roi = config.roi;

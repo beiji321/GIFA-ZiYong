@@ -33,6 +33,13 @@ const GRAB = slice('function bearingCanvas(', '/**\n * 读一帧的箭头朝向'
 const AC = slice('const AC_KAPPA', '/**\n * 启动识别循环。');
 const clampSrc = slice('function clamp(', 'function safePlay(');
 
+/* 500 帧离线素材不入库（见 .gitignore）。缺素材时如实跳过，
+ * 不把「没有素材」伪装成通过，也不能让脚本报错崩掉。 */
+if (!fs.existsSync(path.join(TMP, 'vidroi500.json')) || !fs.existsSync(path.join(TMP, 'vidroi500.bin'))) {
+  console.log(`SKIP  ${TMP} 不在（缺少 500 帧离线素材，本项无法验证）`);
+  process.exit(0);
+}
+
 const man = JSON.parse(fs.readFileSync(path.join(TMP, 'vidroi500.json'), 'utf8'));
 const blob = fs.readFileSync(path.join(TMP, 'vidroi500.bin'));
 const S0 = man.list[0].size; // 363

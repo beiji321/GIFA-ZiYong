@@ -1031,7 +1031,17 @@ function createWindow() {
       diag.log('resize', { bounds: win.getBounds(), locked: settings.ratioLocked });
     }
     if (!settings.ratioLocked || ratioGuard) return;
-    enforceRatio(win.getBounds().width);
+    /* 防抖：拖动窗口时 resize 事件连着来，每次都立刻 setBounds 校正高度，
+     * 会和用户拖动形成死循环 —— 窗口高度在两个值之间反复横跳，
+     * webview 跟着不停重绘，表现为「拖起来卡卡的」。
+     *
+     * 改成只保留最后一次校正：拖动过程中先不纠正，
+     * 停下来 120ms 后按最终宽度纠正一次。 */
+    clearTimeout(ratioEnforceTimer);
+    ratioEnforceTimer = setTimeout(() => {
+      if (!win || win.isDestroyed() || !settings.ratioLocked) return;
+      enforceRatio(win.getBounds().width);
+    }, 120);
   });
 
   win.on('closed', () => {
@@ -1069,6 +1079,7 @@ let chromeHeight = 64;
 // ready-to-show 那一刻量到的是布局完成前的值（日志里稳定差 39px）。
 let chromeReportedAt = 0;
 let ratioGuard = false;    // setBounds 会再触发 resize，用它挡住递归
+let ratioEnforceTimer = null;  // 拖动时只纠正一次高度，避免和拖动互相打架
 let ratioApplying = false; // did-finish-load / ready-to-show 可能先后触发，只跑一次
 
 /**
@@ -1099,10 +1110,13 @@ function enforceRatio(width) {
   try {
     win.setBounds({ x: b.x, y: b.y, width: w, height: h });
   } finally {
-    // setBounds 的 resize 事件可能是异步派发的，等这一轮走完再解锁
+    // setBounds 的 resize 事件是**异步派发**的，setTimeout(0) 可能在它之前就解锁，
+    // 于是 resize → enforceRatio → setBounds → resize 又来一轮，形成死循环
+    // （窗口高度在两个值之间横跳，webview 反复重绘，拖动发卡）。
+    // 延到 150ms 再解锁，覆盖掉这一轮派发出来的 resize。
     setTimeout(() => {
       ratioGuard = false;
-    }, 0);
+    }, 150);
   }
 }
 
@@ -1125,7 +1139,19 @@ async function applyRatioLock(force = false) {
 
   const [w] = win.getContentSize();
   if (!Number.isFinite(w) || w <= 0) return;
-  const h = Math.round((w * 9) / 16) + chromeHeight;
+  /* 沉浸模式下窗口**外框**高度保持不变。
+   *
+   * 作者的设计：进沉浸只是让 #stage 铺满窗口（省掉标题栏那 66px），
+   * 视频区因此变大，窗口本身尺寸不变、位置居中。
+   *
+   * 而这里原来算的是「视频高(w*9/16) + chromeHeight」——
+   * 沉浸时 chrome 已经是 0，算出来比窗口矮 66px，
+   * 两套规则打架，窗口就一会儿高一会儿矮，位置也跟着晃。
+   *
+   * 沉浸时直接用当前外框高度：一个数都不改，位置自然也不会动。 */
+  const h = immersion
+    ? win.getBounds().height
+    : Math.round((w * 9) / 16) + chromeHeight;
   diag.log('ratio', {
     phase: 'apply',
     locked: settings.ratioLocked,
@@ -1152,33 +1178,37 @@ async function applyRatioLock(force = false) {
     const inner = win.getContentSize();
     const frameW = Math.max(0, cur.width - inner[0]);
     const frameH = Math.max(0, cur.height - inner[1]);
-    const x = Number.isFinite(anchor.x) ? anchor.x : cur.x;
-    const y = Number.isFinite(anchor.y) ? anchor.y : cur.y;
-    win.setBounds({
-      x,
-      y,
-      width: Math.round(w) + frameW,
-      height: Math.round(h) + frameH
-    });
-    // 1px 抖动：让 Chromium 认为尺寸真的变了，重新布局一次 webview
-    win.setBounds({
-      x,
-      y,
-      width: Math.round(w) + frameW,
-      height: Math.round(h) + frameH + 1
-    });
-    await new Promise((r) => setTimeout(r, 16));
-    if (!win || win.isDestroyed()) return;
-    win.setBounds({
-      x,
-      y,
-      width: Math.round(w) + frameW,
-      height: Math.round(h) + frameH
-    });
+
+    /* 沉浸模式：位置和尺寸完全按作者 fitImmersionWindow 的规则算，
+     * 两个函数算出同一个结果，谁先谁后都一样，不会互相打架。
+     *
+     * 之前这里锁的是窗口左上角，而 fitImmersionWindow 把窗口居中 ——
+     * 两个规则轮番 setBounds，窗口就一会儿左上、一会儿居中，
+     * 位置和高度一起晃。 */
+    if (immersion) {
+      const placed = immersionPlacement();
+      if (placed) win.setBounds(placed);
+    } else {
+      const x = Number.isFinite(anchor.x) ? anchor.x : cur.x;
+      const y = Number.isFinite(anchor.y) ? anchor.y : cur.y;
+      /* 只设一次。
+       * 以前这里还有「高度 +1 再减回来」的抖动，目的是让 Chromium 重新布局。
+       * 但窗口贴屏幕底部时，高度 +1 会让 Windows 把窗口往上顶以保证底边
+       * 不出屏，等高度减回来时却不还原 —— 净上移（用户实际遇到的症状）。
+       * Chromium 的 webview 布局在尺寸变化时会自动重排，不需要骗它。 */
+      win.setBounds({
+        x,
+        y,
+        width: Math.round(w) + frameW,
+        height: Math.round(h) + frameH
+      });
+    }
   } finally {
+    /* 延到 150ms 再解锁：setBounds 派发的 resize 是异步的，
+     * 立刻解锁会让 resize → enforceRatio → setBounds → resize 死循环。 */
     setTimeout(() => {
       ratioGuard = false;
-    }, 0);
+    }, 150);
   }
 }
 
@@ -2481,21 +2511,65 @@ function sameWindowBounds(first, second) {
   return first.x === second.x && first.y === second.y && first.width === second.width && first.height === second.height;
 }
 
-function fitImmersionWindow() {
-  if (!immersion || !immersionBounds || !immersionAspect || !win || win.isDestroyed() || win.isFullScreen() || win.isMinimized()) return;
+/* 沉浸窗口该放在哪、多大 —— 唯一的算法来源。
+ *
+ * 作者的 fitImmersionWindow 和魔改的 applyRatioLock 都会碰窗口几何，
+ * 两边各算一套就会轮流 setBounds，位置和高度一起晃。
+ * 现在两边都用这个函数，算出同一个结果，谁先谁后都一样。
+ */
+function immersionPlacement() {
+  if (!immersion || !immersionBounds || !immersionAspect || !win || win.isDestroyed() || win.isFullScreen() || win.isMinimized()) return null;
   const original = immersionBounds;
   const { workArea } = screen.getDisplayMatching(original);
   const current = win.getBounds();
   const content = win.getContentBounds();
   const frameW = Math.max(0, current.width - content.width);
   const frameH = Math.max(0, current.height - content.height);
+  /* 尺寸：按视频宽高比收紧，去掉黑边（作者原意，保留）。
+   * 位置：**贴哪条边就锁哪条边**。
+   *
+   * 原来这里按中心缩放（top = original.y + (original.height - height) / 2），
+   * 标题栏没了 → 高度少 66px → 位置下移 33px。两种窗口位置下都是下移，
+   * 但看起来方向相反：
+   *   · 窗口贴顶   → 顶边被推下来，整个窗口「往上顶」不动、下半截缩进屏幕里，
+   *                  视觉上就是「下面的在往上移」；
+   *   · 窗口贴底   → 底边出界，Windows 把它拉回可见区，
+   *                  视觉上就是「上面的在往下移」。
+   *
+   * 正确的锚点规则：
+   *   贴上边 → 锁顶边（top 不变，底边上升）
+   *   贴下边 → 锁底边（bottom 不变，顶边下移）
+   *   都不贴 → 锁中心
+   * 这样无论窗口在哪儿，进出沉浸时贴着的那条边都不动。 */
   const maxW = Math.max(1, Math.min(original.width, workArea.width) - frameW);
   const maxH = Math.max(1, Math.min(original.height, workArea.height) - frameH);
   const width = Math.max(1, Math.min(maxW, Math.round(maxH * immersionAspect))) + frameW;
   const height = Math.max(1, Math.min(maxH, Math.round(maxW / immersionAspect))) + frameH;
   const left = Math.max(workArea.x, Math.min(workArea.x + workArea.width - width, original.x + Math.round((original.width - width) / 2)));
-  const top = Math.max(workArea.y, Math.min(workArea.y + workArea.height - height, original.y + Math.round((original.height - height) / 2)));
-  const bounds = { x: left, y: top, width, height };
+  /* 贴边判定：只有真的贴着边（距离在阈值内）才锁那条边，
+   * 否则保持作者的居中。
+   *
+   * 阈值不能只看「哪边更近」—— 窗口在屏幕中间偏上时也会「离上边更近」，
+   * 但它并没有贴边，锁顶边会让它莫名其妙地挪动。 */
+  const EDGE = 40;
+  const distTop = original.y - workArea.y;
+  const distBottom = (workArea.y + workArea.height) - (original.y + original.height);
+  let top;
+  if (distTop <= EDGE) {
+    top = original.y;                                  // 贴上边：锁顶边
+  } else if (distBottom <= EDGE) {
+    top = original.y + original.height - height;        // 贴下边：锁底边
+  } else {
+    top = original.y + Math.round((original.height - height) / 2);  // 居中
+  }
+  top = Math.max(workArea.y, Math.min(workArea.y + workArea.height - height, top));
+  return { x: left, y: top, width, height };
+}
+
+function fitImmersionWindow() {
+  const bounds = immersionPlacement();
+  if (!bounds) return;
+  const current = win.getBounds();
   if (!sameWindowBounds(current, bounds)) win.setBounds(bounds);
 }
 
