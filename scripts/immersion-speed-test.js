@@ -283,7 +283,7 @@ function createHarness(options = {}) {
       'isPlaybackGuest', 'isPlaybackMessage', 'playbackState', 'guestPlaybackSettings',
       'publishPlaybackSettings', 'showNotice', 'cyclePlaybackRate', 'setHoldSpeed', 'cancelTemporarySpeed',
       'attachPlaybackGuest', 'applyPin', 'createWindow', 'sendTo', 'broadcast', 'floatState', 'notifyFloatState',
-      'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'sameWindowBounds', 'fitImmersionWindow',
+      'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade', 'sameWindowBounds', 'fitImmersionPosition', 'fitImmersionWindow',
       'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore', 'setImmersion', 'registerIpc',
       'clearBearingOverlay', 'overlaySize', 'overlayBounds', 'createOverlay', 'showOverlay', 'setOverlayPlacing', 'setBearingEnabled'
     ].map((name) => extractFunction(mainSource, name)),
@@ -525,6 +525,49 @@ check('等到视频尺寸再收去黑边；进入、换比例、异步事件和�
   window.setBounds({ ...original, x: original.x + 1 });
   harness.clock.advance(250);
   assert.equal(JSON.parse(harness.fileWrites.at(-1)).bounds.x, original.x + 1);
+});
+
+check('贴顶或贴底的浮窗切换视频比例时始终贴住原来的边', () => {
+  const workArea = { x: -1920, y: -1080, width: 1920, height: 1040 };
+  const bottom = workArea.y + workArea.height;
+  for (const edge of ['top', 'bottom']) {
+    const original = { x: -1700, y: edge === 'top' ? workArea.y + 1 : bottom - 569, width: 896, height: 568 };
+    const harness = createHarness({ workArea, window: { bounds: original } });
+    const window = harness.getWindow();
+    const savedBounds = plain(harness.getSettings().bounds);
+    const { report } = startImmersion(harness);
+    assert.deepEqual(window.getBounds(), original);
+    for (const [videoWidth, videoHeight, fittedHeight] of [[896, 504, 504], [1792, 768, 384]]) {
+      report(videoWidth, videoHeight);
+      const y = edge === 'top' ? workArea.y : bottom - fittedHeight;
+      assert.deepEqual(window.getBounds(), { ...original, y, height: fittedHeight }, edge);
+    }
+    harness.setImmersion(false);
+    assert.deepEqual(window.getBounds(), original);
+    assert.deepEqual(plain(harness.getSettings().bounds), savedBounds);
+    assertNoPersistence(harness);
+  }
+});
+
+check('缩窄时保留左右边角，原窗口占满一个轴时在该轴居中', () => {
+  const workArea = { x: 40, y: 32, width: 1920, height: 1040 };
+  for (const [x, expectedX] of [[40, 40], [1064, 1640]]) {
+    const original = { x, y: 504, width: 896, height: 568 };
+    const harness = createHarness({ workArea, window: { bounds: original } });
+    const { report } = startImmersion(harness);
+    report(900, 1600);
+    assert.deepEqual(harness.getWindow().getBounds(), { ...original, x: expectedX, width: 320 });
+    harness.setImmersion(false);
+    assert.deepEqual(harness.getWindow().getBounds(), original);
+  }
+
+  const fullWidth = { ...workArea, height: 568 };
+  const harness = createHarness({ workArea: fullWidth, window: { bounds: fullWidth } });
+  const { report } = startImmersion(harness);
+  report(1280, 960);
+  assert.deepEqual(harness.getWindow().getBounds(), { ...fullWidth, x: 622, width: 757 });
+  report(4000, 1000);
+  assert.deepEqual(harness.getWindow().getBounds(), { ...fullWidth, y: 76, height: 480 });
 });
 
 check('只接受当前文档、当前沉浸会话的顶层 guest 尺寸', () => {

@@ -452,6 +452,27 @@ async function runElectron() {
     assert.deepEqual(host.getBounds(), originalBounds);
     console.log('PASS 最小化时退出不唤醒窗口，还原后恢复原位置和尺寸');
 
+    const { workArea } = screen.getDisplayMatching(originalBounds);
+    const bottom = workArea.y + workArea.height;
+    for (const atTop of [true, false]) {
+      const edge = atTop ? '贴顶' : '贴底';
+      const edgeGap = ({ y, height }) => Math.abs(atTop ? y - workArea.y : y + height - bottom);
+      host.setBounds({ ...originalBounds, x: workArea.x + 16,
+        y: atTop ? workArea.y : bottom - originalBounds.height });
+      const snapped = host.getBounds();
+      assert.ok(edgeGap(snapped) <= 2, `${edge}测试前置坐标`);
+      const since = videoSizes.length;
+      assert.equal(immersion.setImmersion(true), true);
+      await waitForVideoSize(896, 504, since);
+      const fitted = host.getBounds();
+      assert.ok(fitted.height < snapped.height - 30, `${edge}沉浸应收去留边`);
+      assert.ok(edgeGap(fitted) <= 1, `${edge}沉浸后偏离工作区边缘 ${edgeGap(fitted)} px`);
+      assert.equal(immersion.setImmersion(false), false);
+      assert.deepEqual(host.getBounds(), snapped, `${edge}退出后恢复原窗口`);
+      console.log(`PASS 实际窗口${edge}进入和退出沉浸`);
+    }
+    host.setBounds(originalBounds);
+
     const expectChoice = async (label, change, expected, nextMutation = true) => {
       const actual = await guest.executeJavaScript(`(async () => {
         ${change}
@@ -542,7 +563,7 @@ function loadImmersionHarness(host, screen, sourceDir, guestPlaybackSettings) {
   const names = [
     'isPlaybackGuest', 'isPlaybackMessage', 'attachPlaybackGuest', 'sendTo', 'broadcast', 'showNotice',
     'floatState', 'notifyFloatState', 'applyWindowPresentation', 'updateHoverFade', 'syncHoverFade',
-    'sameWindowBounds', 'fitImmersionWindow', 'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore',
+    'sameWindowBounds', 'fitImmersionPosition', 'fitImmersionWindow', 'restoreImmersionWindow', 'syncImmersionBoundsAfterRestore',
     'setImmersion', 'registerIpc'
   ];
   for (const name of names) {

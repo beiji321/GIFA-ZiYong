@@ -935,6 +935,18 @@ function sameWindowBounds(first, second) {
   return first.x === second.x && first.y === second.y && first.width === second.width && first.height === second.height;
 }
 
+function fitImmersionPosition(start, size, fittedSize, workStart, workSize) {
+  const workEnd = workStart + workSize;
+  // Windows 的 DPI 换算可能让已贴边的窗口相差 1–2 个逻辑像素。
+  const atStart = Math.abs(start - workStart) <= 2;
+  const atEnd = Math.abs(start + size - workEnd) <= 2;
+  if (atStart && !atEnd) return workStart;
+  if (atEnd && !atStart) return workEnd - fittedSize;
+  // 普通位置或两侧都贴边时，沿这个轴居中。
+  const centered = start + Math.round((size - fittedSize) / 2);
+  return Math.max(workStart, Math.min(workEnd - fittedSize, centered));
+}
+
 function fitImmersionWindow() {
   if (!immersion || !immersionBounds || !immersionAspect || !win || win.isDestroyed() || win.isFullScreen() || win.isMinimized()) return;
   const original = immersionBounds;
@@ -947,9 +959,9 @@ function fitImmersionWindow() {
   const maxH = Math.max(1, Math.min(original.height, workArea.height) - frameH);
   const width = Math.max(1, Math.min(maxW, Math.round(maxH * immersionAspect))) + frameW;
   const height = Math.max(1, Math.min(maxH, Math.round(maxW / immersionAspect))) + frameH;
-  const left = Math.max(workArea.x, Math.min(workArea.x + workArea.width - width, original.x + Math.round((original.width - width) / 2)));
-  const top = Math.max(workArea.y, Math.min(workArea.y + workArea.height - height, original.y + Math.round((original.height - height) / 2)));
-  const bounds = { x: left, y: top, width, height };
+  const x = fitImmersionPosition(original.x, original.width, width, workArea.x, workArea.width);
+  const y = fitImmersionPosition(original.y, original.height, height, workArea.y, workArea.height);
+  const bounds = { x, y, width, height };
   if (!sameWindowBounds(current, bounds)) win.setBounds(bounds);
 }
 
