@@ -20,6 +20,8 @@ const power = main.slice(main.indexOf("    powerMonitor.on('suspend'"), main.ind
 function harness() {
   const windows = [];
   const actions = [];
+  const pollerCalls = [];
+  const deviceUpdates = [];
   const powerMonitor = new EventEmitter();
   class FakeDisc extends EventEmitter {
     constructor(options) {
@@ -58,6 +60,12 @@ function harness() {
     __dirname: path.join(__dirname, '../src'),
     path,
     console: { warn() {} },
+    gamepad: { start: () => pollerCalls.push('start'), stop: () => pollerCalls.push('stop') },
+    consoleWin: {},
+    sendTo: (_window, channel, payload) => {
+      assert.equal(channel, 'gamepad:devices');
+      deviceUpdates.push([...payload]);
+    },
     BrowserWindow: FakeDisc,
     win: { isDestroyed: () => false },
     loginWin: null,
@@ -81,7 +89,7 @@ function harness() {
     ${disc}
     ${power}
     globalThis.api = {
-      handleGamepadFrame, active: () => holdSpeedActive,
+      handleGamepadFrame, setGamepadEnabled, active: () => holdSpeedActive,
       keyboard: (down) => handleHotkey('holdSpeed', down ? 'down' : 'up'),
       typing: (on) => { typingInField = on; if (on) cancelTemporarySpeed(); },
       resetGamepadSession,
@@ -90,12 +98,14 @@ function harness() {
     ...context.api,
     windows,
     actions,
+    pollerCalls,
+    deviceUpdates,
     power: (event) => powerMonitor.emit(event),
-    frame(pressed, rx = 0, ry = 0, slot = 0) {
+    frame(pressed, rx = 0, ry = 0, slot = 0, model = 'xinput') {
       const frame = config.xinputToFrame({ b: pressed ? 0x0040 : 0, rx, ry });
-      context.api.handleGamepadFrame({ ...frame, slot });
+      context.api.handleGamepadFrame({ ...frame, slot, model });
     },
-    disconnect() { context.api.handleGamepadFrame(config.xinputToFrame(null)); }
+    disconnect(slot) { context.api.handleGamepadFrame({ ...config.xinputToFrame(null), slot }); }
   };
 }
 
@@ -162,12 +172,12 @@ for (const firstRelease of ['keyboard', 'gamepad']) {
   });
 }
 
-test('disconnect and slot replacement cancel without committing a queued action', () => {
+test('disconnect cancels a queued action and reconnection requires a fresh press', () => {
   const app = harness();
   app.frame(false);
   app.frame(true);
   app.frame(true, 0, 32767);
-  app.disconnect();
+  app.disconnect(0);
   app.frame(true);
   app.frame(true, 0, 32767);
   app.frame(true);
@@ -176,9 +186,65 @@ test('disconnect and slot replacement cancel without committing a queued action'
   app.frame(true);
   app.frame(true, 32767);
   assert.equal(app.active(), true);
-  app.frame(true, 0, 0, 1);
+  app.disconnect(0);
   assert.equal(app.active(), false);
   assert.deepEqual(app.actions, [true, false]);
+});
+
+test('mixed devices keep the disc and held action with the controller that opened it', () => {
+  const app = harness();
+  app.frame(false);
+  app.frame(false, 0, 0, 4, 'dualshock4');
+  app.frame(false, 0, 0, 5, 'dualsense');
+  app.frame(true, 0, 0, 4, 'dualshock4');
+  app.frame(true, 32767, 0, 4, 'dualshock4');
+  const disc = app.windows[0];
+  disc.finish();
+  app.frame(true, 0, 0, 0);
+  app.frame(true, 0, 32767, 0);
+  app.disconnect(5);
+  assert.equal(app.active(), true);
+  assert.equal(disc.messages.at(-1).highlight, 'e');
+  app.disconnect(4);
+  assert.equal(app.active(), false);
+  assert.equal(disc.visible, false);
+  app.frame(true);
+  assert.equal(disc.visible, false);
+  app.frame(false);
+  app.frame(true);
+  app.frame(true, 0, 32767);
+  app.frame(true);
+  assert.deepEqual(app.actions, [true, false, 'prevPart']);
+  assert.deepEqual(app.deviceUpdates, [
+    ['xinput'], ['xinput', 'dualshock4'], ['xinput', 'dualshock4', 'dualsense'],
+    ['xinput', 'dualshock4'], ['xinput']
+  ]);
+});
+
+test('disabling gamepad releases its worker and disc, preserves a keyboard hold, and waits for a fresh press', () => {
+  const app = harness();
+  app.frame(false);
+  app.frame(true);
+  app.windows[0].finish();
+  app.keyboard(true);
+  app.frame(true, 32767);
+  app.setGamepadEnabled(false);
+  app.setGamepadEnabled(false);
+  assert.equal(app.windows[0].destroyed, true);
+  assert.equal(app.active(), true);
+  app.keyboard(false);
+  assert.equal(app.active(), false);
+  app.frame(true, 32767);
+  app.setGamepadEnabled(true);
+  app.setGamepadEnabled(true);
+  app.frame(true, 32767);
+  assert.equal(app.active(), false);
+  app.frame(false);
+  app.frame(true);
+  app.frame(true, 32767);
+  assert.equal(app.active(), true);
+  assert.equal(app.windows.length, 2);
+  assert.deepEqual(app.pollerCalls, ['stop', 'start']);
 });
 
 test('lock, suspend, and typing cancel the session and require a fresh press', () => {

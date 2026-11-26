@@ -21,9 +21,10 @@ let placing = false;
 
 /* 两路角度各有一套补间状态，互不干扰 */
 const tween = {
-  arrow: { target: null, shown: null, raf: 0 },
-  view: { target: null, shown: null, raf: 0, conf: 0, width: 0, at: 0 }
+  arrow: { target: null, shown: null },
+  view: { target: null, shown: null, conf: 0, width: 0, at: 0 }
 };
+let animationFrame = 0;
 
 // 视觉常量：与浮窗的深色主题保持同一套红
 const RED = '#ff2f2f';
@@ -58,20 +59,22 @@ function radius(w, h) {
  * 识别端已经做到「有新帧才算」，但 IPC 到这边是一跳一跳的。
  * 每帧追 45% 的差值，大约 3~4 帧收敛，视觉上是连续转动而不是硬切，代价 ~50ms。
  */
-function step(key) {
-  const t = tween[key];
-  t.raf = 0;
-  if (t.shown === null || t.target === null) return;
-
+function advance(t) {
+  if (t.shown === null || t.target === null) return false;
   const d = shortAngle(t.target, t.shown);
   if (Math.abs(d) < 0.25) {
     t.shown = t.target;
-    draw();
-    return;
+    return false;
   }
   t.shown = (t.shown + d * 0.45 + 360) % 360;
+  return true;
+}
+
+function step() {
+  const arrowMoving = advance(tween.arrow);
+  const viewMoving = advance(tween.view);
   draw();
-  t.raf = requestAnimationFrame(() => step(key));
+  animationFrame = arrowMoving || viewMoving ? requestAnimationFrame(step) : 0;
 }
 
 /**
@@ -86,7 +89,7 @@ function setTarget(key, deg) {
     draw();
     return;
   }
-  if (!t.raf) t.raf = requestAnimationFrame(() => step(key));
+  if (!animationFrame) animationFrame = requestAnimationFrame(step);
 }
 
 function resize() {

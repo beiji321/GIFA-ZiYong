@@ -54,8 +54,12 @@
       <main id="stage">
         <div id="placeholder">
           <div class="ph-icon"><svg class="ico"><use href="#f-video"></use></svg></div>
-          <p>粘贴一个 B 站攻略视频链接</p>
-          <span>支持 BV 号、av 号、b23.tv 短链、带分 P 的链接</span>
+          <p aria-live="polite">粘贴一个 B 站攻略视频链接</p>
+          <span id="placeholderHint">支持 BV 号、av 号、b23.tv 短链、带分 P 的链接</span>
+          <div id="loadActions" hidden>
+            <button id="btnRetry" class="primary" type="button">重试</button>
+            <button id="btnBrowser" class="ghost" type="button" hidden>在浏览器打开</button>
+          </div>
         </div>
 
         <div id="calib" class="hidden">

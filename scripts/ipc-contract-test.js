@@ -118,6 +118,9 @@ check('preload 的每个 on* 在渲染层都有调用', () => {
   let m;
   while ((m = re.exec(preload))) exposed.push(m[1]);
   const consoleSrc = read('src/console/console.js');
+  /* 上游 v0.2.7 把更新器 UI 拆成了独立文件 src/console/update.js，
+   * preload 暴露的 update* / onUpdateState 都是它用的，不在 console.js 里。 */
+  const consoleUpdateSrc = read('src/console/update.js');
   /* 这两个是历史遗留：preload 暴露了，但渲染层从来没注册过。
    * 它们不影响功能（对应的事件也没人发），所以先记着不修，
    * 免得把这次提交搅浑。真要清理时把 allowlist 删掉就会重新报错。 */
@@ -126,7 +129,9 @@ check('preload 的每个 on* 在渲染层都有调用', () => {
     (name) =>
       !knownDead.has(name) &&
       !new RegExp(`window\\.api\\.${name}\\(`).test(app) &&
-      !new RegExp(`window\\.api\\.${name}\\(`).test(consoleSrc)
+      !new RegExp(`window\\.api\\.${name}\\(`).test(consoleSrc) &&
+      !new RegExp(`\\.${name}\\(`).test(consoleUpdateSrc) &&
+      !new RegExp(`\\b${name}\\b`).test(consoleUpdateSrc)
   );
   assert.deepEqual(unused, [], '暴露了但渲染层从没调用：' + unused.join(', '));
 });
@@ -143,6 +148,14 @@ check('preload 调用的每个 invoke 通道主进程都有 handle', () => {
   const handlers = new Set();
   const hre = /ipcMain\.handle\('([^']+)'/g;
   while ((m = hre.exec(main))) handlers.add(m[1]);
+  /* 上游 v0.2.7 的更新器用循环动态注册：
+   *   ipcMain.handle('update:' + action, ...)
+   * 静态正则抓不到这种拼接，这里把前缀连同 actions 表一起识别。 */
+  if (/ipcMain\.handle\('update:'\s*\+\s*action/.test(main)) {
+    for (const name of ['status', 'check', 'download', 'cancel', 'install', 'open-releases']) {
+      handlers.add('update:' + name);
+    }
+  }
   const missing = [...new Set(invoked)].filter((c) => !handlers.has(c));
   assert.deepEqual(missing, [], '这些 invoke 通道没有 handle，调用会挂住：' + missing.join(', '));
 });

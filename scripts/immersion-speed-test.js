@@ -329,6 +329,7 @@ function createHarness(options = {}) {
     'let win = initialWindow;',
     'let consoleWin = initialLauncher;',
     'let overlayWin = null;',
+    'let overlayReleaseTimer = null;',
     'let overlayPlacing = false;',
     'let lastBearing = null;',
     'let playbackGuest = null;',
@@ -1111,6 +1112,44 @@ check('方位关闭时启动不创建叠加层，加载期间关闭不再被回�
   harness.invoke('overlay:enable', true);
   assert.equal(harness.getOverlay(), overlay);
   assert.equal(overlay.isVisible(), true);
+  harness.clock.advance(5000);
+  assert.equal(overlay.isDestroyed(), false);
+});
+
+check('关闭方位后释放闲置窗口，重新启用后只补发当前方向', () => {
+  const harness = createHarness();
+  harness.registerIpc();
+  harness.invoke('overlay:enable', true);
+  const old = harness.getOverlay();
+  old.finishLoad();
+  const layout = activeBearingLayout(harness.getSettings().bearing);
+  const sender = harness.getWindow().webContents;
+  harness.send('overlay:bearing', sender, { layoutId: layout.id, revision: layout.revision, angle: 12 });
+  harness.invoke('overlay:enable', false);
+  harness.clock.advance(5000);
+  assert.equal(old.isDestroyed(), true);
+  assert.equal(harness.getOverlay(), null);
+  harness.invoke('overlay:enable', true);
+  const fresh = harness.getOverlay();
+  const latest = { layoutId: layout.id, revision: layout.revision, view: 215 };
+  harness.send('overlay:bearing', sender, latest);
+  fresh.finishLoad();
+  assert.equal(fresh.isVisible(), true);
+  assert.equal(fresh.mouseThrough, true);
+  assert.deepEqual(fresh.messages.at(-1), { channel: 'bearing', payload: latest });
+  assert.ok(!fresh.messages.some(m => m.payload?.angle === 12));
+});
+
+check('仅开启动器时按需创建方位窗口，摆放入口可直接使用', () => {
+  const harness = createHarness({ withWindow: false });
+  harness.registerIpc();
+  harness.invoke('overlay:enable', true);
+  assert.equal(harness.getOverlay(), null);
+  assert.equal(harness.invoke('overlay:place', true), true);
+  const overlay = harness.getOverlay();
+  overlay.finishLoad();
+  assert.equal(overlay.isVisible(), true);
+  assert.equal(overlay.focusable, true);
 });
 
 check('真实窗口 closed 回调清理临时倍速、沉浸与悬停 timer', () => {

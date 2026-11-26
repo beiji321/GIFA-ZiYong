@@ -1,115 +1,22 @@
 'use strict';
 
 /**
- * 手柄输入源：主进程经 PowerShell 子进程轮询 XInput。
- *
- * 为什么不是渲染进程的 Gamepad API：Chromium 要求文档收到过真实用户手势才启动
- * 手柄监视，而轮询宿主窗必须不抢焦点、鼠标穿透、从不 show —— 它永远拿不到手势，
- * 实机在游戏前台时 getGamepads() 恒空。XInput 是 OS 层轮询，与焦点和手势无关。
- *
- * 帧数据只走 stdout 逐行 JSON，子进程按签名去重，静默时不产行。
+ * 独立辅助程序用 XInput 接收 Xbox 输入，用 Windows HID 接收 PlayStation 输入。
+ * 每个连接有独立槽位，助手在后台也能收到按下、松开和断连。
  */
 
 const { spawn } = require('node:child_process');
+const path = require('node:path');
 const { xinputToFrame } = require('./gamepad-config');
+const gamepadHelperPath = require('./gamepad-helper-path');
 
-const SLOT_COUNT = 4;
-const POLL_MS = 16;
+const XINPUT_SLOT_COUNT = 4;
+const SONY_MODELS = new Set(['dualshock4', 'dualsense', 'dualsense-edge']);
 const RESTART_DELAY_MS = 1000;
 const RESTART_LIMIT = 3;
 
-const XINPUT_CSHARP = `
-using System;
-using System.Runtime.InteropServices;
-
-[StructLayout(LayoutKind.Sequential, Pack = 4)]
-public struct XGamepad {
-  public ushort wButtons;
-  public byte bLeftTrigger;
-  public byte bRightTrigger;
-  public short sThumbLX;
-  public short sThumbLY;
-  public short sThumbRX;
-  public short sThumbRY;
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 4)]
-public struct XState {
-  public uint dwPacketNumber;
-  public XGamepad Gamepad;
-}
-
-public static class Xi {
-  [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-  delegate uint GetStateFn(uint user, out XState state);
-
-  const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
-  [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryEx(string name, IntPtr file, uint flags);
-  [DllImport("kernel32", SetLastError = true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
-
-  static GetStateFn fn;
-
-  public static int Probe() {
-    if (fn != null) return 0;
-    string[] names = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
-    for (int i = 0; i < names.Length; i++) {
-      IntPtr lib = LoadLibraryEx(names[i], IntPtr.Zero, LOAD_LIBRARY_SEARCH_SYSTEM32);
-      if (lib == IntPtr.Zero) continue;
-      IntPtr addr = GetProcAddress(lib, "XInputGetState");
-      if (addr == IntPtr.Zero) continue;
-      fn = (GetStateFn)Marshal.GetDelegateForFunctionPointer(addr, typeof(GetStateFn));
-      return 0;
-    }
-    return -1;
-  }
-
-  public static uint State(uint user, out XState state) {
-    return fn(user, out state);
-  }
-}
-`;
-
-// PowerShell 的单引号 here-string 结束标记必须顶格，所以下面有两行不能缩进。
-const POLL_SCRIPT = `
-$ErrorActionPreference = 'Stop'
-$code = @'
-${XINPUT_CSHARP}
-'@
-Add-Type -Language CSharp -TypeDefinition $code
-if ([Xi]::Probe() -ne 0) {
-  [Console]::Out.WriteLine('{"error":"xinput-missing"}')
-  [Console]::Out.Flush()
-  exit 1
-}
-$parentInput = [Console]::OpenStandardInput()
-$parentEof = $parentInput.ReadAsync((New-Object byte[] 1), 0, 1)
-$state = New-Object XState
-$last = ''
-while (-not $parentEof.IsCompleted) {
-  $line = '{"none":1}'
-  for ($i = 0; $i -lt ${SLOT_COUNT}; $i++) {
-    if ([Xi]::State($i, [ref]$state) -eq 0) {
-      $g = $state.Gamepad
-      $line = '{{"slot":{0},"b":{1},"lt":{2},"rt":{3},"lx":{4},"ly":{5},"rx":{6},"ry":{7}}}' -f $i, [int]$g.wButtons, [int]$g.bLeftTrigger, [int]$g.bRightTrigger, [int]$g.sThumbLX, [int]$g.sThumbLY, [int]$g.sThumbRX, [int]$g.sThumbRY
-      break
-    }
-  }
-  if ($line -ne $last) {
-    $last = $line
-    [Console]::Out.WriteLine($line)
-    [Console]::Out.Flush()
-  }
-  Start-Sleep -Milliseconds ${POLL_MS}
-}
-`;
-
 let run = null;
 let poller = null;
-
-function powershellPath() {
-  const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
-  return root + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-}
 
 function failPoller(current, ...warning) {
   if (run !== current.owner || current.failed) return;
@@ -139,17 +46,23 @@ function handleLine(current, line) {
     return;
   }
   if (!raw || typeof raw !== 'object') return;
-  if (raw.error) {
+  if (raw.error === 'gamepad-backends-unavailable' || raw.error === 'xinput-missing') {
     current.owner.unavailable = true;
-    failPoller(current, '[gamepad] 本机没有可用的 XInput 运行库，手柄功能不可用');
+    failPoller(current, '[gamepad] Windows 手柄输入后端不可用');
     killPoller(current);
     return;
   }
-  const frame = xinputToFrame(raw);
-  if (frame.connected && Number.isInteger(raw.slot) && raw.slot >= 0 && raw.slot < SLOT_COUNT) {
-    frame.slot = raw.slot;
+  const slot = raw.slot;
+  const validSlot = Number.isInteger(slot) && slot >= 0 && slot <= 0x7fffffff;
+  if (raw.none === 1) {
+    if (validSlot) current.owner.onFrame?.({ ...xinputToFrame(null), slot });
+    else if (slot === undefined) current.owner.onFrame?.(xinputToFrame(null));
+    return;
   }
-  current.owner.onFrame?.(frame);
+  if (!validSlot || !Number.isInteger(raw.b) || raw.b < 0 || raw.b > 0xffff) return;
+  const model = slot < XINPUT_SLOT_COUNT && raw.model === undefined ? 'xinput' : raw.model;
+  if (slot < XINPUT_SLOT_COUNT ? model !== 'xinput' : !SONY_MODELS.has(model)) return;
+  current.owner.onFrame?.({ ...xinputToFrame(raw), slot, model });
 }
 
 function consumeStdout(current, chunk) {
@@ -167,14 +80,13 @@ function consumeStdout(current, chunk) {
 function spawnPoller(owner) {
   if (run !== owner || poller || owner.unavailable) return;
 
-  const encoded = Buffer.from(POLL_SCRIPT, 'utf16le').toString('base64');
   let child;
   try {
-    child = spawn(powershellPath(), ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
-      // stderr 不接：PowerShell 的 stderr 一被重定向成管道就先吐一段 CLIXML 框架，
-      // 里面并不是错误内容，反而会把日志搞脏。真起不来由退出码和 error 事件报。
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'ignore']
+    const packaged = process.versions.electron && require('electron').app.isPackaged;
+    const binary = gamepadHelperPath(packaged ? process.resourcesPath : undefined);
+    child = spawn(binary, [], {
+      cwd: path.dirname(binary), windowsHide: true,
+      stdio: ['pipe', 'pipe', 'inherit']
     });
   } catch (err) {
     console.warn('[gamepad] 轮询进程起不来：', err.message);
@@ -220,7 +132,7 @@ function spawnPoller(owner) {
       killPoller(current);
     }
   });
-  child.once('exit', onExit);
+  // exit 可能早于 stdout 的最后一行，尤其是辅助程序报告缺少 XInput 后立即退出时。
   child.once('close', onExit);
 }
 

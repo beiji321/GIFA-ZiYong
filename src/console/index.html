@@ -4,10 +4,12 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';"
+      content="default-src 'self'; img-src 'self' https://*.hdslb.com https://*.biliimg.com; style-src 'self' 'unsafe-inline'; script-src 'self';"
     />
     <title>原神跟跑助手 · 启动器</title>
     <link rel="stylesheet" href="console.css" />
+    <link rel="stylesheet" href="home.css" />
+    <script src="update.js" defer></script>
   </head>
   <body>
     <!-- 纯 CSS 分页：radio 必须是 #shell 的前置兄弟，导航 label 通过 for 切换。
@@ -26,7 +28,6 @@
       <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2" /><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M10 14h.01M14 14h.01M18 14h.01" /></symbol>
       <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="5" width="13" height="14" rx="2" /><path d="M16 10l5-3v10l-5-3z" /></symbol>
       <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9" /><circle cx="15" cy="7" r="2" /><circle cx="9" cy="17" r="2" /></symbol>
-      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></symbol>
       <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4l9 16H3z" /><path d="M12 10v4M12 17h.01" /></symbol>
       <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z" /></symbol>
     <symbol id="i-map" viewBox="0 0 24 24"><path d="M3 6l6-3 6 3 6-3v15l-6 3-6-3-6 3z" /><path d="M9 3v15M15 6v15" /></symbol>
@@ -39,48 +40,50 @@
       <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z" /><path d="M17 9a4 4 0 010 6M19.5 6.5a7.5 7.5 0 010 11" /></symbol>
       <symbol id="i-resume" viewBox="0 0 24 24"><path d="M4 5v14l10-7zM17 5v14" /></symbol>
       <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7.5" /><path d="M12 2.5v4M12 17.5v4M2.5 12h4M17.5 12h4" /></symbol>
+      <symbol id="i-link" viewBox="0 0 24 24"><path d="M10.5 13.5a3.8 3.8 0 0 0 5.4 0l3.7-3.7a3.8 3.8 0 1 0-5.4-5.4l-2 2M13.5 10.5a3.8 3.8 0 0 0-5.4 0l-3.7 3.7a3.8 3.8 0 1 0 5.4 5.4l2-2" /></symbol>
+      <symbol id="i-next" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6" /></symbol>
+      <symbol id="i-account" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5" /><path d="M5 20v-2a3 3 0 0 1 3-3h8a3 3 0 0 1 3 3v2Z" /></symbol>
+      <symbol id="i-update" viewBox="0 0 24 24"><path d="M20 10a8 8 0 0 0-14.5-3M4 14a8 8 0 0 0 14.5 3M20 5v5h-5M4 19v-5h5" /></symbol>
     </svg>
 
     <div id="shell">
-      <!-- ============================================================ 左侧导航 -->
       <aside class="navpane">
-        <!-- 与右侧 .topbar 同一条 40px 标题栏带：放真正的品牌，而不是点了没反应的装饰按钮 -->
         <div class="nav-brand">
-          <img class="brand-mark" src="../../build/icon.ico" width="22" height="22" alt="" />
+          <img class="brand-mark" src="../../build/icon.ico" width="23" height="23" alt="" />
           <strong class="brand-text">原神跟跑助手</strong>
         </div>
 
-        <nav class="nav-list">
+        <nav class="nav-list" aria-label="启动器导航">
           <label class="nav-item" for="tab-home" title="启动">
-            <svg class="ico"><use href="#i-play"></use></svg><span>启动</span>
+            <svg class="ico" aria-hidden="true"><use href="#i-play"></use></svg><span>启动</span>
           </label>
           <label class="nav-item" for="tab-bearing" title="方位标定">
-            <svg class="ico"><use href="#i-compass"></use></svg><span>方位标定</span>
+            <svg class="ico" aria-hidden="true"><use href="#i-compass"></use></svg><span>方位标定</span>
           </label>
-          <label class="nav-item" for="tab-window" title="浮窗">
-            <svg class="ico"><use href="#i-window"></use></svg><span>浮窗</span>
+          <label class="nav-item" for="tab-window" title="浮窗设置">
+            <svg class="ico" aria-hidden="true"><use href="#i-window"></use></svg><span>浮窗设置</span>
           </label>
           <label class="nav-item" for="tab-hotkeys" title="快捷键">
-            <svg class="ico"><use href="#i-keyboard"></use></svg><span>快捷键</span>
+            <svg class="ico" aria-hidden="true"><use href="#i-keyboard"></use></svg><span>快捷键</span>
           </label>
           <label class="nav-item" for="tab-media" title="字幕弹幕">
             <svg class="ico"><use href="#i-video"></use></svg><span>字幕弹幕</span>
           </label>
         </nav>
 
-        <div class="nav-foot">
-          <span class="ver" id="ver"></span>
-        </div>
+        <div class="nav-foot"><span class="ver" id="ver"></span></div>
       </aside>
 
-      <!-- ======================================================= 内容工作区 -->
       <section class="workspace">
-        <!-- 自绘标题栏：整条可拖动，右侧是账号；系统的最小化 / 最大化 / 关闭浮在最右 -->
         <header class="topbar">
-          <div class="topbar-right">
-            <span id="accountLine" class="account">未登录 · 只能看预览和标清</span>
-            <button id="btnLogin" class="tiny">登录 / 切换账号</button>
-          </div>
+          <button id="btnUpdate" class="update-trigger" type="button" aria-haspopup="dialog" aria-controls="updateDialog">
+            <svg class="ico" aria-hidden="true"><use href="#i-update"></use></svg>
+            <span id="updateTriggerText">软件更新</span>
+          </button>
+          <button id="btnLogin" class="account" type="button" title="登录 B 站">
+            <svg class="ico" aria-hidden="true"><use href="#i-account"></use></svg>
+            <span id="accountLine">登录 B 站</span>
+          </button>
         </header>
 
         <!-- 提权提示：放在分页之外，切到哪一页都看得见 -->
@@ -93,26 +96,57 @@
         </div>
 
         <div class="content">
-          <!-- ---------------------------------------------------------- 启动 -->
-          <div class="pane pane-home">
-            <!-- 主视觉：直接画出产品在做的事（视频小地图 → 你的小地图上的红箭头 / 绿弧）。
-                 全部是内联矢量，没有引入任何外部图片素材。 -->
-            <div class="hero">
-              <div class="hero-text">
-                <h2>边跑图，边看攻略</h2>
-                <p>读出攻略视频里小地图的行进方向与镜头朝向，实时标在你自己的游戏画面上。</p>
-                <div class="hero-legend">
-                  <span><i class="lg lg-red"></i>红箭头 · 行进方向</span>
-                  <span><i class="lg lg-green"></i>绿弧 · 镜头朝向</span>
+          <main class="pane pane-home" aria-labelledby="home-title">
+            <header class="home-heading">
+              <h1 id="home-title">启动跟跑</h1>
+              <span id="floatState" class="badge off" role="status">浮窗未启动</span>
+            </header>
+
+            <section class="video-panel" aria-labelledby="video-heading">
+              <div class="video-entry">
+                <h2 id="video-heading"><label for="url">攻略视频链接</label></h2>
+                <form id="launchForm" class="launch-form">
+                  <div class="launch-input">
+                    <svg class="ico" aria-hidden="true"><use href="#i-link"></use></svg>
+                    <input id="url" type="text" placeholder="粘贴 B 站链接或 BV 号" aria-describedby="link-formats" autocomplete="off" spellcheck="false" />
+                  </div>
+                  <button id="btnLaunch" class="primary" type="submit"><svg class="ico" aria-hidden="true"><use href="#i-play"></use></svg><span id="launchLabel">打开浮窗</span></button>
+                </form>
+                <p class="formats" id="link-formats">也支持 av 号、b23.tv 短链和带分 P 的链接。</p>
+                <div id="playingControls" class="playing-controls" hidden>
+                  <span id="videoMeta" class="video-meta"></span>
+                  <label for="part">分 P</label>
+                  <select id="part" class="sel" disabled></select>
+                  <button id="btnStop" class="small" type="button" disabled>关闭浮窗</button>
                 </div>
               </div>
-              <svg class="hero-art" viewBox="0 0 330 150" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+
+              <section id="resumeBar" class="home-history" aria-labelledby="resume-heading" hidden>
+                <div class="resume-cover" aria-hidden="true"><svg class="ico"><use href="#i-video"></use></svg><img id="resumeCover" alt="" width="112" height="63" referrerpolicy="no-referrer" hidden /></div>
+                <div class="resume-copy">
+                  <h2 id="resume-heading">上次看到</h2>
+                  <p id="resumeInfo" class="resume-name"></p>
+                  <div class="resume-meta"><span id="resumePart"></span><span id="resumeWhen"></span></div>
+                </div>
+                <button id="btnResume" type="button">继续观看<svg class="ico" aria-hidden="true"><use href="#i-next"></use></svg></button>
+              </section>
+            </section>
+
+            <section class="map-panel" aria-labelledby="map-heading">
+              <div class="map-copy">
+                <h2 id="map-heading">小地图方位</h2>
+                <dl class="marker-key">
+                  <div><dt class="arrow-key">红箭头</dt><dd>攻略里角色的行进方向</dd></div>
+                  <div><dt class="view-key">绿弧</dt><dd>攻略里的镜头朝向</dd></div>
+                </dl>
+                <button class="text-action" type="button" data-open-pane="tab-bearing">设置方位标记<svg class="ico" aria-hidden="true"><use href="#i-next"></use></svg></button>
+              </div>
+              <svg class="map-diagram" viewBox="0 0 330 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="视频小地图的方向标记显示在游戏小地图上">
                 <defs>
                   <radialGradient id="heroCone" cx="0" cy="0" r="42" gradientUnits="userSpaceOnUse">
                     <stop offset="0" stop-color="#fff" stop-opacity="0.42" />
                     <stop offset="1" stop-color="#fff" stop-opacity="0.1" />
                   </radialGradient>
-                  <!-- 下面两个渐变与 overlay.js 的取色一致：箭头尾深尖亮，绿弧内缘亮外缘深 -->
                   <linearGradient id="heroArrow" x1="0" y1="-17" x2="0" y2="-41.5" gradientUnits="userSpaceOnUse">
                     <stop offset="0" stop-color="#c4121d" />
                     <stop offset="0.55" stop-color="#ff2f2f" />
@@ -124,26 +158,18 @@
                     <stop offset="1" stop-color="#1fae52" />
                   </radialGradient>
                 </defs>
-                <!-- 视频里的小地图：白色视野扇形 + 青色玩家箭头 -->
                 <g transform="translate(78 66)">
                   <circle class="ha-disc" r="42" />
                   <path fill="url(#heroCone)" transform="rotate(-40)" d="M0 0L-29.7-29.7A42 42 0 0 1 29.7-29.7Z" />
                   <path class="ha-player" transform="rotate(35)" d="M0-12L7.5 8 0 3.5-7.5 8Z" />
                 </g>
                 <text class="ha-label" x="78" y="136">视频里的小地图</text>
-
-                <!-- 识别 → 叠加 -->
                 <path class="ha-link" d="M136 66H184" />
                 <path class="ha-link-head" d="M181 60.5l6.5 5.5-6.5 5.5" />
-
-                <!-- 你的小地图：外圈是叠加层画的红箭头和绿弧 -->
                 <g transform="translate(252 66)">
                   <circle class="ha-ring" r="46" />
                   <circle class="ha-disc" r="33" />
                   <path class="ha-player" transform="rotate(-105) scale(0.82)" d="M0-12L7.5 8 0 3.5-7.5 8Z" />
-                  <!-- 造型照着 overlay.js 画：绿弧是两端收细、正中带小尖的月牙，
-                       红箭头是细尾 + 后掠箭头的一整块轮廓。渐变用 fill 属性引用，
-                       不放进 console.css —— 外链样式表里的 url(#id) 解析基准不可靠 -->
                   <path class="ha-arc" fill="url(#heroArc)" transform="rotate(-40)" d="M-23.6-40.8A42 42 0 0 1-7.9-47.9Q-3-48.6 0-51.9Q3-48.6 7.9-47.9A42 42 0 0 1 23.6-40.8A1.1 1.1 0 0 1 22.4-38.9A56.8 56.8 0 0 0-22.4-38.9A1.1 1.1 0 0 1-23.6-40.8Z" />
                   <g class="ha-arrow" transform="rotate(35)">
                     <path class="ha-arrow-body" fill="url(#heroArrow)" d="M-1.2-17L-2.6-32.5L-6.7-29.4L0-41.5L6.7-29.4L2.6-32.5L1.2-17Z" />
@@ -152,6 +178,12 @@
                 </g>
                 <text class="ha-label" x="252" y="136">你的小地图</text>
               </svg>
+            </section>
+
+            <div class="home-keys" role="group" aria-label="常用快捷键">
+              <span>播放 / 暂停 <kbd id="homePlayKey">Alt+空格</kbd></span>
+              <span>显示 / 隐藏浮窗 <kbd id="homeHideKey">Alt+H</kbd></span>
+              <button class="text-action" type="button" data-open-pane="tab-hotkeys">修改快捷键</button>
             </div>
 
             <section class="card">
@@ -199,36 +231,60 @@
                 <div class="note-step"><b>3</b><span>回到游戏，用快捷键暂停 / 快进。默认 <b>Alt+空格</b> 暂停播放。</span></div>
               </div>
             </section>
-          </div>
+            <details class="home-guide">
+              <summary>游戏里看不到浮窗？</summary>
+              <p>在原神的「设置 → 图像 → 显示模式」选择「窗口化」或「无边框」。如果已经隐藏了浮窗，可用上方的显示快捷键找回。</p>
+            </details>
+          </main>
 
           <!-- ------------------------------------------------------ 方位标定 -->
-          <div class="pane pane-bearing">
-            <div class="pane-head">
-              <h1>方位标定</h1>
-              <p>红箭头是视频里角色的行进方向，绿弧是镜头视角方向，两者独立识别、互不干扰。</p>
-            </div>
-
-            <section class="card">
+          <div class="pane pane-bearing" aria-labelledby="bearing-heading">
+            <div class="pane-head"><h1 id="bearing-heading">方位标定</h1></div>
+            <section class="card" aria-labelledby="video-map-heading">
               <div class="card-head">
-                <span class="card-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
-                <div class="card-heading">
-                  <h2>显示与标定</h2>
-                  <p>视频小地图布局可跨视频复用，同一时刻只识别当前布局</p>
+                <span class="card-ico"><svg class="ico" aria-hidden="true"><use href="#i-target"></use></svg></span>
+                <div class="card-heading"><h2 id="video-map-heading">攻略里的小地图</h2></div>
+              </div>
+              <div class="card-body">
+                <div class="layout-picker">
+                  <label for="bearingLayout">视频布局</label>
+                  <select id="bearingLayout" class="sel"></select>
+                  <button id="btnLayoutDefault" class="small">设为启动默认</button>
                 </div>
+                <div class="layout-row">
+                  <button id="btnNewLayout" class="small">新增布局</button>
+                  <button id="btnPickRoi" class="small">调整范围</button>
+                  <button id="btnRenameLayout" class="small">重命名</button>
+                  <button id="btnDeleteLayout" class="ghost small danger">删除布局</button>
+                </div>
+                <form id="layoutNameForm" class="layout-row" hidden>
+                  <input id="layoutName" type="text" maxlength="40" spellcheck="false" aria-label="布局名称" placeholder="布局名称或 UP 主昵称" required />
+                  <button id="btnSaveLayoutName" type="submit" class="small">去框选</button>
+                  <button id="btnCancelLayoutName" type="button" class="ghost small">取消</button>
+                </form>
+                <p id="layoutStatus" class="tip" aria-live="polite"></p>
+                <details class="settings-help"><summary>识别工具</summary>
+                  <div class="tool-row">
+                    <button id="btnAutoCenter" class="small">重新对准圆心</button>
+                    <button id="btnDumpRoi" class="small">抓一帧核对</button>
+                    <button id="btnOpenDump" class="small">打开导出位置</button>
+                  </div>
+                </details>
+              </div>
+            </section>
+            <section class="card" aria-labelledby="game-map-heading">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico" aria-hidden="true"><use href="#i-compass"></use></svg></span>
+                <div class="card-heading"><h2 id="game-map-heading">游戏里的标记</h2></div>
               </div>
               <div class="card-body">
                 <label class="setting" for="setBearing">
-                  <span class="setting-ico"><svg class="ico"><use href="#i-pin"></use></svg></span>
-                  <span class="setting-text"><strong>显示方位箭头</strong><small>在叠加层画出视频里的行进方向与视角方位</small></span>
+                  <span class="setting-text"><strong>显示方位箭头</strong><small>红箭头显示角色的行进方向，绿弧显示镜头朝向。</small></span>
                   <span class="switch"><input type="checkbox" id="setBearing" /></span>
                 </label>
                 <div class="setting">
-                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
-                  <span class="setting-text"><strong>标记大小</strong><small>叠加层上红圈与绿弧的直径</small></span>
-                  <span class="setting-ctrl">
-                    <input type="range" id="setBearingSize" min="60" max="240" step="5" />
-                    <span class="val" id="sizeVal">110</span>
-                  </span>
+                  <label class="setting-text" for="setBearingSize"><strong>标记大小</strong></label>
+                  <span class="setting-ctrl"><input type="range" id="setBearingSize" min="60" max="240" step="5" /><span class="val" id="sizeVal">110</span></span>
                 </div>
 
                 <label class="setting" for="setOverlayRadar">
@@ -332,8 +388,7 @@
           <!-- ---------------------------------------------------------- 浮窗 -->
           <div class="pane pane-window">
             <div class="pane-head">
-              <h1>浮窗</h1>
-              <p>控制置顶、穿透、透明度与播放行为；偏好自动记住，沉浸模式仅本次运行生效。</p>
+              <h1>浮窗设置</h1>
             </div>
 
             <section class="card">
@@ -341,13 +396,12 @@
                 <span class="card-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
                 <div class="card-heading">
                   <h2>窗口行为</h2>
-                  <p>游戏里也能用全局快捷键随时切换</p>
                 </div>
               </div>
               <div class="card-body">
                 <label class="setting" for="setResumeOnLaunch">
                   <span class="setting-ico"><svg class="ico"><use href="#i-resume"></use></svg></span>
-                  <span class="setting-text"><strong>下次启动自动继续上次视频</strong><small>记住看到哪一集，打开就续播</small></span>
+                  <span class="setting-text"><strong>启动时续播</strong><small>打开助手时继续上次看的分 P。</small></span>
                   <span class="switch"><input type="checkbox" id="setResumeOnLaunch" /></span>
                 </label>
                 <label class="setting" for="setImmersion">
@@ -357,17 +411,17 @@
                 </label>
                 <label class="setting" for="setHoverFade">
                   <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
-                  <span class="setting-text"><strong>鼠标移入自动变淡</strong><small>仅沉浸模式生效，鼠标移入时降至 10% 不透明度，移出恢复原透明度。</small></span>
+                  <span class="setting-text"><strong>鼠标移入自动变淡</strong><small>沉浸模式下，鼠标移入时降至 10% 不透明度。</small></span>
                   <span class="switch"><input type="checkbox" id="setHoverFade" /></span>
                 </label>
                 <label class="setting" for="setPin">
                   <span class="setting-ico"><svg class="ico"><use href="#i-pin"></use></svg></span>
-                  <span class="setting-text"><strong>窗口置顶</strong><small>层级被抢时会自动夺回</small></span>
+                  <span class="setting-text"><strong>窗口置顶</strong><small>浮窗保持在游戏上方。</small></span>
                   <span class="switch"><input type="checkbox" id="setPin" /></span>
                 </label>
                 <label class="setting" for="setPass">
                   <span class="setting-ico"><svg class="ico"><use href="#i-cursor"></use></svg></span>
-                  <span class="setting-text"><strong>鼠标穿透</strong><small>点击直接落到游戏里，按 Alt+L 可关</small></span>
+                  <span class="setting-text"><strong>鼠标穿透</strong><small>让鼠标点击直接落到游戏里。</small></span>
                   <span class="switch"><input type="checkbox" id="setPass" /></span>
                 </label>
               </div>
@@ -450,13 +504,12 @@
                 <span class="card-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
                 <div class="card-heading">
                   <h2>显示与声音</h2>
-                  <p>不透明度低一些更不挡视野</p>
                 </div>
               </div>
               <div class="card-body">
                 <div class="setting">
                   <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
-                  <span class="setting-text"><strong>不透明度</strong><small>整个浮窗的可见程度</small></span>
+                  <label class="setting-text" for="setOpacity"><strong>不透明度</strong></label>
                   <span class="setting-ctrl">
                     <input type="range" id="setOpacity" min="30" max="100" step="1" />
                     <span class="val" id="opacityVal">100%</span>
@@ -464,15 +517,13 @@
                 </div>
                 <div class="setting">
                   <span class="setting-ico"><svg class="ico"><use href="#i-volume"></use></svg></span>
-                  <span class="setting-text"><strong>音量</strong><small>视频播放音量，与系统音量独立</small></span>
+                  <label class="setting-text" for="setVolume"><strong>视频音量</strong></label>
                   <span class="setting-ctrl">
                     <input type="range" id="setVolume" min="0" max="100" step="1" />
                     <span class="val" id="volumeVal">100%</span>
                   </span>
                 </div>
-                <p class="tip">
-                  想压在原神上面：游戏内「显示模式」请选 <b>窗口化</b> 或 <b>无边框</b>。独占全屏下任何外部浮窗都无法被系统合成上去。
-                </p>
+
               </div>
             </section>
 
@@ -481,7 +532,6 @@
                 <span class="card-ico"><svg class="ico"><use href="#i-play"></use></svg></span>
                 <div class="card-heading">
                   <h2>播放倍速</h2>
-                  <p>常规倍速会记住，长按加速只临时生效</p>
                 </div>
               </div>
               <div class="card-body">
@@ -554,7 +604,7 @@
 
                 <div class="setting">
                   <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
-                  <span class="setting-text"><strong><label for="setHoldRate">长按临时倍速</label></strong><small id="holdRateHint">按住 F8 临时加速，松开恢复常规倍速；临时值不会替换保存的常规倍速。</small></span>
+                  <span class="setting-text"><strong><label for="setHoldRate">长按临时倍速</label></strong><small id="holdRateHint">按住 F8 使用这个倍速，松开恢复。</small></span>
                   <span class="setting-ctrl">
                     <select id="setHoldRate" class="sel">
                       <option value="1.25">1.25 倍</option>
@@ -565,7 +615,7 @@
                     </select>
                   </span>
                 </div>
-                <p class="tip" id="cycleSpeedHint">按 Alt+S 循环切换常规倍速：1 → 1.25 → 1.5 → 2 倍；可在「快捷键」中修改。</p>
+                <p class="tip" id="cycleSpeedHint">Alt+S 在 1、1.25、1.5 和 2 倍之间切换。常规倍速会自动保存。</p>
               </div>
             </section>
           </div>
@@ -917,7 +967,7 @@
           <div class="pane pane-hotkeys">
             <div class="pane-head">
               <h1>全局快捷键</h1>
-              <p>点键位后按下新组合，也可以只按一个键，或直接按鼠标侧键。</p>
+              <p>点击键位后按下新的按键、组合键或鼠标侧键。按 Esc 取消录制。</p>
             </div>
 
             <div id="hkState" class="hk-state"></div>
@@ -926,18 +976,15 @@
               <div class="card-head">
                 <span class="card-ico"><svg class="ico"><use href="#i-keyboard"></use></svg></span>
                 <div class="card-heading">
-                  <h2>键位 <span class="hint">游戏全屏时同样生效</span></h2>
-                  <p>单键、侧键、循环倍速与长按动作走被动监听；其他组合键由系统独占</p>
+                  <h2>键盘与鼠标</h2>
                 </div>
                 <button id="btnResetHk" class="small head-action">恢复默认</button>
               </div>
               <div class="card-body">
                 <div id="hkList" class="hk-list"></div>
-                <p class="tip">
-                  单键（如 <b>F9</b>、<b>J</b>）、鼠标侧键、循环倍速和长按临时加速都走系统钩子被动监听，不占用、不拦截按键，游戏里同一个键也会照常生效，建议挑不常用的键。
-                  循环倍速和长按动作即使绑定组合键也使用被动监听；循环倍速每按一次切一档，长按加速松开后恢复常规倍速。其他带 <b>Alt / Ctrl</b> 的组合键由系统独占。
-                  沉浸模式可用同一快捷键进入和退出，也可回到「浮窗」页关闭。
-                </p>
+                <details class="settings-help"><summary>快捷键和游戏按键冲突时</summary>
+                  <p>单键、侧键和两个倍速动作会同时传给游戏。可以换成游戏里较少用的键。其他组合键由助手独占。</p>
+                </details>
               </div>
             </section>
 
@@ -945,20 +992,20 @@
               <div class="card-head">
                 <span class="card-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
                 <div class="card-heading">
-                  <h2>手柄快捷键 <span class="hint">按住 L3 弹出圆盘</span></h2>
-                  <p>推右摇杆指向方位，回中触发；一个动作可以绑到多个方位</p>
+                  <h2>手柄快捷键</h2>
                 </div>
                 <button id="btnResetGp" class="small head-action">恢复默认</button>
               </div>
               <div class="card-body">
+                <label class="setting" for="setGamepadEnabled">
+                  <span class="setting-text"><strong>启用手柄快捷键</strong><small id="gamepadStatus" role="status">正在检测手柄…</small></span>
+                  <span class="switch"><input type="checkbox" id="setGamepadEnabled" /></span>
+                </label>
                 <div class="gp-body">
                   <canvas id="gpDisc" class="gp-disc"></canvas>
                   <div id="gpList" class="hk-list gp-list"></div>
                 </div>
-                <p class="tip">
-                  左边就是弹出后的圆盘：扇区上的 <b>n</b> 是正北（向上推右摇杆），<b>e</b> 是正东，其余依此类推。圆盘只在按住 L3 时出现，抬起即收起；未回中就抬杆算取消，不会触发。
-                  改完立刻生效，不用重启。<b>长按加速</b>反过来用：推过锁存线就开始临时加速，回中、滑到别的方向或抬起 L3 才恢复原倍速 —— 加速多久就是摇杆推多久。
-                </p>
+                <p class="tip">按住左摇杆（PS 的 L3 / Xbox 的 LS）打开圆盘，推右摇杆选择动作，回中执行。提前松开左摇杆可取消。「长按加速」在推到该方向时开始，离开方向或松开左摇杆即恢复。</p>
               </div>
             </section>
           </div>
@@ -967,7 +1014,39 @@
       </section>
     </div>
 
-    <div id="toast"></div>
+    <dialog class="update-dialog" id="updateDialog" aria-labelledby="updateTitle">
+      <header class="update-dialog-head">
+        <h2 id="updateTitle">软件更新</h2>
+        <button id="btnUpdateClose" class="small ghost" type="button" autofocus>关闭</button>
+      </header>
+      <div class="update-dialog-body">
+        <div class="update-status" role="status">
+          <p id="updateStatus">尚未检查更新</p>
+          <p id="updateMessage" class="update-message"></p>
+          <p id="updateHint" class="update-hint"></p>
+        </div>
+        <dl class="update-facts">
+          <div><dt>当前版本</dt><dd id="updateCurrentVersion">—</dd></div>
+          <div><dt>最新版本</dt><dd id="updateLatestVersion">—</dd></div>
+          <div><dt>版本类型</dt><dd id="updateMode">—</dd></div>
+          <div><dt>下载大小</dt><dd id="updateSize">—</dd></div>
+        </dl>
+        <div id="updateTransfer" class="update-transfer" hidden>
+          <progress id="updateProgress" aria-label="下载进度" aria-describedby="updateProgressText"></progress>
+          <p id="updateProgressText"></p>
+        </div>
+        <section id="updateNotes" class="update-notes" aria-labelledby="updateNotesTitle" hidden>
+          <h3 id="updateNotesTitle">更新说明</h3>
+          <p id="updateNotesText" class="update-notes-copy" tabindex="0"></p>
+        </section>
+      </div>
+      <footer class="update-dialog-actions">
+        <button id="btnUpdateReleases" class="ghost" type="button">打开官方发布页</button>
+        <button id="btnUpdateAction" class="primary" type="button">检查更新</button>
+      </footer>
+    </dialog>
+
+    <div id="toast" role="status"></div>
     <!-- 手柄卡片里的圆盘参考图和浮窗共用同一套画法，见 src/disc/disc-draw.js -->
     <script src="../disc/disc-draw.js"></script>
     <script src="console.js"></script>

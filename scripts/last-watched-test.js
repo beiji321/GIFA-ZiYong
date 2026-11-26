@@ -15,7 +15,7 @@ const ROOT = require('path').resolve(__dirname, '..');
 const mainSrc = fs.readFileSync(ROOT + '/src/main.js', 'utf8');
 const consoleSrc = fs.readFileSync(ROOT + '/src/console/console.js', 'utf8');
 const htmlSrc = fs.readFileSync(ROOT + '/src/console/index.html', 'utf8');
-const cssSrc = fs.readFileSync(ROOT + '/src/console/console.css', 'utf8');
+const homeCss = fs.readFileSync(ROOT + '/src/console/home.css', 'utf8');
 
 /** 按函数名抠出整段函数体（花括号配平） */
 function grab(src, name) {
@@ -60,6 +60,9 @@ function makeEl() {
     value: '',
     title: '',
     hidden: false,
+    src: '',
+    getAttribute(name) { return this[name] || null; },
+    removeAttribute(name) { this[name] = ''; },
     disabled: false,
     _children: [],
     set textContent(v) {
@@ -96,13 +99,14 @@ const uiCode = [
   'escapeHtml',
   'fmtWatchedAt',
   'lastWatchedLabel',
+  'coverSource',
   'renderLastWatched',
   'renderLastPart',
   'partForLaunch'
 ].map((n) => grab(consoleSrc, n)).join('\n\n');
 const C = new Function(
   '$', 'document', 'state', 'Date',
-  uiCode + '\nreturn { escapeHtml, fmtWatchedAt, lastWatchedLabel, renderLastWatched, renderLastPart, partForLaunch };'
+  uiCode + '\nreturn { escapeHtml, fmtWatchedAt, lastWatchedLabel, coverSource, renderLastWatched, renderLastPart, partForLaunch };'
 )($, documentStub, uiState, MockDate);
 
 /* ------------------------------------------------ 1. noteWatched 写入全字段 */
@@ -113,12 +117,14 @@ M.noteWatched(s, {
   p: 3,
   id: 'BV1xx411c7mD',
   title: '【原神一条龙全收集】蒙德',
+  cover: 'https://i0.hdslb.com/bfs/archive/cover.jpg',
   pageCount: 20
 });
 check('写入 lastText', s.lastText, 'https://www.bilibili.com/video/BV1xx411c7mD?p=3');
 check('写入 lastPart', s.lastPart, 3);
 check('写入 lastTitle', s.lastTitle, '【原神一条龙全收集】蒙德');
 check('写入 lastVideoId', s.lastVideoId, 'BV1xx411c7mD');
+check('写入 lastCover', s.lastCover, 'https://i0.hdslb.com/bfs/archive/cover.jpg');
 check('写入 lastPageCount', s.lastPageCount, 20);
 check('写入 lastWatchedAt', s.lastWatchedAt, NOW);
 
@@ -126,6 +132,7 @@ console.log('\n--- 主进程：只切 P 时保留片名与总数 ---');
 M.noteWatched(s, { p: 4 });
 check('lastPart 更新', s.lastPart, 4);
 check('lastTitle 保留', s.lastTitle, '【原神一条龙全收集】蒙德');
+check('仅切 P 时保留封面', s.lastCover, 'https://i0.hdslb.com/bfs/archive/cover.jpg');
 check('lastPageCount 保留', s.lastPageCount, 20);
 check('lastText 保留', s.lastText, 'https://www.bilibili.com/video/BV1xx411c7mD?p=3');
 check('时间戳刷新', s.lastWatchedAt, NOW);
@@ -155,7 +162,8 @@ const base = {
   lastPageCount: 20,
   lastTitle: '蒙德一条龙',
   lastVideoId: 'BV1xx411c7mD',
-  lastWatchedAt: at(2026, 11, 8, 9, 5)
+  lastWatchedAt: at(2026, 11, 8, 9, 5),
+  lastCover: '//i1.hdslb.com/bfs/archive/cover.jpg'
 };
 check('标题优先 + P7/20 + 今天', C.lastWatchedLabel(base), {
   name: '蒙德一条龙', part: 'P7/20', when: '今天 09:05'
@@ -175,12 +183,10 @@ check('占位 select 有值就用它',
   C.partForLaunch('https://x/BV1', { lastText: 'https://x/BV1', lastPart: 7 }, '7'), 7);
 check('下拉改到 P9 就按 P9',
   C.partForLaunch('https://x/BV1', { lastText: 'https://x/BV1', lastPart: 7 }, '9'), 9);
-check('贴了新链接 → 换片回 P1',
-  C.partForLaunch('https://x/BV2', { lastText: 'https://x/BV1', lastPart: 7 }, '7'), 1);
-check('首次使用（无 lastText）取下拉值',
-  C.partForLaunch('https://x/BV2', { lastText: '', lastPart: 1 }, '3'), 3);
-check('首次使用且下拉为空 → P1',
-  C.partForLaunch('https://x/BV2', { lastText: '', lastPart: 1 }, ''), 1);
+check('贴了新链接时由主进程解析链接分 P',
+  C.partForLaunch('https://x/BV2?p=5', { lastText: 'https://x/BV1', lastPart: 7 }, '7'), undefined);
+check('首次使用不误传占位下拉的页码',
+  C.partForLaunch('https://x/BV2?p=5', { lastText: '', lastPart: 1 }, '1'), undefined);
 check('非法下拉值回退 lastPart',
   C.partForLaunch('https://x/BV1', { lastText: 'https://x/BV1', lastPart: 5 }, 'abc'), 5);
 check('负数下拉值回退 lastPart',
@@ -197,18 +203,23 @@ check('占位时下拉禁用', els.part.disabled, true);
 check('占位时 sel.value', els.part.value, '7');
 
 C.renderLastWatched(base);
-check('有记录时信息条显示', els.resumeBar.hidden, false);
-check('信息条含片名', els.resumeInfo.innerHTML.includes('蒙德一条龙'), true);
-check('信息条含 P7/20', els.resumeInfo.innerHTML.includes('P7/20'), true);
-check('信息条含时间', els.resumeInfo.innerHTML.includes('今天 09:05'), true);
+check('有记录时观看卡片显示', els.resumeBar.hidden, false);
+check('观看卡片片名', els.resumeInfo.textContent, '蒙德一条龙');
+check('观看卡片分别显示 P 和时间', [els.resumePart.textContent, els.resumeWhen.textContent], ['P7/20', '今天 09:05']);
 check('title 给完整信息', els.resumeInfo.title, '蒙德一条龙 · P7/20 · 今天 09:05');
+check('封面使用允许的 HTTPS CDN', els.resumeCover.src, 'https://i1.hdslb.com/bfs/archive/cover.jpg');
+check('封面尚未加载时保留占位', els.resumeCover.hidden, true);
+check('拒绝外站和伪造后缀', C.coverSource('https://i0.hdslb.com.example.org/image.jpg'), '');
+check('拒绝带身份信息的链接', C.coverSource('https://user@i0.hdslb.com/image.jpg'), '');
+check('旧 HTTP 封面升级 HTTPS', C.coverSource('http://i0.hdslb.com/image.jpg'), 'https://i0.hdslb.com/image.jpg');
 
 C.renderLastWatched({});
-check('无记录时信息条隐藏', els.resumeBar.hidden, true);
+check('无记录时观看卡片隐藏', els.resumeBar.hidden, true);
 
 C.renderLastWatched({ lastText: '<img src=x>', lastPart: 1, lastWatchedAt: 0 });
-check('恶意标题被转义（无原始标签）', els.resumeInfo.innerHTML.includes('<img'), false);
-check('转义后保留文本', els.resumeInfo.innerHTML.includes('&lt;img'), true);
+check('特殊字符按文本渲染', els.resumeInfo.textContent, '<img src=x>');
+check('不写入 HTML', els.resumeInfo.innerHTML, '');
+check('旧记录没有封面时清掉旧图片', els.resumeCover.src, '');
 
 /* ------------------------------------------- 5. 启动恢复开关与老配置迁移 */
 console.log('\n--- 启动恢复：shouldResumeOnLaunch / 迁移 ---');
@@ -225,9 +236,10 @@ check('--open 显式指定时不抢',
 
 const defaultsMatch = /const DEFAULT_SETTINGS = (\{[\s\S]*?\n\});/.exec(mainSrc);
 if (!defaultsMatch) throw new Error('找不到 DEFAULT_SETTINGS');
-const DEFAULTS = new Function('DEFAULT_HOTKEYS', 'DEFAULT_GAMEPAD', 'return ' + defaultsMatch[1])(
+const DEFAULTS = new Function('DEFAULT_HOTKEYS', 'DEFAULT_GAMEPAD', 'DEFAULT_BEARING_LAYOUTS', 'return ' + defaultsMatch[1])(
   {},
-  require('../src/gamepad-config').DEFAULT_GAMEPAD
+  require('../src/gamepad-config').DEFAULT_GAMEPAD,
+  require('../src/bearing-layouts').DEFAULT_BEARING_LAYOUTS
 );
 check('resumeOnLaunch 出厂默认开启', DEFAULTS.resumeOnLaunch, true);
 check('lastWatchedAt 出厂默认 0', DEFAULTS.lastWatchedAt, 0);
@@ -258,7 +270,7 @@ check('浮窗 init 恢复时 autoplay=true',
 
 check('index.html 有上次看到四元素',
   ['resumeBar', 'resumeInfo', 'btnResume', 'setResumeOnLaunch'].every((id) => htmlSrc.includes('id="' + id + '"')), true);
-check('CSS 有 .resume[hidden] 兜底', cssSrc.includes('.resume[hidden]'), true);
+check('无浮窗时隐藏分 P 和关闭按钮', homeCss.includes('.playing-controls[hidden]'), true);
 check('console.js 绑定了 setResumeOnLaunch',
   consoleSrc.includes("$('setResumeOnLaunch').addEventListener('change'"), true);
 check('console.js 监听 settings:changed 刷新信息条',

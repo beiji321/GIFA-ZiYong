@@ -7,6 +7,12 @@
 
 const $ = (id) => document.getElementById(id);
 const HOLD_RATES = [1.25, 1.5, 2, 2.5, 3];
+const GAMEPAD_NAMES = new Map([
+  ['xinput', 'Xbox / XInput'],
+  ['dualshock4', 'PS4 DualShock 4'],
+  ['dualsense', 'PS5 DualSense'],
+  ['dualsense-edge', 'PS5 DualSense Edge']
+]);
 
 const state = {
   boot: null,
@@ -39,7 +45,16 @@ const LAYOUT_FAIL = {
 document.addEventListener('DOMContentLoaded', init);
 
 async function init() {
+  let initialGamepadModels;
+  window.api.onGamepadDevices((models) => {
+    if (!state.boot) initialGamepadModels = models;
+    else {
+      state.boot.gamepadModels = models;
+      renderGamepadDevices(state.boot.settings);
+    }
+  });
   state.boot = await window.api.boot();
+  if (initialGamepadModels) state.boot.gamepadModels = initialGamepadModels;
   const s = state.boot.settings;
 
   // 魔改扩展：字幕来源状态每秒刷新
@@ -60,13 +75,11 @@ async function init() {
   fillSettings(s);
   renderHotkeys();
   renderGamepad();
-  paintGamepadDisc();
+  const hotkeysTab = $('tab-hotkeys');
+  if (hotkeysTab.checked) paintGamepadDisc();
+  else hotkeysTab.addEventListener('change', paintGamepadDisc, { once: true });
   applyNav(state.boot.nav);
 
-  // 上次看过的视频先填进输入框，省得每次重新粘。
-  // 分 P 下拉也必须预置到上次那一集：空 <select> 的 value 是 ''，
-  // 点「启动跟跑」时 Number('')||1 会把 lastPart 覆写成 P1，进度就丢了。
-  if (s.lastText) $('url').value = s.lastText;
   renderLastPart(s);
   renderLastWatched(s);
   updateVideoMeta();
@@ -101,29 +114,38 @@ async function init() {
     fillSettings(next);
     // 浮窗换片 / 自动连播下一 P 时，「上次看到」要立刻跟上
     renderLastWatched(next);
-    // 同一个视频里切了 P，启动器的下拉与当前 P 标注也跟着走
-    if (
-      state.video &&
-      next.lastPart &&
-      next.lastPart !== state.video.p &&
-      (!next.lastVideoId || !state.video.id ||
-        String(next.lastVideoId).toLowerCase() === String(state.video.id).toLowerCase())
-    ) {
+    if (state.video && next.lastVideoId && state.video.id &&
+      String(next.lastVideoId).toLowerCase() !== String(state.video.id).toLowerCase()) {
+      state.video = null;
+    }
+    if (!state.video) renderLastPart(next);
+    else if (next.lastPart && next.lastPart !== state.video.p) {
       state.video.p = next.lastPart;
       renderParts();
-      updateVideoMeta();
     }
+    updateVideoMeta();
   });
 }
 
 /* ------------------------------------------------------------ 视频与浮窗 */
 
 function wireVideo() {
-  $('btnLaunch').addEventListener('click', launch);
-  $('btnResume').addEventListener('click', resumeLast);
-  $('url').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') launch();
+  for (const button of document.querySelectorAll('[data-open-pane]')) {
+    button.addEventListener('click', () => {
+      const tab = $(button.dataset.openPane);
+      tab.click();
+      tab.focus({ preventScroll: true });
+    });
+  }
+  $('launchForm').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = $('url').value.trim();
+    launch(text, partForLaunch(text, state.boot.settings, $('part').value));
   });
+  $('btnResume').addEventListener('click', resumeLast);
+  const cover = $('resumeCover');
+  cover.addEventListener('load', () => { cover.hidden = false; });
+  cover.addEventListener('error', () => { cover.hidden = true; });
 
   $('part').addEventListener('change', async () => {
     const p = Number($('part').value) || 1;
@@ -140,89 +162,83 @@ function wireVideo() {
   $('btnStop').addEventListener('click', () => window.api.action('stop-float'));
 }
 
-/**
- * 点「启动跟跑」时用第几 P。
- * 输入框里贴了和上次不同的链接 = 换片 → P1；否则沿用下拉里选中的（上次那一集）。
- * 抽成纯函数便于离线回归。
- */
-function partForLaunch(text, s, selValue) {
-  const t = String(text || '').trim();
-  const last = String((s && s.lastText) || '').trim();
-  if (t && last && t !== last) return 1;
-  const n = Number(selValue);
-  if (Number.isFinite(n) && n > 0) return Math.floor(n);
-  return Math.max(1, Math.floor(Number(s && s.lastPart) || 1));
+function partForLaunch(text, settings, selValue) {
+  const link = String(text || '').trim();
+  if (!link || link !== String(settings?.lastText || '').trim()) return undefined;
+  const selected = Number(selValue);
+  if (Number.isFinite(selected) && selected > 0) return Math.floor(selected);
+  return Math.max(1, Math.floor(Number(settings?.lastPart) || 1));
 }
 
-/** 「继续观看」：把记录填回去，再走正常的启动流程 */
-async function resumeLast() {
-  const s = state.boot.settings;
-  if (!s.lastText) {
+function resumeLast() {
+  const { lastText, lastPart } = state.boot.settings;
+  if (!lastText) {
     toast('还没有观看记录', true);
     return;
   }
-  $('url').value = s.lastText;
-  const p = Math.max(1, Number(s.lastPart) || 1);
-  if (!state.video) renderLastPart(s);
-  $('part').value = String(p);
-  await launch();
+  return launch(lastText, Math.max(1, Number(lastPart) || 1));
 }
 
-async function launch() {
-  const text = $('url').value.trim();
-  if (!text && !state.boot.settings.lastText) {
+function renderLaunchLabel() {
+  const label = $('launchLabel');
+  if ($('btnLaunch').disabled) label.textContent = '载入中…';
+  else label.textContent = state.floatRunning ? '播放此链接' : '打开浮窗';
+}
+
+async function launch(text, part) {
+  const launchButton = $('btnLaunch');
+  if (launchButton.disabled) return;
+  if (!text) {
     toast('先粘一个 B 站链接', true);
     $('url').focus();
     return;
   }
 
-  $('btnLaunch').disabled = true;
-  $('btnLaunch').textContent = '载入中…';
+  launchButton.disabled = true;
+  $('btnResume').disabled = true;
+  renderLaunchLabel();
 
   try {
-    if (text) {
-      const p = partForLaunch(text, state.boot.settings, $('part').value);
-      const res = await window.api.load({ text, p });
-      if (!res.ok) {
-        toast(res.message || '载入失败', true);
-        return;
-      }
-      state.video = {
-        text,
-        id: res.id,
-        title: res.title || '',
-        pages: res.pages || [],
-        p: res.p
-      };
-      // 本地先同步一次：bili:load 的广播是异步的，紧接着再点「启动跟跑」
-      // 不能因为快照还没刷新就被误判成「换片」而退回 P1。
-      Object.assign(state.boot.settings, {
-        lastText: text,
-        lastPart: res.p,
-        lastTitle: res.title || '',
-        lastVideoId: res.id,
-        lastPageCount: (res.pages || []).length,
-        lastWatchedAt: Date.now()
-      });
-      renderParts();
-      renderLastWatched(state.boot.settings);
-      updateVideoMeta();
-
+    /* 我方修复：本地原文点击时要保留用户当前选中的分 P。
+     * 上游这里直接传 `part`，而 `part` 在「同一视频再次载入」时可能还是旧值，
+     * 导致点了 P3 却回到 P1。partForLaunch 专门处理这个场景。 */
+    const p = partForLaunch(text, state.boot.settings, $('part').value);
+    const result = await window.api.load({ text, p });
+    if (!result.ok) {
+      toast(result.message || '载入失败', true);
+      return;
     }
+    state.video = { text, id: result.id, title: result.title || '', pages: result.pages || [], p: result.p };
+    const previous = state.boot.settings;
+    const sameVideo = previous.lastVideoId === result.id;
+    Object.assign(previous, {
+      lastText: text,
+      lastPart: result.p,
+      lastTitle: result.title || (sameVideo ? previous.lastTitle : ''),
+      lastCover: result.cover || '',
+      lastVideoId: result.id,
+      lastPageCount: state.video.pages.length || (sameVideo ? previous.lastPageCount : 0),
+      lastWatchedAt: Date.now()
+    });
+    renderParts();
+    renderLastWatched(previous);
+    updateVideoMeta();
 
+    const wasRunning = state.floatRunning;
     await window.api.action('start-float');
-    // 浮窗已经在跑的时候不能只切窗口，得让它换片
-    if (state.floatRunning && text) {
-      await window.api.action('float-load', { text, p: (state.video && state.video.p) || 1 });
-    }
-    toast('浮窗已启动，按 Alt+H 可以随时隐藏');
+    if (wasRunning) await window.api.action('float-load', { text, p: result.p });
+    const hideKey = state.boot.settings.hotkeys?.toggleVisible;
+    const message = wasRunning ? '视频已载入' : '浮窗已打开';
+    toast(hideKey ? `${message}，${prettify(hideKey)} 可隐藏` : message);
+  } catch {
+    toast('没能启动播放，请重试', true);
   } finally {
-    $('btnLaunch').disabled = false;
-    $('btnLaunch').textContent = '启动跟跑';
+    launchButton.disabled = false;
+    $('btnResume').disabled = false;
+    renderLaunchLabel();
   }
 }
 
-/** 还没载入视频时，先给分 P 下拉一个「上次的 P」占位，避免 launch() 取到空值 */
 function renderLastPart(s) {
   if (state.video) return;
   const sel = $('part');
@@ -302,31 +318,46 @@ function lastWatchedLabel(s) {
   return { name, part: `P${p}${total ? '/' + total : ''}`, when: fmtWatchedAt(s && s.lastWatchedAt) };
 }
 
-function renderLastWatched(s) {
-  const bar = $('resumeBar');
-  const info = lastWatchedLabel(s);
-  if (!info) {
-    bar.hidden = true;
-    return;
+function coverSource(value) {
+  if (typeof value !== 'string' || !value) return '';
+  try {
+    const url = new URL(value.startsWith('//') ? 'https:' + value : value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.port ||
+      !/\.(hdslb|biliimg)\.com$/i.test(url.hostname)) return '';
+    url.protocol = 'https:';
+    return url.href;
+  } catch {
+    return '';
   }
-  bar.hidden = false;
-  const tail = `${info.part}${info.when ? ' · ' + info.when : ''}`;
-  const el = $('resumeInfo');
-  el.innerHTML = `<b>${escapeHtml(info.name)}</b> <span class="dim">· ${escapeHtml(tail)}</span>`;
-  el.title = `${info.name} · ${info.part}${info.when ? ' · ' + info.when : ''}`;
+}
+
+function renderLastWatched(settings) {
+  const bar = $('resumeBar');
+  const info = lastWatchedLabel(settings);
+  bar.hidden = !info || !settings.lastText;
+  if (bar.hidden) return;
+  $('resumeInfo').textContent = info.name;
+  $('resumeInfo').title = [info.name, info.part, info.when].filter(Boolean).join(' · ');
+  $('resumePart').textContent = info.part;
+  $('resumeWhen').textContent = info.when;
+
+  const cover = $('resumeCover');
+  const src = coverSource(settings.lastCover);
+  if ((cover.getAttribute('src') || '') !== src) {
+    cover.hidden = true;
+    if (src) cover.src = src;
+    else cover.removeAttribute('src');
+  }
 }
 
 function updateVideoMeta() {
-  const v = state.video;
-  if (!v) {
-    $('videoMeta').textContent = state.boot.settings.resumeOnLaunch
-      ? '已开启「下次启动自动继续」，启动时直接接着看'
-      : '还没载入视频；点「启动跟跑」开始';
-    return;
-  }
-  const title = v.title || v.id;
-  $('videoMeta').innerHTML =
-    `<b>${escapeHtml(title)}</b> · 当前 P${v.p}${v.pages.length ? '/' + v.pages.length : ''}`;
+  const video = state.video;
+  const fallback = lastWatchedLabel(state.boot.settings);
+  const label = video ? video.title || video.id : fallback?.name || '等待载入视频';
+  const field = $('videoMeta');
+  field.hidden = !$('resumeBar').hidden && label === fallback?.name;
+  field.textContent = label;
+  field.title = label;
 }
 
 function setFloatState(next) {
@@ -342,7 +373,9 @@ function setFloatState(next) {
       ? state.hoverFaded ? '沉浸中 · 已变淡' : '沉浸模式'
       : '浮窗运行中';
   badge.className = 'badge ' + (state.floatRunning ? 'on' : 'off');
+  $('playingControls').hidden = !state.floatRunning;
   $('btnStop').disabled = !state.floatRunning;
+  renderLaunchLabel();
   $('setImmersion').checked = state.immersion;
 }
 
@@ -364,7 +397,9 @@ function renderLayouts(bearing) {
   });
   select.replaceChildren(...options);
   select.value = current?.id || '';
-  $('btnLayoutDefault').disabled = !current || current.id === bearing.defaultLayoutId;
+  const defaultButton = $('btnLayoutDefault');
+  defaultButton.disabled = !current || current.id === bearing.defaultLayoutId;
+  defaultButton.textContent = current?.id === bearing.defaultLayoutId ? '启动默认布局' : '设为启动默认';
   const canEdit = current && !current.builtIn;
   for (const id of ['btnPickRoi', 'btnRenameLayout', 'btnDeleteLayout']) $(id).disabled = !canEdit;
   $('layoutStatus').textContent = current?.centered
@@ -388,19 +423,32 @@ function renderPlaybackHints() {
   const immersionKey = prettify(hotkeys.toggleImmersion ?? 'Alt+I');
   const holdKey = prettify(hotkeys.holdSpeed ?? 'F8');
   const cycleKey = prettify(hotkeys.cycleSpeed ?? 'Alt+S');
+  $('homePlayKey').textContent = prettify(hotkeys.togglePlay ?? 'Alt+Space');
+  $('homeHideKey').textContent = prettify(hotkeys.toggleVisible ?? 'Alt+H');
   $('immersionHint').textContent =
     `按 ${immersionKey} 进入或退出。窗口贴合视频比例并穿透鼠标，退出后恢复原位置和大小。`;
   $('holdRateHint').textContent =
-    `按住 ${holdKey} 临时加速，松开恢复常规倍速；临时值不会替换保存的常规倍速。`;
+    `按住 ${holdKey} 使用这个倍速，松开恢复。`;
   $('cycleSpeedHint').textContent =
-    `按 ${cycleKey} 循环切换常规倍速：1 → 1.25 → 1.5 → 2 倍；可在「快捷键」中修改。`;
+    `${cycleKey} 在 1、1.25、1.5 和 2 倍之间切换。常规倍速会自动保存。`;
+}
+
+function renderGamepadDevices(settings) {
+  const enabled = settings.gamepad?.enabled !== false;
+  const models = state.boot.gamepadModels || [];
+  const names = Array.from(new Set(models.map((model) => GAMEPAD_NAMES.get(model)).filter(Boolean)));
+  const text = !enabled ? '后台手柄检测已关闭' : names.length
+    ? `已识别 ${names.join('、')}`
+    : '等待手柄输入。连接后动一下摇杆即可检查识别状态。';
+  const status = $('gamepadStatus');
+  if (status.textContent !== text) status.textContent = text;
 }
 
 function fillSettings(settings) {
   $('setPin').checked = !!settings.pinned;
   $('setPass').checked = !!settings.clickThrough;
 
-  // 沉浸模式防遮挡
+  // 沉浸模式防遮挡（我方自用开关）
   $('setStoryHide').checked = !!(settings.storyAutoHide && settings.storyAutoHide.enabled);
   // 老 settings.json 可能没有 showBox 字段，默认显示（排查期需要它）
   $('setStoryBox').checked = !(settings.storyAutoHide && settings.storyAutoHide.showBox === false);
@@ -408,6 +456,9 @@ function fillSettings(settings) {
   setRange('setAvoidHold', 'avoidHoldVal', settings.avoidHideHold, 4, 's');
   $('setCombatFade').checked = settings.combatFadeEnabled !== false;
   setRange('setCombatOpacity', 'combatOpacityVal', settings.combatOpacity, 75, '%');
+  // 上游：手柄开关
+  $('setGamepadEnabled').checked = settings.gamepad?.enabled !== false;
+  renderGamepadDevices(settings);
   $('setImmersion').checked = state.immersion;
   $('setHoverFade').checked = settings.hoverFadeEnabled !== false;
   const holdRate = Number(settings.holdPlaybackRate);
@@ -1088,6 +1139,15 @@ function wireBearing() {
 /* --------------------------------------------------------------- 热键 */
 
 function wireHotkeys() {
+  $('setGamepadEnabled').addEventListener('change', async (event) => {
+    const input = event.currentTarget;
+    try {
+      await window.api.save({ gamepadEnabled: input.checked });
+    } catch {
+      input.checked = state.boot.settings.gamepad?.enabled !== false;
+      toast('手柄开关未保存，请重试', true);
+    }
+  });
   $('btnResetHk').addEventListener('click', async () => {
     const res = await window.api.resetHotkeys();
     state.boot.settings.hotkeys = res.hotkeys;
@@ -1117,6 +1177,7 @@ function renderHotkeys() {
 
     const kbd = document.createElement('button');
     kbd.className = 'kbd';
+    kbd.setAttribute('aria-label', `${meta.label}，${prettify(hotkeys[meta.key])}，点击改键`);
     paintKeys(kbd, hotkeys[meta.key]);
     kbd.addEventListener('click', () => captureHotkey(kbd, meta.key));
 
@@ -1154,6 +1215,7 @@ function renderGamepad() {
     const select = document.createElement('select');
     select.className = 'sel';
     select.title = `${dir.label}方向绑定的动作`;
+    select.setAttribute('aria-label', select.title);
     for (const option of options) {
       const item = document.createElement('option');
       item.value = option.value;
@@ -1191,7 +1253,7 @@ function paintGamepadDisc() {
   window.GdiscDraw.drawDisc(ctx, {
     width: GP_DISC_SIZE,
     height: GP_DISC_SIZE,
-    hint: '按住 L3 弹出'
+    hint: '按住左摇杆'
   });
 }
 
@@ -1272,7 +1334,7 @@ function renderElevateState() {
   const text = $('elevBannerText');
   if (text) {
     text.textContent =
-      '未以管理员身份运行：原神等以管理员权限启动的程序在前台时，全局快捷键（含单键与组合键）收不到，这是 Windows 的 UIPI 限制。点右侧按钮重启即可，当前配置不会丢。';
+      '当前未以管理员身份运行，在游戏内使用全局快捷键可能不生效。';
   }
 
   const btn = $('btnElevate');
@@ -1454,18 +1516,17 @@ function prettify(acc) {
 /* ---------------------------------------------------------------- 账号 */
 
 function applyNav(nav) {
-  const el = $('accountLine');
-  // 前面的小圆点：登录后变绿（样式在 console.css 的 .account.on）
-  el.classList.toggle('on', !!(nav && nav.loggedIn));
-  if (!nav) {
-    el.textContent = '登录状态未知';
-    return;
-  }
-  if (nav.loggedIn) {
-    el.innerHTML = `已登录 <b>${escapeHtml(nav.uname || '')}</b>${nav.vip ? '（大会员）' : ''}`;
+  const button = $('btnLogin');
+  const label = $('accountLine');
+  button.classList.toggle('on', !!nav?.loggedIn);
+  if (nav?.loggedIn) {
+    label.textContent = nav.uname || 'B 站已登录';
+    button.title = `已登录 ${nav.uname || 'B 站'}${nav.vip ? '（大会员）' : ''} · 点击登录或切换账号`;
   } else {
-    el.textContent = '未登录 · 只能看预览和标清';
+    label.textContent = '登录 B 站';
+    button.title = nav?.ok === false ? '暂未能确认登录状态，点击打开登录窗口' : '登录 B 站以观看完整视频和高清画质';
   }
+  button.setAttribute('aria-label', nav?.loggedIn ? `切换 B 站账号，当前为${nav.uname || '已登录账号'}` : '登录 B 站');
 }
 
 /* ---------------------------------------------------------------- 杂项 */

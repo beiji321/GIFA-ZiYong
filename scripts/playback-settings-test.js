@@ -437,18 +437,28 @@ try {
     assertPreferences(harness, { volume: 19, muted: true, playbackRate: 1.25 });
   });
 
-  check('附加 guest 立即原生静音，只有跨文档主框架导航重新关声音', () => {
+  check('附加 guest 立即原生静音，取消导航和迟到的提交事件都不影响已经播放的声音', () => {
     const harness = createHarness();
+    harness.registerIpc();
     const { guest } = attachGuest(harness);
     assert.equal(harness.getGuest(), guest);
     assert.deepEqual(guest.audioChanges, [true]);
+    harness.send('player:settings', guest);
+    harness.send('player:ready', guest);
     guest.audioChanges.length = 0;
-    guest.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false });
-    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: true });
-    assert.deepEqual(guest.audioChanges, []);
-    guest.setAudioMuted(false);
+
     guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
+    guest.emit('did-fail-provisional-load', {}, -3, 'ERR_ABORTED', 'https://example.test/', true);
+    assert.deepEqual(guest.audioChanges, []);
+    assert.equal(guest.audioMuted, false);
+
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
+    harness.send('player:settings', guest);
     assert.equal(guest.audioMuted, true);
+    harness.send('player:ready', guest);
+    guest.emit('did-navigate', {}, 'https://example.test/video?p=3', 200, 'OK');
+    assert.deepEqual(guest.audioChanges, [true, false]);
+    assert.equal(guest.audioMuted, false);
   });
 
   check('guest 授权要求当前活窗口、当前 guest 与宿主同时匹配', () => {
@@ -644,8 +654,8 @@ try {
     harness.send('player:changed', guest, { playbackRate: 2.25 });
     assertPreferences(harness, { volume: 47, muted: true, playbackRate: 2.25 });
     harness.send('player:ready', guest);
-    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
-    assert.equal(guest.audioMuted, true);
+    guest.emit('did-navigate', {}, 'https://example.test/video?p=2', 200, 'OK');
+    assert.equal(guest.audioMuted, false);
     const event = harness.send('player:settings', guest);
     assertBootstrap(event, { volume: 47, muted: true, playbackRate: 2.25 });
     assert.equal(guest.audioMuted, true);

@@ -71,6 +71,8 @@ const env = {
   document: { createElement: () => ({}) },
   window: { api: { save: (p) => { saved.push(p); return Promise.resolve(); } } },
   toast: (msg) => toasts.push(msg),
+  closeCalib() {},
+  resetLayoutHint() {},
   Date: FakeDate
 };
 
@@ -83,8 +85,9 @@ const A = new Function(...Object.keys(env), appCode + '\nreturn { partFromUrl, i
 /* guest 侧单独一套：同名函数不能与 app 混在一个作用域 */
 const guestCode = ['partFromUrl', 'idFromUrl', 'snapshot'].map((n) => grab(guestSrc, n)).join('\n\n');
 let location = { href: '', pathname: '' };
-const G = new Function('video', 'location', guestCode + '\nreturn { partFromUrl, idFromUrl, snapshot };')(
-  null, { get href() { return location.href; }, get pathname() { return location.pathname; } }
+const guestDocument = { title: '' };
+const G = new Function('video', 'location', 'document', guestCode + '\nreturn { partFromUrl, idFromUrl, snapshot };')(
+  null, { get href() { return location.href; }, get pathname() { return location.pathname; } }, guestDocument
 );
 
 function reset(over = {}) {
@@ -129,6 +132,10 @@ let s = G.snapshot();
 check('无 video 时 found=false', s.found, false);
 check('无 video 仍带 p', s.p, 6);
 check('无 video 仍带 vid', s.vid, 'bv1xx411c7md');
+check('普通页面不是验证页', s.verification, false);
+guestDocument.title = '验证码_哔哩哔哩';
+check('B 站验证页即使 HTTP 200 也不能算播放器就绪', G.snapshot().verification, true);
+guestDocument.title = '';
 
 /* ------------------------------------------------------ 4. 同步逻辑 */
 console.log('\n--- 4. 自动连播同步 ---');

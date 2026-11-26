@@ -7,7 +7,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const asar = require('@electron/asar');
 const { LICENSE_DIR, PROJECT_LICENSE_FILES, EXTRA_LICENSE_FILES, LICENSE_FILES, verifyLicenseBundle } = require('./license-files');
-const afterPack = require('./after-pack');
+const afterPackHook = require('./after-pack');
+const gamepadHelperPath = require('../src/gamepad-helper-path');
+// 非 Windows 也能验证归档与许可；Windows 额外运行含编译步骤的完整钩子。
+const afterPack = process.platform === 'win32' ? afterPackHook : async ({ appOutDir }) => afterPackHook.organizeWindowsResources(appOutDir);
 
 const ROOT = path.resolve(__dirname, '..');
 const read = (file) => fs.readFileSync(path.join(ROOT, file));
@@ -83,6 +86,10 @@ async function main() {
       assert.ok(!fs.existsSync(path.join(bundle, 'resources', 'default_app.asar')));
       assert.ok(!fs.existsSync(path.join(bundle, 'version')));
       assert.ok(fs.existsSync(archive));
+      if (process.platform === 'win32') {
+        const helper = gamepadHelperPath(path.join(bundle, 'resources'));
+        assert.equal(fs.readFileSync(helper).toString('ascii', 0, 2), 'MZ');
+      }
       assert.equal(fs.readFileSync(path.join(bundle, 'data', 'settings.json'), 'utf8'), '{"keep":true}');
     });
     await afterPack({ appOutDir: bundle, electronPlatformName: 'win32' });

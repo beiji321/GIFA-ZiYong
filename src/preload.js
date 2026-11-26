@@ -14,6 +14,17 @@ contextBridge.exposeInMainWorld('api', {
   // 自动连播换 P：只换 cid/弹幕/字幕，不重新载入播放器
   part: (payload) => ipcRenderer.invoke('bili:part', payload),
   nav: () => ipcRenderer.invoke('bili:nav'),
+  updateStatus: () => ipcRenderer.invoke('update:status'),
+  updateCheck: () => ipcRenderer.invoke('update:check'),
+  updateDownload: () => ipcRenderer.invoke('update:download'),
+  updateCancel: () => ipcRenderer.invoke('update:cancel'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
+  updateOpenReleases: () => ipcRenderer.invoke('update:open-releases'),
+  onUpdateState: (callback) => {
+    const listener = (_event, snapshot) => callback(snapshot);
+    ipcRenderer.on('update:state', listener);
+    return () => { ipcRenderer.removeListener('update:state', listener); };
+  },
   // 游戏内热键需要管理员身份（UIPI），由用户在启动器里按需触发 UAC 提权重启
   relaunchElevated: () => ipcRenderer.invoke('app:relaunch-elevated'),
   updateHotkeys: (hotkeys) => ipcRenderer.invoke('hotkeys:update', hotkeys),
@@ -21,6 +32,7 @@ contextBridge.exposeInMainWorld('api', {
   // 手柄八方向圆盘的动作绑定；map 是「方位名 → 动作名」，缺的方位沿用当前设置
   updateGamepad: (map) => ipcRenderer.invoke('gamepad:update', map),
   resetGamepad: () => ipcRenderer.invoke('gamepad:reset'),
+  onGamepadDevices: (cb) => ipcRenderer.on('gamepad:devices', (_e, models) => cb(models)),
 
   // 方位标记：角度是高频数据，用单向 send 避免 invoke 的往返开销
   bearing: (payload) => ipcRenderer.send('overlay:bearing', payload),

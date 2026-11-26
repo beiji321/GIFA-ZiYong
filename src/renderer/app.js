@@ -5,23 +5,25 @@
 
 const $ = (id) => document.getElementById(id);
 
+const emptyVideo = { found: false, playing: false, current: 0, duration: 0, rate: 1, muted: false, volume: 1 };
 const state = {
   boot: null,
   id: '',
   p: 1,
   pages: [],
-  autoPlay: true,
-  attached: false,
   guestReady: false,
-  pendingUrl: '',
   queue: [],
-  video: { found: false, playing: false, current: 0, duration: 0, rate: 1, muted: false, volume: 1 },
+  video: { ...emptyVideo },
   seeking: false,
   drawer: false,
   uiTimer: null,
   toastTimer: null,
   immersiveTimer: null,
-  loadIssuedAt: 0
+  loadIssuedAt: 0,
+  load: null,
+  pendingLoad: null,
+  loadTimer: null,
+  compatible: false
 };
 
 let wv = null;
@@ -105,17 +107,17 @@ async function init() {
   $('btnRatio').classList.toggle('locked', s.ratioLocked === true);
   document.body.classList.toggle('ratio-locked', s.ratioLocked === true);
 
-  createWebview();
+  /* 上游 v0.2.8 把 webview 创建改到 startPlayback 里按需做（配合「浮窗一直载入中」
+   * 的修复），这里不再预先创建。wireChromeHeight 仍然要在启动时挂上，
+   * 比例锁定要用它上报的 chrome 高度。 */
   wireChromeHeight();
   renderLayoutSelect();
   wireUi();
   wireHotkeys();
 
-  pumpUi();
-
   document.body.classList.add('ui');
 
-  if (!state.boot.nav || !state.boot.nav.loggedIn) {
+  if (state.boot.nav?.ok && !state.boot.nav.loggedIn) {
     setTimeout(() => toast('未登录：部分视频只能看预览。点 ⚙ 打开启动器，在那边登录即可', 5200), 1200);
   }
 
@@ -125,7 +127,7 @@ async function init() {
   }
 
   if (state.boot.initialUrl) {
-    loadVideo(state.boot.initialUrl, 1, true);
+    loadVideo(state.boot.initialUrl, undefined, true);
   } else if (s.lastText) {
     // 「上次看到」：带标题和 Pn/总数提示，避免忘了自己在看哪个视频、第几 P。
     // autoplay=true 是用户明确要的「下次启动接着播」，不再是只把页面打开。
@@ -141,14 +143,6 @@ async function init() {
 
 /* --------------------------------------------------------------- webview */
 
-/**
- * 把 chrome 高度（标题栏 + 控制条）实时报给主进程。
- *
- * 比例锁定要用它算视频区高度，而它只有布局稳定后才是真的：
- * 主进程自己在 ready-to-show 那一刻去量，量到的是布局完成前的值
- * （日志里稳定量到 105，真实只有 66），高度就算错了，而且再没人纠正。
- * 改由渲染层在布局真的变了的时候报告，主进程照着用。
- */
 function wireChromeHeight() {
   const stage = $('stage');
   if (!stage || typeof ResizeObserver !== 'function') return;
@@ -193,139 +187,139 @@ function wireChromeHeight() {
   }, 400);
 }
 
-function createWebview() {
-  wv = document.createElement('webview');
-  wv.id = 'view';
-  wv.setAttribute('partition', 'persist:bili');
-  wv.setAttribute('preload', state.boot.webviewPreload);
-  wv.setAttribute('src', 'about:blank');
-  wv.style.width = '100%';
-  wv.style.height = '100%';
+function discardWebview() {
+  const previous = wv;
+  wv = null;
+  previous?.remove();
+  state.guestReady = false;
+  state.queue = [];
+  state.video = { ...emptyVideo };
+  state.seeking = false;
+  $('progress').classList.remove('dragging');
+  paintVideoControls();
+  const finishRect = rectWaiter;
+  rectWaiter = null;
+  finishRect?.(null);
+}
 
-  wv.addEventListener('dom-ready', () => {
-    state.attached = true;
+function createWebview(load) {
+  const view = document.createElement('webview');
+  const active = () => wv === view && state.load === load;
+  wv = view;
+  view.id = 'view';
+  view.setAttribute('partition', 'persist:bili');
+  if (state.compatible) view.setAttribute('webpreferences', 'sandbox=no');
+  view.setAttribute('src', load.url);
+
+  view.addEventListener('dom-ready', () => {
+    if (!active()) return;
+    load.documentReady = true;
     state.guestReady = true;
-    flush();
-    if (state.pendingUrl) {
-      const u = state.pendingUrl;
-      state.pendingUrl = '';
-      loadUrl(u);
-    }
-  });
-
-  wv.addEventListener('ipc-message', (e) => {
-    if (e.channel === 'state') {
-      applyState(e.args && e.args[0]);
-      return;
-    }
-    if (e.channel === 'want-window-fullscreen') {
-      // 访客侧把 requestFullscreen 改写成了「让窗口全屏」，这里转给主进程
-      window.api.action('fullscreen', !!(e.args && e.args[0]));
-      return;
-    }
-    /* ---- 魔改扩展：字幕精灵相关通道 ---- */
-    if (e.channel === 'guest-log') {
-      /* 访客页的调试日志。
-       * 以前只 console.log 到浮窗控制台（要开 F12 才看得到），
-       * 排查「识别 0 帧」时等于没有证据。现在同时写进 startup.log。 */
-      const text = String((e.args && e.args[0]) || '');
-      console.log('[guest]', text);
-      if (/^\[bearing\]/.test(text)) {
-        try {
-          window.api.diag('guestBearing', { line: text.slice(0, 200) });
-        } catch {
-          /* 日志失败不影响功能 */
-        }
-      }
-      return;
-    }
-    if (e.channel === 'subtitle-time') {
-      // 官方字幕模式下访客页每 200ms 报一次播放进度（比心跳更细）
-      window.api.subtitleTime(e.args && e.args[0]);
-      return;
-    }
-    if (e.channel === 'subtitle') {
-      const p = e.args && e.args[0];
-      window.api.subtitle(p || {});
-      // 同一条字幕顺带判一次转向和绝对方位：
-      //   detectTurn   → 相对指令（左转/右转），画面边缘弹大箭头
-      //   detectCompassDir → 绝对方位（往东/东北），雷达模式点亮对应扇形
-      if (p && !p.off && p.text) {
-        detectTurn(p.text);
-        detectCompassDir(p.text);
-        // 智能防遮挡：这句在讲地图 / 锚点 / 传送，说明要看画面，别淡掉
-        if (/地图|锚点|传送/.test(p.text)) window.api.avoidHide();
-      }
-      return;
-    }
-    if (e.channel === 'bearing') {
-      onGuestBearing(e.args && e.args[0]);
-      return;
-    }
-    if (e.channel === 'bearing-autocenter') {
-      onGuestAutoCenter(e.args && e.args[0]);
-      return;
-    }
-    if (e.channel === 'bearing-dump') {
-      onGuestDump(e.args && e.args[0]);
-      return;
-    }
-    if (e.channel === 'video-rect') {
-      const fn = rectWaiter;
-      rectWaiter = null;
-      if (fn) fn(e.args && e.args[0]);
-    }
-  });
-
-  wv.addEventListener('did-stop-loading', () => {
-    state.guestReady = true;
+    sendPlayer({ cmd: 'ping' });
     sendPlayer({ cmd: 'clean', on: true });
     syncBearingToGuest();
-    syncSubtitleToGuest();
-    syncDanmakuHideToGuest();
-    // 魔改扩展：比例锁定状态可能从控制台改的，按钮要跟上
-    if (next.ratioLocked !== undefined) {
-      $('btnRatio').classList.toggle('locked', !!next.ratioLocked);
-      document.body.classList.toggle('ratio-locked', !!next.ratioLocked);
-    }
-    maybeAutoDump();
-    if (state.autoPlay) {
-      sendPlayer({ cmd: 'play' });
-      setTimeout(() => sendPlayer({ cmd: 'play' }), 700);
+    if (load.autoplay) sendPlayer({ cmd: 'play' });
+    flush();
+  });
+
+  view.addEventListener('did-finish-load', () => {
+    if (active() && load.autoplay && !state.video.ready && !state.video.playing) sendPlayer({ cmd: 'play' });
+  });
+
+  view.addEventListener('ipc-message', (event) => {
+    if (!active() || !state.guestReady) return;
+    const payload = event.args?.[0];
+    switch (event.channel) {
+      case 'state': applyState(payload); break;
+      case 'want-window-fullscreen': window.api.action('fullscreen', !!payload); break;
+      case 'bearing': onGuestBearing(payload); break;
+      case 'bearing-autocenter': onGuestAutoCenter(payload); break;
+      case 'bearing-dump': onGuestDump(payload); break;
+      case 'video-rect': {
+        const finishRect = rectWaiter;
+        rectWaiter = null;
+        finishRect?.(payload);
+        break;
+      }
+      /* ---- 魔改扩展：访客页调试日志 ---- */
+      case 'guest-log': {
+        const text = String(payload || '');
+        console.log('[guest]', text);
+        if (/^\[bearing\]/.test(text)) {
+          try {
+            window.api.diag('guestBearing', { line: text.slice(0, 200) });
+          } catch {
+            /* 日志失败不影响功能 */
+          }
+        }
+        break;
+      }
+      /* ---- 魔改扩展：字幕精灵 ---- */
+      case 'subtitle-time':
+        window.api.subtitleTime(payload);
+        break;
+      case 'subtitle': {
+        window.api.subtitle(payload || {});
+        if (payload && !payload.off && payload.text) {
+          detectTurn(payload.text);
+          detectCompassDir(payload.text);
+          if (/地图|锚点|传送/.test(payload.text)) window.api.avoidHide();
+        }
+        break;
+      }
+      default: break;
     }
   });
 
-  // 分 P 自动连播：Electron 层的导航事件是访客状态心跳之外的独立通道，
-  // SPA pushState 和整页跳转都能拿到确定的新 URL（不依赖 B 站页面内部实现）。
-  const onNav = (e) => {
-    if (e && e.isMainFrame === false) return;
-    const u = (e && e.url) || '';
-    const p = partFromUrl(u);
-    if (p) syncPartFromGuest({ p, vid: idFromUrl(u) }, false);
+  const onNav = (event) => {
+    if (!active() || !event.isMainFrame) return;
+    const part = partFromUrl(event.url);
+    const id = idFromUrl(event.url);
+    if (part && id) syncPartFromGuest({ p: part, vid: id }, false);
   };
-  wv.addEventListener('did-navigate-in-page', onNav);
-  wv.addEventListener('did-navigate', onNav);
-
-  wv.addEventListener('did-fail-load', (e) => {
-    if (!e.isMainFrame) return;
-    hidePlaceholderIfVideo();
-    toast(`加载失败（${e.errorCode}），检查网络或换「网页版」试试`, 4000);
+  view.addEventListener('did-navigate-in-page', onNav);
+  /* 整页跳转（B 站某些入口是 document 级导航，不触发 in-page）。
+   * 上游 v0.2.8 用 did-frame-navigate 覆盖了这种情况，但它的 event 是
+   * (event, url, httpResponseCode, httpStatusText) 签名；
+   * 这里额外挂 did-navigate 作为显式通道，保证自动连播不漏。 */
+  view.addEventListener('did-navigate', onNav);
+  view.addEventListener('did-frame-navigate', (event) => {
+    if (!active() || !event.isMainFrame) return;
+    // 未提交的导航可能被拦截，原文档此时仍可播放。
+    if (load.committed || load.documentReady) {
+      state.guestReady = false;
+      load.documentReady = false;
+      load.failed = false;
+      state.video = { ...emptyVideo };
+      paintVideoControls();
+      showPlaceholder('正在打开 B 站播放页…');
+      armPlaybackTimeout(load);
+    }
+    load.committed = true;
+    onNav(event);
+    if (event.httpResponseCode >= 400) {
+      showLoadFailure(load, `B 站页面返回 HTTP ${event.httpResponseCode}`);
+    }
+  });
+  view.addEventListener('did-fail-load', (event) => {
+    if (!active() || !event.isMainFrame || event.errorCode === -3) return;
+    showLoadFailure(load, `B 站页面打开失败（${event.errorCode}）`);
+  });
+  view.addEventListener('render-process-gone', (event) => {
+    if (!active() || event.details.reason === 'clean-exit') return;
+    state.guestReady = false;
+    state.video = { ...emptyVideo };
+    paintVideoControls();
+    const { reason, exitCode } = event.details;
+    const hexCode = `0x${(exitCode >>> 0).toString(16).toUpperCase()}`;
+    const offerCompatibility = state.boot.playbackCompatibility && !state.compatible && !load.committed &&
+      (reason === 'crashed' || reason === 'abnormal-exit') && hexCode === '0x80000003';
+    showLoadFailure(load, `播放页进程退出（${hexCode}）`, offerCompatibility);
   });
 
-  $('stage').appendChild(wv);
+  $('stage').appendChild(view);
 }
 
-function loadUrl(url) {
-  if (!state.attached) {
-    state.pendingUrl = url;
-    return;
-  }
-  try {
-    wv.loadURL(url);
-  } catch (err) {
-    toast('载入失败：' + err.message, 4000);
-  }
-}
 
 function sendPlayer(msg) {
   if (!wv) return;
@@ -333,11 +327,7 @@ function sendPlayer(msg) {
     state.queue.push(msg);
     return;
   }
-  try {
-    wv.send('player', msg);
-  } catch {
-    state.queue.push(msg);
-  }
+  wv.send('player', msg).catch(() => {});
 }
 
 function flush() {
@@ -699,26 +689,36 @@ async function loadVideo(text, part, autoplay) {
     return;
   }
 
-  showPlaceholder('载入中…');
-  const res = await window.api.load({ text: t, p: part || 1 });
+  const load = { text: t, part, autoplay };
+  state.pendingLoad = load;
+  if (!wv) showPlaceholder('正在读取视频信息…');
 
-  if (!res.ok) {
-    toast(res.message || '载入失败', 4000);
-    if (!state.video.found) showPlaceholder('粘贴一个 B 站攻略视频链接');
+  let res;
+  try {
+    res = await window.api.load({ text: t, p: part });
+  } catch {
+    res = { ok: false, message: '未能读取视频信息' };
+  }
+  if (state.pendingLoad !== load) return;
+  state.pendingLoad = null;
+  if (!res?.ok) {
+    const message = res?.message || '未能读取视频信息';
+    if (wv) {
+      toast(message, 4000);
+    } else {
+      state.load = load;
+      showLoadFailure(load, message);
+    }
     return;
   }
 
   closeCalib();
   resetLayoutHint();
   window.api.bearing({ clear: true });
+  load.url = res.url;
   state.id = res.id;
   state.p = res.p;
   state.pages = res.pages || [];
-  state.autoPlay = !!autoplay;
-  state.guestReady = false;
-  state.queue = [];
-  state.loadIssuedAt = Date.now();
-
   $('urlInput').value = t;
   $('videoTitle').textContent = res.title || res.id;
   $('videoTitle').title = res.owner ? `${res.title} · UP：${res.owner}` : res.title || '';
@@ -726,9 +726,45 @@ async function loadVideo(text, part, autoplay) {
 
   renderParts();
   toggleUrlbar(false);
-
-  loadUrl(res.url);
+  startPlayback(load);
   if (res.message) toast(res.message, 3500);
+}
+
+function playbackUrl(load) {
+  const url = new URL(load.url);
+  url.searchParams.set('p', String(state.p));
+  return url.href;
+}
+
+function startPlayback(load) {
+  state.load = load;
+  discardWebview();
+  closeCalib();
+  resetLayoutHint();
+  window.api.bearing({ clear: true });
+  state.loadIssuedAt = Date.now();
+  showPlaceholder('正在打开 B 站播放页…');
+  armPlaybackTimeout(load);
+  createWebview(load);
+}
+
+function retryPlayback() {
+  const load = state.load;
+  if (!load?.failed || state.pendingLoad) return;
+  if (!load.url) {
+    loadVideo(load.text, load.part, load.autoplay);
+    return;
+  }
+  if (load.offerCompatibility) state.compatible = true;
+  startPlayback({ text: load.text, url: playbackUrl(load), autoplay: load.autoplay });
+}
+
+function armPlaybackTimeout(load) {
+  clearTimeout(state.loadTimer);
+  state.loadTimer = setTimeout(() => {
+    const message = load.documentReady ? 'B 站播放页已打开，视频读取超时' : 'B 站播放页打开超时';
+    showLoadFailure(load, message);
+  }, 22000);
 }
 
 function renderParts() {
@@ -776,17 +812,31 @@ function changePart(delta) {
 
 function applyState(v) {
   if (!v) return;
-  state.video = v;
-  // 访客页心跳里带了 ?p=，自动连播下一 P 时在这里把下拉框校准过来
+  const load = state.load;
+  if (!load) return;
+  if (v.verification) {
+    showLoadFailure(load, 'B 站要求安全验证');
+    return;
+  }
+  state.video = { ...emptyVideo, ...v };
   syncPartFromGuest(v, true);
 
-  if (v.found) hidePlaceholderIfVideo();
+  if (v.mediaError) {
+    showLoadFailure(load, `视频读取失败（媒体错误 ${v.mediaError}）`);
+  } else if (v.ready) {
+    clearTimeout(state.loadTimer);
+    load.failed = false;
+    $('placeholder').classList.add('hidden');
+  }
+  paintVideoControls();
+  if (v.title && v.title !== '哔哩哔哩') $('videoTitle').textContent = v.title;
+}
 
-  // 图标是内联 SVG，这里只切状态 class，显示哪一枚由 style.css 决定
+function paintVideoControls() {
+  const v = state.video;
   $('btnPlay').classList.toggle('playing', !!v.playing);
   $('btnMute').classList.toggle('muted', !!(v.muted || v.volume === 0));
   $('btnSpeed').textContent = `${(v.rate || 1).toFixed(2).replace(/0$/, '')}×`;
-
   if (!state.seeking) paintProgress(v.current, v.duration);
   $('timeText').textContent = `${fmt(v.current)} / ${fmt(v.duration)}`;
 
@@ -818,10 +868,17 @@ function fmt(sec) {
 /* -------------------------------------------------------------------- UI */
 
 function wireUi() {
-  $('btnLoad').addEventListener('click', () => loadVideo($('urlInput').value, 1, true));
+  const loadInput = () => loadVideo($('urlInput').value, undefined, true);
+  $('btnLoad').addEventListener('click', loadInput);
   $('urlInput').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') loadVideo($('urlInput').value, 1, true);
+    if (e.key === 'Enter') loadInput();
     e.stopPropagation();
+  });
+  $('btnRetry').addEventListener('click', retryPlayback);
+  $('btnBrowser').addEventListener('click', async () => {
+    if (!state.load?.url) return;
+    const opened = await window.api.action('open-video-browser', playbackUrl(state.load)).catch(() => false);
+    if (!opened) toast('无法打开默认浏览器');
   });
 
   $('btnLink').addEventListener('click', () => {
@@ -1146,21 +1203,25 @@ function prettify(acc) {
 
 /* ---------------------------------------------------------------- 占位层 */
 
-function showPlaceholder(text) {
+function showPlaceholder(text, hint = '', failed = false) {
   const ph = $('placeholder');
   ph.classList.remove('hidden');
+  ph.classList.toggle('failed', failed);
   ph.querySelector('p').textContent = text;
+  $('placeholderHint').textContent = hint;
+  $('placeholderHint').hidden = !hint;
+  $('loadActions').hidden = !failed;
 }
 
-function hidePlaceholderIfVideo() {
-  $('placeholder').classList.add('hidden');
-}
-
-function pumpUi() {
-  // 占位文案随状态变化
-  setInterval(() => {
-    if (state.video.found) hidePlaceholderIfVideo();
-  }, 800);
+function showLoadFailure(load, message, offerCompatibility = false) {
+  if (state.load !== load || (load.failed && !offerCompatibility)) return;
+  clearTimeout(state.loadTimer);
+  load.failed = true;
+  load.offerCompatibility = offerCompatibility;
+  $('btnRetry').textContent = offerCompatibility ? '兼容重试' : '重试';
+  $('btnBrowser').hidden = !load.url;
+  const hint = offerCompatibility ? '兼容重试会关闭本浮窗的播放页沙箱' : '';
+  showPlaceholder(message, hint, true);
 }
 
 /* ------------------------------------------------------------------ toast */

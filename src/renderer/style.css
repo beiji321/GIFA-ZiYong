@@ -377,7 +377,22 @@ button.ghost:hover {
 
 #placeholder span {
   font-size: 11px;
-  color: #6f6f7b;
+  color: #8e919e;
+}
+
+#placeholder.failed .ph-icon {
+  display: none;
+}
+
+#loadActions {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  pointer-events: auto;
+}
+
+#loadActions[hidden] {
+  display: none;
 }
 
 /* ---------------------------------------------------------------- 控制条 */

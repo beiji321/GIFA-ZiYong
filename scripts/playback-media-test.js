@@ -473,6 +473,75 @@ async function runElectron() {
     await withTimeout(restored, '等待测试窗口还原');
     assert.deepEqual(host.getBounds(), originalBounds);
     console.log('PASS 最小化时退出不唤醒窗口，还原后恢复原位置和尺寸');
+
+    const expectChoice = async (label, change, expected, nextMutation = true) => {
+      const actual = await guest.executeJavaScript(`(async () => {
+        ${change}
+        ${nextMutation ? 'await Promise.resolve();' : ''}
+        return document.querySelector('[data-gifa-video]')?.id ??
+          document.getElementById('shadow-player-host')?.shadowRoot?.querySelector('[data-gifa-video]')?.id ?? '';
+      })()`);
+      assert.equal(actual, expected, label);
+      console.log('PASS  ' + label);
+    };
+    await expectChoice('单个 video 隐藏后仍为当前播放器', `
+      const media = document.querySelector('video');
+      media.id = 'main-video';
+      media.style.display = 'none';
+      document.body.appendChild(document.createComment('弹幕更新'));
+    `, 'main-video');
+    await expectChoice('观察器发现整棵新子树里的可见 video', `
+      const fragment = document.createDocumentFragment();
+      const wrapper = document.createElement('section');
+      wrapper.innerHTML = '<div><video id="nested-video" style="width:640px;height:360px"></video></div>';
+      fragment.appendChild(wrapper);
+      document.body.appendChild(fragment);
+    `, 'nested-video');
+    await expectChoice('多个 video 都隐藏时按原顺序回退到第一个', `
+      document.getElementById('nested-video').style.visibility = 'hidden';
+      document.body.appendChild(document.createComment('DOM 更新触发重新选择'));
+    `, 'main-video');
+
+    // 纯样式变化不会触发 childList 观察，验证 700ms 的多候选兜底仍在运行。
+    const styledChoice = await withTimeout(guest.executeJavaScript(`new Promise((resolve) => {
+      const selected = () => document.querySelector('[data-gifa-video]')?.id;
+      const observer = new MutationObserver(() => {
+        if (selected() !== 'nested-video') return;
+        observer.disconnect();
+        resolve(selected());
+      });
+      observer.observe(document, { subtree: true, attributes: true, attributeFilter: ['data-gifa-video'] });
+      document.getElementById('nested-video').style.visibility = 'visible';
+    })`), '等待纯样式变化后重选播放器');
+    assert.equal(styledChoice, 'nested-video');
+    console.log('PASS  多个 video 的纯样式变化仍由定时器重选');
+
+    await expectChoice('多个可见 video 面积相同时优先 DOM 顺序', `
+      document.getElementById('main-video').style.cssText = 'width:640px;height:360px';
+      document.body.appendChild(document.createComment('尺寸更新'));
+    `, 'main-video');
+    await expectChoice('单批移除旧播放器并加入嵌套 video', `
+      const replacement = document.createElement('article');
+      replacement.innerHTML = '<video id="new-video" style="width:320px;height:180px"></video>';
+      for (const media of document.querySelectorAll('video')) media.remove();
+      document.body.appendChild(replacement);
+    `, 'new-video');
+    await expectChoice('同步媒体事件在观察器交付前选中面积较大的新播放器', `
+      const newer = document.createElement('video');
+      newer.id = 'event-video';
+      newer.style.cssText = 'width:640px;height:360px';
+      document.body.appendChild(newer);
+      newer.dispatchEvent(new Event('loadstart'));
+    `, 'event-video', false);
+    await expectChoice('移走其他候选后保留唯一的播放器', `
+      document.getElementById('new-video').remove();
+    `, 'event-video');
+    await expectChoice('唯一播放器移入 Shadow DOM 后解除绑定', `
+      const shadowHost = document.createElement('div');
+      shadowHost.id = 'shadow-player-host';
+      document.body.appendChild(shadowHost);
+      shadowHost.attachShadow({ mode: 'open' }).appendChild(document.getElementById('event-video'));
+    `, '');
     console.log('媒体回归全部通过');
   } finally {
     host.destroy();

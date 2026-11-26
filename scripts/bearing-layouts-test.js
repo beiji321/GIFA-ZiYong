@@ -263,10 +263,13 @@ test('the video guest samples only the selected layout and clears stale directio
   const listeners = {};
   const mainCode = source('main.js');
   const start = mainCode.indexOf("  ipcMain.on('overlay:bearing', ");
-  const end = mainCode.indexOf("  ipcMain.handle('overlay:enable'", start);
+  /* 合并上游 v0.2.8 后，overlay:enable 前面多了 playback:get / playback:update 等
+   * 处理器。这里只抽取 overlay:bearing 这一个，避免把无关代码拉进沙箱
+   * （它们依赖 playbackState 等本测试没提供的实现）。 */
+  const end = mainCode.indexOf("  ipcMain.handle('playback:get'", start);
   assert.ok(start >= 0 && end > start);
   vm.runInNewContext(mainCode.slice(start, end), {
-    ipcMain: { on: (name, callback) => { listeners[name] = callback; } },
+    ipcMain: { on: (name, callback) => { listeners[name] = callback; }, handle() {} },
     win, activeBearingLayout, lastBearing: null, settings: { bearing }, overlayWin: {},
     // 主进程里的这几个是模块级 let 变量，抽取时不在函数体里，
     // 必须由 harness 显式提供，否则 handler 读不到就抛 ReferenceError。

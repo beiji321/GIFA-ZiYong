@@ -5,9 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const asar = require('@electron/asar');
 const { LICENSE_DIR, ELECTRON_LICENSE_FILES, verifyLicenseBundle } = require('./license-files');
+const { compileGamepadHelper } = require('./build-gamepad-helper');
+const { buildUpdateHelper } = require('./build-update-helper');
+const gamepadHelperPath = require('../src/gamepad-helper-path');
 
-module.exports = async function afterPack({ appOutDir, electronPlatformName }) {
-  if (electronPlatformName !== 'win32') return;
+function organizeWindowsResources(appOutDir) {
   const root = path.resolve(appOutDir);
   function outputPath(relative) {
     const target = path.resolve(root, relative);
@@ -49,4 +51,13 @@ module.exports = async function afterPack({ appOutDir, electronPlatformName }) {
     fs.unlinkSync(target);
   }
   console.log('  GIFA：许可集中到 resources/licenses，已移除 Electron 默认启动包及版本文件');
+}
+
+module.exports = async function afterPack({ appOutDir, electronPlatformName }) {
+  if (electronPlatformName !== 'win32') return;
+  organizeWindowsResources(appOutDir);
+  const resources = path.resolve(appOutDir, 'resources');
+  compileGamepadHelper(gamepadHelperPath(resources));
+  buildUpdateHelper(resources);
 };
+module.exports.organizeWindowsResources = organizeWindowsResources;

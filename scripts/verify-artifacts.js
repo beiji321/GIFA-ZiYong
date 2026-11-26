@@ -17,6 +17,8 @@ const crypto = require('crypto');
 const { verifyZip } = require('./zip-writer');
 const asar = require('@electron/asar');
 const { LICENSE_FILES, EXTRA_LICENSE_FILES, verifyLicenseBundle } = require('./license-files');
+const gamepadHelperPath = require('../src/gamepad-helper-path');
+const { HELPER_NAME, KEY_NAME, MANIFEST_NAME, fromKeyParts, verifyManifest } = require('../src/update-manifest');
 
 const ROOT = path.resolve(__dirname, '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
@@ -35,6 +37,9 @@ const OUT = ARG_OUT ? path.resolve(ROOT, ARG_OUT.slice('--out='.length)) : lates
 const ZIP = path.join(OUT, `GIFA-${VERSION}-win-x64.zip`);
 const SETUP = path.join(OUT, `GIFA-${VERSION}-Setup.exe`);
 const SUMS = path.join(OUT, 'SHA256SUMS.txt');
+const RESOURCES = path.join(OUT, 'win-unpacked', 'resources');
+const PUBLIC_KEY = path.join(RESOURCES, KEY_NAME);
+const MANIFEST = path.join(OUT, MANIFEST_NAME);
 
 let pass = 0;
 let fail = 0;
@@ -77,6 +82,16 @@ if (has(ZIP)) {
   const hasEntry = (n) => z.names.includes('GIFA/' + n);
   check('主程序 GIFA.exe 条目', hasEntry('GIFA.exe'), true);
   check('app.asar 条目', z.names.some((n) => n.endsWith('resources/app.asar')), true);
+  const helper = gamepadHelperPath('resources').split(path.sep).join('/');
+  const zippedHelper = z.read('GIFA/' + helper);
+  const builtHelper = path.join(OUT, 'win-unpacked', helper);
+  check('安装版源目录与绿色版均收录同一手柄程序', !!zippedHelper && has(builtHelper) && zippedHelper.equals(read(builtHelper)) && zippedHelper.toString('ascii', 0, 2) === 'MZ', true);
+  const updater = path.join(RESOURCES, HELPER_NAME);
+  const zipUpdater = z.read('GIFA/resources/' + HELPER_NAME);
+  check('安装版源目录与绿色版均收录同一更新器', !!zipUpdater && has(updater) && zipUpdater.equals(read(updater)) && zipUpdater.toString('ascii', 0, 2) === 'MZ', true);
+  const zipKey = z.read('GIFA/resources/' + KEY_NAME);
+  check('两种发行形态的更新公钥一致', has(PUBLIC_KEY) ? !!zipKey && zipKey.equals(read(PUBLIC_KEY)) : !zipKey, true);
+  check('绿色版不包含个人数据', z.names.filter(name => name.startsWith('GIFA/data/')), ['GIFA/data/']);
   check('portable.flag', hasEntry('portable.flag'), true);
   check('绿色版说明', hasEntry('README-绿色版.txt'), true);
   check('data/ 目录项', hasEntry('data/'), true);
@@ -129,6 +144,21 @@ if (has(SUMS)) {
     if (!has(f) || sha256(f) !== hash) allOk = false;
   }
   check('两个 hash 都对得上', allOk, true);
+}
+
+check('签名清单随已配置公钥的发行包交付', has(MANIFEST), has(PUBLIC_KEY));
+if (has(MANIFEST) && has(PUBLIC_KEY)) {
+  try {
+    const publicKey = fromKeyParts(JSON.parse(read(PUBLIC_KEY).toString('utf8')));
+    const manifest = verifyManifest(read(MANIFEST), publicKey, VERSION);
+    check('更新清单签名与版本正确', manifest.version, VERSION);
+    for (const artifact of Object.values(manifest.artifacts)) {
+      const file = path.join(OUT, artifact.name);
+      check(`更新签名覆盖 ${artifact.name}`, has(file) && fs.statSync(file).size === artifact.size && sha256(file) === artifact.sha256, true);
+    }
+  } catch (error) {
+    check('更新清单有效', error.message, true);
+  }
 }
 
 /* ---- 6. 打包配置 ---- */

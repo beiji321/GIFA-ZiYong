@@ -16,6 +16,7 @@ delete env.ELECTRON_RUN_AS_NODE;
 
 const args = [path.resolve(__dirname, '..'), ...process.argv.slice(2)];
 
+if (process.platform === 'win32') require('./build-gamepad-helper').ensureDevGamepadHelper();
 const child = spawn(electronBinary, args, { stdio: 'inherit', env });
 child.on('close', (code) => process.exit(code ?? 0));
 child.on('error', (err) => {

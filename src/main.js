@@ -25,6 +25,8 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { execFile, execFileSync, spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
+const { createUpdateController, installExitHook, resolveUpdater } = require('./update-controller');
+const { githubClient, RELEASES_PAGE } = require('./update-github');
 const hookHotkeys = require('./hook-hotkeys');
 const gamepad = require('./gamepad');
 const { mergeHotkeys, prepareHotkeyUpdate } = require('./hotkey-config');
@@ -368,6 +370,7 @@ function biliSession() {
 /** 用该分区的 Cookie 发请求，避开 B 站风控，并且能读到登录态 */
 function biliFetch(url, extraHeaders) {
   return biliSession().fetch(url, {
+    signal: AbortSignal.timeout(8000),
     headers: {
       'User-Agent': UA,
       Referer: 'https://www.bilibili.com/',
@@ -495,6 +498,7 @@ const DEFAULT_SETTINGS = {
   // 「上次看到」：光有 lastText/lastPart 不够 —— 用户记不住的是「哪个视频、第几 P」，
   // 长链接/BV 号看不出片名，所以额外存标题、视频 id、分 P 总数和最后观看时间。
   lastTitle: '',
+  lastCover: '',
   lastVideoId: '',
   lastPageCount: 0,
   lastWatchedAt: 0,
@@ -592,6 +596,7 @@ function noteWatched(s, info) {
   if (Number.isFinite(p) && p > 0) s.lastPart = Math.floor(p);
   if (info.id) s.lastVideoId = String(info.id);
   if (info.title !== undefined) s.lastTitle = String(info.title || '');
+  if (info.cover !== undefined) s.lastCover = typeof info.cover === 'string' ? info.cover : '';
   if (info.pageCount !== undefined) {
     const n = Number(info.pageCount);
     s.lastPageCount = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
@@ -711,14 +716,31 @@ function loadSettings() {
   }
 }
 
-function flushSettings() {
+function flushSettings(atomic = false) {
   clearTimeout(saveTimer);
   saveTimer = null;
+  const file = settingsFile();
+  let temporaryDir;
   try {
-    fs.mkdirSync(path.dirname(settingsFile()), { recursive: true });
-    fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2), 'utf8');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const contents = JSON.stringify(settings, null, 2);
+    if (atomic) {
+      temporaryDir = fs.mkdtempSync(path.join(path.dirname(file), '.settings-'));
+      const temporary = path.join(temporaryDir, 'settings.json');
+      fs.writeFileSync(temporary, contents, { encoding: 'utf8', flag: 'wx', flush: true });
+      fs.renameSync(temporary, file);
+    } else {
+      fs.writeFileSync(file, contents, 'utf8');
+    }
+    return true;
   } catch (err) {
     console.error('[settings] 写入失败', err);
+    return false;
+  } finally {
+    if (temporaryDir) {
+      try { fs.unlinkSync(path.join(temporaryDir, 'settings.json')); } catch {}
+      try { fs.rmdirSync(temporaryDir); } catch {}
+    }
   }
 }
 
@@ -795,9 +817,14 @@ function attachPlaybackGuest(guest) {
   playbackGuest = guest;
   immersionAspect = 0;
   guest.setAudioMuted(true);
+  /* 上游把「导航开始就静音」收进了新文档的同步 player:settings，
+   * 这里只额外保留我方需要的沉浸比例重置（换文档后视频尺寸会变）。 */
+  /* 上游 v0.2.7 起，音频门控改由新文档的同步 player:settings 负责：
+   * 导航开始时不再直接静音（否则取消导航 / 迟到的提交事件会把已播放的声音掐掉）。
+   * 这里只保留魔改版需要的一件事 —— 换文档后视频尺寸会变，
+   * 沉浸比例必须重置，否则会按旧宽高比算窗口。 */
   guest.on('did-start-navigation', (details) => {
     if (details.isMainFrame && !details.isSameDocument) {
-      guest.setAudioMuted(true);
       if (playbackGuest === guest) immersionAspect = 0;
     }
   });
@@ -810,6 +837,26 @@ function attachPlaybackGuest(guest) {
       immersionAspect = 0;
     }
   });
+}
+
+function isPlaybackPage(value, requireVideoPath = true) {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.origin === 'https://www.bilibili.com' && !url.username && !url.password &&
+      (!requireVideoPath || /^\/video\/(?:BV[0-9A-Za-z]{10}|av\d+)\/?$/.test(url.pathname));
+  } catch {
+    return false;
+  }
+}
+
+function supportsPlaybackCompatibility() {
+  return process.platform === 'win32' && sandboxGuard.mode === 'normal';
+}
+
+function isPlaybackSandboxCrash(details) {
+  return (details.reason === 'crashed' || details.reason === 'abnormal-exit') &&
+    (details.exitCode >>> 0) === 0x80000003;
 }
 
 /* ------------------------------------------------------------------ 窗口 */
@@ -924,10 +971,44 @@ function createWindow() {
   // webview 里的 <video> 一旦走 HTML 全屏，它会铺满整个客户区并盖住我们自己的
   // 标题栏和设置按钮 —— 这是「视频全屏后找不到设置」的根因。直接禁掉，
   // 让 B 站播放器的全屏按钮改走窗口全屏（见 webview-preload 里的 requestFullscreen 改写）。
-  win.webContents.on('will-attach-webview', (_e, prefs) => {
-    prefs.disableHtmlFullscreen = true;
+  let compatibilityAvailable = false;
+  win.webContents.on('will-attach-webview', (event, prefs, params) => {
+    if (params.partition !== BILI_PARTITION || !isPlaybackPage(params.src)) {
+      event.preventDefault();
+      return;
+    }
+    Object.assign(prefs, {
+      preload: path.join(__dirname, 'webview-preload.js'),
+      disableHtmlFullscreen: true,
+      sandbox: !compatibilityAvailable || prefs.sandbox !== false,
+      nodeIntegration: false,
+      nodeIntegrationInSubFrames: false,
+      nodeIntegrationInWorker: false,
+      contextIsolation: true,
+      webSecurity: true,
+      webviewTag: false
+    });
   });
-  win.webContents.on('did-attach-webview', (_e, guest) => attachPlaybackGuest(guest));
+  win.webContents.on('did-attach-webview', (_event, guest) => {
+    attachPlaybackGuest(guest);
+    let navigated = false;
+    guest.setWindowOpenHandler(() => ({ action: 'deny' }));
+    guest.on('will-navigate', (event) => {
+      if (!isPlaybackPage(event.url, false)) event.preventDefault();
+    });
+    guest.on('will-redirect', (event) => {
+      if (event.isMainFrame && !isPlaybackPage(event.url, false)) event.preventDefault();
+    });
+    guest.once('did-navigate', () => { navigated = true; });
+    guest.on('render-process-gone', (_gone, details) => {
+      if (!isPlaybackGuest(guest) || details.reason === 'clean-exit') return;
+      if (!navigated && supportsPlaybackCompatibility() && isPlaybackSandboxCrash(details)) compatibilityAvailable = true;
+      sandboxGuard.log('bili-render-gone', JSON.stringify({ ...details, beforeNavigation: !navigated }));
+    });
+    guest.on('preload-error', () => {
+      if (isPlaybackGuest(guest)) sandboxGuard.log('bili-preload-error', '播放页访客脚本加载失败');
+    });
+  });
   win.webContents.on('render-process-gone', () => {
     cancelTemporarySpeed();
     if (win && !win.isDestroyed()) setImmersion(false);
@@ -1043,7 +1124,6 @@ function createWindow() {
       enforceRatio(win.getBounds().width);
     }, 120);
   });
-
   win.on('closed', () => {
     win = null;
     lastBearingStats = null; // 健康度属于「当前这次识别」，浮窗关了不该显示旧数字
@@ -2525,6 +2605,7 @@ function immersionPlacement() {
   const content = win.getContentBounds();
   const frameW = Math.max(0, current.width - content.width);
   const frameH = Math.max(0, current.height - content.height);
+
   /* 尺寸：按视频宽高比收紧，去掉黑边（作者原意，保留）。
    * 位置：**贴哪条边就锁哪条边**。
    *
@@ -2546,6 +2627,7 @@ function immersionPlacement() {
   const width = Math.max(1, Math.min(maxW, Math.round(maxH * immersionAspect))) + frameW;
   const height = Math.max(1, Math.min(maxH, Math.round(maxW / immersionAspect))) + frameH;
   const left = Math.max(workArea.x, Math.min(workArea.x + workArea.width - width, original.x + Math.round((original.width - width) / 2)));
+
   /* 贴边判定：只有真的贴着边（距离在阈值内）才锁那条边，
    * 否则保持作者的居中。
    *
@@ -2677,15 +2759,9 @@ function createConsole() {
     icon: path.join(__dirname, '..', 'build', 'icon.ico'),
     backgroundColor: '#1e1e1e',
     autoHideMenuBar: true,
-    // Windows 原生标题栏在浅色系统主题下是一条白条，会和我们自绘的 40px 深色
-    // TitleBar 叠成两层。用 Window Controls Overlay 把网页内容延伸到窗口顶部，
-    // 最小化/最大化/关闭三个系统按钮浮在深色顶栏右上角（VS Code / Wpf.Ui 同款）。
-    // 对应 console.css 里 .topbar 的右侧留白与拖动区域；仅 Windows 有效。
+    // Window Controls Overlay 的颜色、高度与 console.css 的 --chrome / --title-h 一致。
     ...(process.platform === 'win32'
-      ? {
-          titleBarStyle: 'hidden',
-          titleBarOverlay: { color: '#1e1e1e', symbolColor: '#e6e6e6', height: 40 }
-        }
+      ? { titleBarStyle: 'hidden', titleBarOverlay: { color: '#1e1e1e', symbolColor: '#e6e6e6', height: 40 } }
       : {}),
     show: false,
     webPreferences: {
@@ -2750,6 +2826,7 @@ setInterval(() => {
 /* ------------------------------------------------------- 方位标记叠加层 */
 
 let overlayWin = null;
+let overlayReleaseTimer = null;
 let overlayPlacing = false;
 let lastBearing = null;
 let overlayDrag = null; // 自绘拖动的起点与初始窗口位置
@@ -2757,6 +2834,11 @@ let overlayDrag = null; // 自绘拖动的起点与初始窗口位置
 let lastBearingStats = null;
 /** 上一次记录「识别结果被丢弃」的时间，用来限频 */
 let lastBearingDropAt = 0;
+
+function clearBearingOverlay() {
+  lastBearing = null;
+  sendTo(overlayWin, 'bearing', { clear: true });
+}
 
 function clearBearingOverlay() {
   lastBearing = null;
@@ -2853,92 +2935,36 @@ function createOverlay() {
 
   const overlay = overlayWin;
   overlay.on('closed', () => {
-    if (overlayWin === overlay) overlayWin = null;
+    if (overlayWin !== overlay) return;
+    clearTimeout(overlayReleaseTimer);
+    overlayReleaseTimer = null;
+    overlayWin = null;
   });
   overlay.webContents.on('did-finish-load', () => {
     if (overlayWin !== overlay || overlay.isDestroyed()) return;
     overlay.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
     if (lastBearing) overlay.webContents.send('bearing', lastBearing);
-    if (settings.bearing.enabled && !overlay.isVisible()) overlay.showInactive();
+    if (settings.bearing.enabled && (win || overlayPlacing) && !overlay.isVisible()) overlay.showInactive();
   });
+  /* 我方补发：radar.js 靠 radar:config 里的 visible 决定画不画，
+   * 不发就一直是「不可见」，整个叠加层等于空白。
+   * 单独挂一发而不是塞进上面的回调里 —— 两条路径都要能兜住
+   * （上游 overlay.js 走 mode/bearing，我们的 radar.js 靠 radar:config）。 */
+  overlay.webContents.on('did-finish-load', pushOverlayBoot);
 
-  // 雷达模式通过 query 指定，两套渲染各自独立成文件。
-  // 注意：这条 loadFile 必须保留 —— 我们的 radar.js 靠 ?radar=1 才注册四轴方位，
-  // 上游的 overlay.js 则靠上面的 mode/bearing 消息。两条路同时留。
+  /* 雷达模式通过 query 指定，两套渲染各自独立成文件。
+   * 注意：这条 loadFile 必须保留 ?radar=1 —— 我们的 radar.js 靠它才注册四轴方位，
+   * 上游 overlay.js 则靠上面的 mode/bearing 消息。两条路同时留。 */
   overlay.loadFile(
     path.join(__dirname, 'overlay', 'index.html'),
     settings.overlayRadar ? { search: 'radar=1' } : undefined
   );
-
-  // 我方雷达/字幕需要 overlay:ready 之后再补一发配置，这里保持原有接线
-  overlay.webContents.on('did-finish-load', pushOverlayBoot);
-
   return overlay;
 }
 
-function ensureOverlayReachable() {
-  if (!overlayWin || overlayWin.isDestroyed()) return false;
-  let b = null;
-  try {
-    b = overlayWin.getBounds();
-  } catch {
-    return false;
-  }
-  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return false;
-
-  let d = null;
-  try {
-    d = screen.getDisplayMatching(b);
-  } catch {
-    return false;
-  }
-  if (!d || !d.workArea) return false;
-  const area = d.workArea;
-
-  // 与工作区的相交面积占窗口面积的比例
-  const ix = Math.max(0, Math.min(b.x + b.width, area.x + area.width) - Math.max(b.x, area.x));
-  const iy = Math.max(0, Math.min(b.y + b.height, area.y + area.height) - Math.max(b.y, area.y));
-  const visible = (ix * iy) / Math.max(1, b.width * b.height);
-  if (visible >= 0.2) return false;
-
-  // 沿最近的边夹回工作区（窗口比工作区还大时贴左上角）
-  const nx = Math.max(area.x, Math.min(b.x, area.x + area.width - b.width));
-  const ny = Math.max(area.y, Math.min(b.y, area.y + area.height - b.height));
-  try {
-    overlayWin.setBounds({ x: Math.round(nx), y: Math.round(ny), width: b.width, height: b.height });
-  } catch {
-    return false;
-  }
-  settings.bearing.x = Math.round(nx + b.width / 2);
-  settings.bearing.y = Math.round(ny + b.height / 2);
-  saveBearingRatio(settings.bearing.x, settings.bearing.y);
-  persist();
-  pushDanmakuConfig();
-  pushRadarConfig();
-  console.log(
-    '[overlay] 叠加层跑到屏幕外（可见 %s%%），已拉回 (%s, %s)',
-    Math.round(visible * 100),
-    Math.round(nx),
-    Math.round(ny)
-  );
-  return true;
-}
-
-/**
- * 方位标定开着就把叠加层叫起来（照搬旧版）。
- *
- * 关键在 ensureOverlayReachable：上次的圆心坐标可能落在屏幕外
- * （换过分辨率 / 改过缩放 / 拔过外接屏），那样窗口建好了也看不见，
- * 表现就是「必须点一下②再锁定才冒出来」—— 因为放置模式会触发拉回。
- */
-function ensureOverlayVisible() {
-  if (!settings.bearing.enabled) return;
-  showOverlay();
-  ensureOverlayReachable();
-  pushRadarConfig();
-}
-
 function showOverlay() {
+  clearTimeout(overlayReleaseTimer);
+  overlayReleaseTimer = null;
   const w = createOverlay();
   if (w.isVisible()) return w;
 
@@ -2947,10 +2973,7 @@ function showOverlay() {
    * 这里不再各挂一份事件 —— createOverlay 的 did-finish-load 已经负责
    * 「加载完就按开关决定显不显示」，两边都挂会互相打架：
    * 该函数里的 reveal 会因为 once 已经消耗掉而不再生效，
-   * 结果就是「开关开了、日志里 overlay:ready 也来了，但窗口一直是隐藏的」。
-   *
-   * 窗口还没加载完：交给 createOverlay 的回调处理。
-   * 已经加载完：直接显示。 */
+   * 结果就是「开关开了、日志里 overlay:ready 也来了，但窗口一直是隐藏的」。 */
   const reveal = () => {
     if (w.isDestroyed() || w.isVisible()) return;
     if (!settings.bearing.enabled) return;
@@ -2999,13 +3022,21 @@ function setBearingEnabled(on) {
   settings.bearing.enabled = !!on;
 
   if (on) {
-    showOverlay();
+    if (win && !win.isDestroyed()) showOverlay();
   } else {
     overlayPlacing = false;
-    if (overlayWin && !overlayWin.isDestroyed()) {
-      overlayWin.setIgnoreMouseEvents(true, { forward: true });
-      overlayWin.setFocusable(false);
-      overlayWin.hide();
+    clearBearingOverlay();
+    const overlay = overlayWin;
+    if (overlay && !overlay.isDestroyed()) {
+      overlay.setIgnoreMouseEvents(true, { forward: true });
+      overlay.setFocusable(false);
+      overlay.hide();
+      // 短时间内反复切换可以直接复用窗口，闲置后释放独立的渲染进程。
+      clearTimeout(overlayReleaseTimer);
+      overlayReleaseTimer = setTimeout(() => {
+        overlayReleaseTimer = null;
+        if (overlayWin === overlay && !overlay.isDestroyed() && !overlay.isVisible()) overlay.destroy();
+      }, 3000);
     }
     clearBearingOverlay();
   }
@@ -4421,8 +4452,8 @@ let discReady = false;
 let discShown = false;
 let discHighlight = '';
 let chordState = createChordState();
-let gamepadSlot = null;
-let gamepadNeedsRelease = true;
+let activeGamepadSlot = null;
+const gamepadDevices = new Map();
 const gamepadPauses = new Set();
 
 function discSize() {
@@ -4543,44 +4574,78 @@ function hideDisc() {
 }
 
 function resetGamepadSession() {
-  if (chordState.l3) gamepadNeedsRelease = true;
+  activeGamepadSlot = null;
   chordState = createChordState();
   if (discShown) hideDisc();
   setHoldSpeed(false, 'gamepad');
 }
 
+function gamepadDeviceModels() {
+  return Array.from(gamepadDevices.values(), (device) => device.model);
+}
+
+function notifyGamepadDevices() {
+  sendTo(consoleWin, 'gamepad:devices', gamepadDeviceModels());
+}
+
 function handleGamepadFrame(frame) {
-  if (!settings.gamepad.enabled || !frame?.connected) {
+  const slot = frame?.slot;
+  if (!settings.gamepad.enabled || (!frame?.connected && slot === undefined)) {
     resetGamepadSession();
-    gamepadSlot = null;
-    gamepadNeedsRelease = true;
+    if (gamepadDevices.size) {
+      gamepadDevices.clear();
+      notifyGamepadDevices();
+    }
     return;
   }
-  if (frame.slot !== gamepadSlot) {
-    resetGamepadSession();
-    gamepadSlot = frame.slot;
-    gamepadNeedsRelease = true;
+  if (!frame.connected) {
+    if (slot === activeGamepadSlot) resetGamepadSession();
+    if (gamepadDevices.delete(slot)) notifyGamepadDevices();
+    return;
   }
+
   const pressed = !!frame.buttons[L3_BUTTON_INDEX];
+  const device = gamepadDevices.get(slot);
+  const freshPress = device?.pressed === false && pressed;
+  if (device) device.pressed = pressed;
+  else {
+    gamepadDevices.set(slot, { model: frame.model, pressed });
+    notifyGamepadDevices();
+  }
+
   if (gamepadPauses.size || typingInField || capturingHotkey ||
       (loginWin && BrowserWindow.getFocusedWindow() === loginWin)) {
-    resetGamepadSession();
-    gamepadNeedsRelease = pressed;
+    if (activeGamepadSlot !== null) resetGamepadSession();
     return;
   }
-  if (gamepadNeedsRelease) {
-    if (!pressed) gamepadNeedsRelease = false;
-    return;
-  }
+  // 圆盘归本次按下左摇杆的设备。首次报告就是按住时，先等该设备松开。
+  if (activeGamepadSlot === null && freshPress) activeGamepadSlot = slot;
+  if (activeGamepadSlot !== slot) return;
+
   const step = stepChord(chordState, frame, settings.gamepad);
   chordState = step.state;
-
-  if (step.active && !discShown) showDisc();
-  else if (!step.active && discShown) hideDisc();
-  if (step.active) pushDiscState(step.highlighted);
+  if (!step.active) {
+    activeGamepadSlot = null;
+    if (discShown) hideDisc();
+  } else {
+    if (!discShown) showDisc();
+    pushDiscState(step.highlighted);
+  }
   if (step.release) handleHotkey(step.release, 'up', 'gamepad');
   if (step.press) handleHotkey(step.press, 'down', 'gamepad');
   if (step.fired) handleHotkey(step.fired);
+}
+
+function setGamepadEnabled(enabled) {
+  if (settings.gamepad.enabled === enabled) return;
+  settings.gamepad.enabled = enabled;
+  if (enabled) {
+    gamepad.start(handleGamepadFrame);
+  } else {
+    stopGamepadPoller();
+    handleGamepadFrame(null);
+    if (discWin && !discWin.isDestroyed()) discWin.destroy();
+  }
 }
 
 function stopGamepadPoller() {
@@ -4756,6 +4821,7 @@ async function fetchVideoInfo(id) {
       ok: true,
       id: d.bvid || id,
       title: d.title || '',
+      cover: typeof d.pic === 'string' ? d.pic : '',
       owner: d.owner ? d.owner.name : '',
       // cid 是弹幕接口和官方字幕接口的必需参数，必须一起带出来
       cid: d.cid || 0,
@@ -4939,12 +5005,14 @@ function registerIpc() {
       // 手柄圆盘的可绑动作表要连白名单一起给界面，否则启动器会列出圆盘其实不认的动作
       gamepadDirs: GAMEPAD_DIR_UI,
       gamepadActions: GAMEPAD_ACTION_ALLOWLIST,
+      gamepadModels: gamepadDeviceModels(),
       failedHotkeys,
       initialUrl: OPEN_ARG,
       nav,
       // 框选圆环的出厂初值。**不进标定列表**，只用来决定第一次打开标定时圆环落在哪，
       // 免得一打开就偏到画面外、用户点「完成」直接存下一个错区域。
       webviewPreload: pathToFileURL(path.join(__dirname, 'webview-preload.js')).href,
+      playbackCompatibility: supportsPlaybackCompatibility(),
       version: app.getVersion(),
       // 界面要能一眼看出「单键/侧键的全局钩子到底起来了没有」，
       // 否则热键不响应时只能靠猜
@@ -4968,8 +5036,7 @@ function registerIpc() {
     if (saveTimer) flushSettings();
     const hadLock = app.hasSingleInstanceLock();
     stopGamepadPoller();
-    resetGamepadSession();
-    gamepadNeedsRelease = true;
+    handleGamepadFrame(null);
     if (hadLock) app.releaseSingleInstanceLock();
     const result = await relaunchElevated();
     // UAC 被取消：把锁要回来，继续以普通权限运行
@@ -4998,6 +5065,14 @@ function registerIpc() {
     if (!lastBearingStats) return null;
     // 超过 5 秒没更新说明识别循环停了（视频暂停 / 开关关闭），界面要能区分
     return { ...lastBearingStats, ageMs: Date.now() - lastBearingStats.at };
+  });
+
+  ipcMain.on('overlay:bearing', (event, payload) => {
+    if (event.sender !== win?.webContents || !payload || !settings.bearing.enabled) return;
+    const layout = activeBearingLayout(settings.bearing);
+    if (!payload.clear && (payload.layoutId !== layout.id || payload.revision !== layout.revision)) return;
+    lastBearing = payload;
+    sendTo(overlayWin, 'bearing', payload);
   });
 
   ipcMain.handle('playback:get', () => playbackState());
@@ -5544,6 +5619,7 @@ function registerIpc() {
 
   ipcMain.handle('settings:save', (_e, patch = {}) => {
     const playbackChanged = updatePlaybackSettings(settings, patch);
+    if (typeof patch.gamepadEnabled === 'boolean') setGamepadEnabled(patch.gamepadEnabled);
     if (HOLD_PLAYBACK_RATES.includes(patch.holdPlaybackRate)) settings.holdPlaybackRate = patch.holdPlaybackRate;
     if (typeof patch.hoverFadeEnabled === 'boolean') {
       settings.hoverFadeEnabled = patch.hoverFadeEnabled;
@@ -5865,6 +5941,9 @@ function registerIpc() {
       case 'minimize':
         win.minimize();
         break;
+      case 'open-video-browser':
+        if (_e.sender !== win.webContents || _e.senderFrame !== _e.sender.mainFrame || !isPlaybackPage(payload)) return false;
+        return shell.openExternal(payload).then(() => true, () => false);
       case 'close':
         // 只关跟跑浮窗，不退出程序 —— 启动器还在，随时可以再点「启动跟跑」。
         // 反方向不一样：关启动器会连带收掉所有窗口并退出（见 createConsole）。
@@ -5920,12 +5999,17 @@ function registerIpc() {
     return true;
   });
 
+  let latestVideoLoad = 0;
   ipcMain.handle('bili:load', async (_e, payload = {}) => {
+    const load = ++latestVideoLoad;
     const resolved = await resolveInput(payload.text);
+    if (load !== latestVideoLoad) return { ok: false, message: '已发出新的播放请求' };
     if (!resolved.ok) return { ok: false, message: resolved.message };
 
     const p = Number(payload.p) || resolved.p || 1;
     const info = await fetchVideoInfo(resolved.id);
+    // 旧请求迟到时不能覆盖当前视频的观看记录。
+    if (load !== latestVideoLoad) return { ok: false, message: '已发出新的播放请求' };
     const id = (info.ok && info.id) || resolved.id;
     const pages = info.ok ? info.pages : [];
 
@@ -5933,11 +6017,13 @@ function registerIpc() {
     const sameVideo =
       settings.lastVideoId &&
       String(settings.lastVideoId).toLowerCase() === String(id).toLowerCase();
+    const cover = (info.ok && info.cover) || (sameVideo ? settings.lastCover : '') || '';
     noteWatched(settings, {
       text: payload.text,
       p,
       id,
       title: info.ok ? info.title : sameVideo ? settings.lastTitle : '',
+      cover,
       pageCount: pages.length || (sameVideo ? settings.lastPageCount : 0)
     });
     persist();
@@ -5971,6 +6057,7 @@ function registerIpc() {
       url: buildUrl(id, p),
       title: info.ok ? info.title : '',
       owner: info.ok ? info.owner : '',
+      cover,
       pages,
       message: info.ok ? '' : `读不到分 P 信息（${info.message}），已直接载入`
     };
@@ -6008,6 +6095,88 @@ function registerIpc() {
 }
 
 /* ---------------------------------------------------------------- 生命周期 */
+
+let updates;
+
+function updateSender(event) {
+  return consoleWin && !consoleWin.isDestroyed() && event.sender === consoleWin.webContents &&
+    event.senderFrame && event.senderFrame === consoleWin.webContents.mainFrame &&
+    event.senderFrame.url === pathToFileURL(path.join(__dirname, 'console', 'index.html')).href;
+}
+
+async function registerUpdates() {
+  const directory = programDir();
+  const resources = process.resourcesPath;
+  const updater = await resolveUpdater({
+    packaged: app.isPackaged, platform: process.platform, arch: process.arch, mode: installMode, programDir: directory,
+    resourcesPath: resources, selfExtracting: !!(process.env.PORTABLE_EXECUTABLE_DIR || process.env.PORTABLE_EXECUTABLE_FILE)
+  });
+  const version = app.getVersion();
+  updates = createUpdateController({
+    version, updater, client: githubClient(), tempDir: app.getPath('temp'),
+    updated: process.argv.includes('--gifa-updated'),
+    onState: state => sendTo(consoleWin, 'update:state', state),
+    async confirmInstall(targetVersion) {
+      if (overlayPlacing || capturingHotkey || (loginWin && !loginWin.isDestroyed())) {
+        throw new Error('请先完成登录、快捷键录制或方位标定，再安装更新。');
+      }
+      const result = await dialog.showMessageBox(consoleWin, {
+        type: 'question', title: '安装 GIFA 更新', message: `重启并更新到 v${targetVersion}？`,
+        detail: '浮窗播放器将停止，更新后会重新启动 GIFA。你的设置、标定和 B 站登录状态会保留。',
+        buttons: ['稍后', '重启并安装'], cancelId: 0, defaultId: 0, noLink: true
+      });
+      return result.response === 1;
+    },
+    async prepareInstall({ manifestPath, artifactPath }) {
+      if (!isElevated()) throw new Error('请以管理员身份运行 GIFA，再安装更新。');
+      if (updater.mode === 'installed' && fs.existsSync(path.join(directory, 'data'))) {
+        throw new Error('安装目录仍有旧绿色版的 data，请先将它备份并迁出，再安装更新。');
+      }
+      if (!flushSettings(true)) throw new Error('无法保存当前设置，未启动更新器。');
+      try { await biliSession().cookies.flushStore(); }
+      catch { throw new Error('无法刷新本地登录状态，未启动更新器。'); }
+      const args = ['--apply', updater.mode, directory, String(process.pid), version, manifestPath, artifactPath];
+      await new Promise((resolve, reject) => {
+        execFile(updater.helper, args, { windowsHide: true, timeout: 180000 }, (error, _stdout, stderr) => {
+          if (!error) return resolve();
+          const code = /^GIFA_UPDATE_ERROR ([A-Z_]+)$/.exec(stderr.trim())?.[1];
+          const messages = {
+            LEGACY_DATA: '安装目录仍有旧绿色版的 data，请先将它备份并迁出。',
+            SCOPE: '无法确认原安装位置或安装范围，请到官方发布页手动升级。',
+            UNSAFE_PATH: '当前目录的权限或路径不支持安全更新，请到官方发布页手动升级。',
+            INTERRUPTED: '检测到上次更新留下的备份。请先保留备份和 data，再手动修复。',
+            NO_KEY: '此构建未配置更新公钥，请从官方发布页获取新版。',
+            NOT_ELEVATED: '请以管理员身份运行 GIFA，再安装更新。',
+            BUSY: '另一个更新或 GIFA 实例正在运行，请关闭后重试。'
+          };
+          console.warn('[update] helper preflight:', error.code, code || 'PREPARE_FAILED');
+          reject(new Error(messages[code] || '更新器无法准备安装，请检查文件占用和可用空间。'));
+        });
+      });
+    },
+    quit: () => app.quit()
+  });
+
+  const actions = {
+    status: updates.snapshot,
+    check: updates.check,
+    download: updates.download,
+    cancel: updates.cancel,
+    install: updates.install,
+    'open-releases': async () => {
+      await shell.openExternal(RELEASES_PAGE);
+      return updates.snapshot();
+    }
+  };
+  for (const [action, handle] of Object.entries(actions)) {
+    ipcMain.handle('update:' + action, event => {
+      if (!updateSender(event)) throw new Error('无权使用更新服务');
+      return handle();
+    });
+  }
+
+  installExitHook(app, updates);
+}
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -6081,14 +6250,19 @@ if (!gotLock) {
 
     registerIpc();
     createTray(); // 先建托盘：启动器被收进托盘后还要有个入口能叫回来
+    // 上游：应用内更新初始化（失败不阻塞启动）
+    await registerUpdates().catch(error => console.warn('[update] initialization failed:', error.message));
     // 上游：沉浸模式下显示环境变了要重新贴合视频比例
     for (const event of ['display-added', 'display-removed', 'display-metrics-changed']) {
       screen.on(event, fitImmersionWindow);
     }
-    createConsole(); // 先出启动器，配置好了再点「启动跟跑」
+    const launcher = createConsole(); // 先出启动器，配置好了再点「启动跟跑」
+    // 上游：更新器正在准备时拦截关闭，避免装到一半
+    launcher.on('close', event => {
+      if (updates?.isPreparing()) event.preventDefault();
+    });
     registerHotkeys();
-    // XInput 轮询是个常驻子进程，关掉了就不该起它。手柄状态属 OS 层，
-    // 不存在「窗口建晚了要等解锁」这种事，随时起都行。
+    // Windows 手柄输入由独立子进程处理，关闭手柄快捷键时无需启动它。
     if (settings.gamepad.enabled) gamepad.start(handleGamepadFrame);
 
     // 外接屏拔插 / 改分辨率：全屏透明层要重新铺满，否则只盖住半个屏幕
