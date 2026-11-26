@@ -1683,6 +1683,10 @@ const storyWatch = {
   /* 连续「看不见游戏」的轮数。截不到图既不是命中也不是落空，
    * 单独计一路，否则切屏/抓图打嗝会直接把剧情状态翻回去。 */
   stale: 0,
+  /* 是否已降频空转。连续看不见游戏时说明用户压根没开游戏（或在干别的），
+   * 还按 600ms 一轮去抓图纯属白烧 CPU —— 降到 STORY_IDLE_INTERVAL，
+   * 等真的抓到一帧再恢复正常间隔。 */
+  slow: false,
   lastScore: 0,
   lastLogged: 0,
   lastDumpAt: 0
@@ -1696,6 +1700,13 @@ const storyWatch = {
 const STORY_ENTER_HITS = 2;
 const STORY_EXIT_MISSES = 3;
 const STORY_STALE_LIMIT = 8;
+/* 连续看不见游戏后，扫描降到这个间隔（毫秒）。
+ *
+ * 原来的行为是「只记一条 giveUp 日志，定时器照旧每 600ms 跑」，
+ * 于是没开游戏时它能空转几百轮。配合当时的兜底 bug（每轮 500ms+），
+ * 主进程被拖到 41% CPU、鼠标输入被堵后成批补发 —— 指针看起来在瞬移。
+ * 兜底已经修掉，这里再把空转本身降频，双保险。 */
+const STORY_IDLE_INTERVAL = 3000;
 
 /** BGRA Buffer → 灰度 Float32Array */
 function grayFromBitmap(bmp, w, h) {
@@ -2113,13 +2124,35 @@ async function grabStoryRoiFallback() {
 }
 
 /** 对外保持同一个入口，先走 GDI，不行再退回 desktopCapturer */
+/* GDI 已经给出**明确结论**的原因码。
+ *
+ * capture.ps1 一旦返回这些，就说明它成功枚举了窗口、拿到了确定答案：
+ *   no-window      窗口列表里没有游戏
+ *   no-rect        拿到了窗口但取不到矩形
+ *   obscured       识别区域被别的窗口盖住
+ *   not-foreground 游戏不在前台
+ *   bad-size/bad-roi 尺寸或区域不合法
+ *
+ * 这种情况下**不能再走 desktopCapturer 兜底**。兜底是给「GDI 本身不可用」
+ * 准备的（PowerShell 被策略禁掉、非 Windows、C# 编译失败），它要枚举
+ * **全部**窗口并抓缩略图，一次 500ms+，是 GDI 的 20 多倍。而 GDI 已经
+ * 枚举过窗口、只是没找到游戏时，兜底只会得到同样的结论 —— 付了代价却
+ * 什么也没多知道。
+ *
+ * 实测后果：没开着游戏时每 600ms 白跑一次兜底，主进程 CPU 41%，
+ * Windows 的低级输入被堵住后成批补发，表现为鼠标指针「瞬移」。
+ */
+const STORY_GDI_DEFINITE_MISS = new Set([
+  'no-window', 'no-rect', 'obscured', 'not-foreground', 'bad-size', 'bad-roi'
+]);
+
 /** 整块 1/3×1/8 再抓一次。只在两级搜索的第一级没命中时才调用。 */
 async function grabStoryRoiWide() {
   const gdi = await grabStoryRoiGdi(false);
   if (gdi) return gdi;
-  // 游戏被别的窗口挡住（或不在前台）时不许走兜底：
-  // desktopCapturer 对后台窗口返回缓存帧，会给出接近 1 的假满分。
-  if (storyCapture.lastReason === 'obscured' || storyCapture.lastReason === 'not-foreground') return null;
+  // GDI 已给出确定结论（含被遮挡 / 不在前台）时不许走兜底：
+  // 兜底对后台窗口返回缓存帧，会给出接近 1 的假满分。
+  if (STORY_GDI_DEFINITE_MISS.has(storyCapture.lastReason)) return null;
   return grabStoryRoiFallback();
 }
 
@@ -2128,16 +2161,25 @@ async function grabStoryRoi() {
   const gdi = await grabStoryRoiGdi(true);
   if (gdi) return gdi;
 
-  /* GDI 明确说「游戏不在前台」时，不许再走兜底。
+  /* GDI 已给出明确结论时，不再走 desktopCapturer 兜底。
    *
-   * 兜底是 desktopCapturer，它**不受前台限制**：游戏在后台时给的是
-   * 窗口的缓存缩略图（画面是冻结的旧帧）。用旧帧去匹配，只要那帧里
-   * 正好有图标，就会得到一个接近 1 的满分 —— 实测抓到过 0.992。
-   * 这种假满分比 0.4x 危险得多：用户切去看攻略，程序却判定「还在剧情」，
-   * 叠加层就一直藏着不回来。 */
-  // 游戏被别的窗口挡住（或不在前台）时不许走兜底：
-  // desktopCapturer 对后台窗口返回缓存帧，会给出接近 1 的假满分。
-  if (storyCapture.lastReason === 'obscured' || storyCapture.lastReason === 'not-foreground') return null;
+   * 兜底只该在 GDI **根本没跑起来**时用（PowerShell 被策略禁掉、非 Windows、
+   * C# 编译失败 —— 对应 bad-cmd）。只要 GDI 返回了明确原因，说明它成功枚举了
+   * 窗口、拿到了确定答案：
+   *
+   *  · no-window / no-rect / bad-size / bad-roi
+   *      游戏不在窗口列表，或几何不合法。兜底枚举的是**同一批**窗口，只会得到
+   *      同样的结论，却要多付 500ms+ 枚举所有窗口并抓缩略图的代价。
+   *
+   *  · obscured / not-foreground
+   *      游戏在、但不在前台或被盖住。兜底对后台窗口返回**缓存的旧帧**，
+   *      只要那帧里正好有图标，就给出接近 1 的假满分（实测抓到过 0.992）——
+   *      比低分危险得多：用户切去看攻略，程序却判定「还在剧情」，叠加层
+   *      一直藏着不回来。
+   *
+   * 实测：没开着游戏时，兜底被自己的原因码一路放行、每 600ms 跑一次，
+   * 主进程 CPU 41%，Windows 低级输入被堵住后成批补发，鼠标指针「瞬移」。 */
+  if (STORY_GDI_DEFINITE_MISS.has(storyCapture.lastReason)) return null;
 
   return grabStoryRoiFallback();
 }
@@ -2399,10 +2441,28 @@ async function storyProbe() {
           win: storyCapture.lastIdent || null
         });
       }
+      /* 已经确认「看不见游戏」很多轮了：降到慢速轮询。
+       *
+       * 不这么做的话，定时器会一直按 600ms 空转 —— 用户没开游戏、
+       * 或者只是在干别的事时，程序每 600ms 醒一次去枚举窗口、抓图、
+       * 匹配模板，纯属白烧 CPU。日志里 stale 涨到 698 就是这来的。
+       * 降到 3 秒一轮，代价是「游戏重新出现后最多晚 3 秒才反应过来」，
+       * 对自动隐藏来说完全可以接受。 */
+      if (!storyWatch.slow) {
+        storyWatch.slow = true;
+        const iv = rearmStoryWatch(STORY_IDLE_INTERVAL);
+        diag.log('story', { idle: true, interval: iv });
+      }
       return;
     }
     // 截到图了，说明刚才的「看不见」是暂时的
     storyWatch.stale = 0;
+    /* 之前降过频就恢复正常节奏：真的抓到画面了，说明用户切回游戏了。 */
+    if (storyWatch.slow) {
+      storyWatch.slow = false;
+      const iv = rearmStoryWatch(storyNormalInterval());
+      diag.log('story', { idle: false, interval: iv });
+    }
     const grabMs = Date.now() - tGrab;
 
     const tMatch = Date.now();
@@ -2517,18 +2577,34 @@ function stopStoryWatch() {
   storyWatch.hits = 0;
   storyWatch.misses = 0;
   storyWatch.stale = 0;
+  storyWatch.slow = false;
   if (storyWatch.on) {
     storyWatch.on = false;
     setStoryHidden(false);
   }
 }
 
+/** 配置里的正常扫描间隔（与 DEFAULT_SETTINGS.storyAutoHide.interval 同口径） */
+function storyNormalInterval() {
+  const cfg = settings.storyAutoHide;
+  return Math.max(300, Math.min(5000, Number(cfg && cfg.interval) || 600));
+}
+
+/** 按给定间隔重挂定时器。降频和恢复正常都走这里，避免两处各写一遍 clear/set。 */
+function rearmStoryWatch(iv) {
+  if (storyWatch.timer) {
+    clearInterval(storyWatch.timer);
+    storyWatch.timer = 0;
+  }
+  storyWatch.timer = setInterval(storyProbe, iv);
+  return iv;
+}
+
 function restartStoryWatch() {
   stopStoryWatch();
   const cfg = settings.storyAutoHide;
   if (!cfg || !cfg.enabled) return;
-  const iv = Math.max(300, Math.min(5000, Number(cfg.interval) || 600));
-  storyWatch.timer = setInterval(storyProbe, iv);
+  const iv = rearmStoryWatch(storyNormalInterval());
   diag.log('story', { watch: true, interval: iv });
 }
 

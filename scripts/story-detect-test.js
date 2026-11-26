@@ -180,7 +180,17 @@ console.log('\n接线检查：');
    * 返回的是缓存帧，会给出接近 1 的假满分（实测 0.992），
    * 用户切去看攻略时叠加层就一直藏不回来。 */
   ok('GDI 失败才退 desktopCapturer', /grabStoryRoiGdi\(true\)[\s\S]{0,900}grabStoryRoiFallback\(\)/.test(source));
-  ok('不在前台时不退兜底', /lastReason === 'not-foreground'[\s\S]{0,80}return null/.test(source));
+  /* 兜底只在「GDI 压根没跑起来」时用。GDI 给出明确原因码（游戏不在、
+   * 被遮挡、不在前台…）时不许再走 desktopCapturer —— 它枚举全部窗口、
+   * 一次 500ms+，而且对后台窗口返回缓存帧会给出假满分。
+   * 早期只判了 obscured / not-foreground 两种，其余原因码照样放行，
+   * 导致没开游戏时每 600ms 白跑一次兜底、主进程 41% CPU、鼠标瞬移。 */
+  ok('明确原因码时不退兜底', /STORY_GDI_DEFINITE_MISS\.has\(storyCapture\.lastReason\)[\s\S]{0,80}return null/.test(source));
+  ok('原因码集合含 no-window', /STORY_GDI_DEFINITE_MISS\s*=\s*new Set\(\[[\s\S]{0,300}'no-window'/.test(source));
+  ok('原因码集合含 not-foreground', /STORY_GDI_DEFINITE_MISS\s*=\s*new Set\(\[[\s\S]{0,300}'not-foreground'/.test(source));
+  /* 空转降频：连续看不见游戏要降速，否则定时器一直按 600ms 空转 */
+  ok('看不见游戏会降频', /storyWatch\.slow = true[\s\S]{0,120}rearmStoryWatch\(STORY_IDLE_INTERVAL\)/.test(source));
+  ok('重新抓到画面会恢复', /storyWatch\.slow = false[\s\S]{0,120}rearmStoryWatch\(storyNormalInterval\(\)\)/.test(source));
   /* 两级搜索：先抓图标所在的小区域（快约 10 倍），没命中再退回整块。
    * 这条锁住「小区域真的比整块小」和「确实有回退」，避免以后
    * 有人把回退删掉、布局一变就永久漏识别。 */
