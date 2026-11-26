@@ -6315,8 +6315,17 @@ if (!gotLock) {
 
     registerIpc();
     createTray(); // 先建托盘：启动器被收进托盘后还要有个入口能叫回来
-    // 上游：应用内更新初始化（失败不阻塞启动）
-    await registerUpdates().catch(error => console.warn('[update] initialization failed:', error.message));
+    /* 自用版停用应用内更新。
+     *
+     * 上游的更新器指向 FinalLawer/GIFA，且要求 Release 带 RSA 签名的
+     * GIFA-update.json。本仓库既没有签名私钥、也没有发布清单，
+     * 而版本号带 -mod（不符合它的 X.Y.Z 格式），实际只会显示「不支持」。
+     * 更要紧的是：如果哪天版本号改成纯数字，它会去拉原作者的正版，
+     * 把自用功能全盖掉。
+     *
+     * 所以整块不初始化 —— 不发起任何网络请求，启动器也不显示更新入口。
+     * 要恢复：删掉这行注释、恢复 console/index.html 里的 update.js 引用。 */
+    // await registerUpdates().catch(error => console.warn('[update] initialization failed:', error.message));
     // 上游：沉浸模式下显示环境变了要重新贴合视频比例
     for (const event of ['display-added', 'display-removed', 'display-metrics-changed']) {
       screen.on(event, fitImmersionWindow);

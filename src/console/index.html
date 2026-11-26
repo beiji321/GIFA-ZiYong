@@ -9,9 +9,22 @@
     <title>原神跟跑助手 · 启动器</title>
     <link rel="stylesheet" href="console.css" />
     <link rel="stylesheet" href="home.css" />
+    <!--
+      应用内更新已停用（自用版）：本仓库没有签名私钥、Release 也没有
+      GIFA-update.json，更新器指向的又是原作者仓库，拉下来会把自用功能全覆盖。
+      见 README「关于应用内更新」。要重新启用，恢复这一行并删掉 body 上的
+      data-update-disabled 属性即可。
     <script src="update.js" defer></script>
+    -->
   </head>
-  <body>
+  <body data-update-disabled>
+    <script>
+      /* 更新入口隐藏：按钮和对话框都去掉，避免用户点了没反应。 */
+      window.addEventListener('DOMContentLoaded', () => {
+        document.getElementById('btnUpdate')?.remove();
+        document.getElementById('updateDialog')?.remove();
+      });
+    </script>
     <!-- 纯 CSS 分页：radio 必须是 #shell 的前置兄弟，导航 label 通过 for 切换。
          这样不用往 console.js 里加任何分页代码，回归脚本的行为完全不变。 -->
     <input class="nav-radio" type="radio" name="nav" id="tab-home" checked />

@@ -16,7 +16,7 @@
     "pack:release": "node scripts/pack-release.js",
     "verify:artifacts": "node scripts/verify-artifacts.js",
     "sign:update": "node scripts/sign-update.js",
-    "test:update": "node --test scripts/update-test.js && node scripts/update-helper-test.js && node scripts/update-launcher-ui-test.js",
+    "test:update": "node --test scripts/update-test.js && node scripts/update-helper-test.js",
     "assets": "python scripts/make-assets.py",
     "test:license": "node scripts/license-test.js",
     "test:materials": "node scripts/material-paths-test.js",
