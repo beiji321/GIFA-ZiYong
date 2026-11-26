@@ -366,6 +366,12 @@ label.setting { cursor: pointer; }
 .setting-ctrl input[type="range"] { flex: 1 1 auto; min-width: 0; }
 .setting-ctrl > .sel { flex: 1 1 auto; min-width: 0; width: 100%; }
 
+/* 竖向堆叠的设置项（标题 + 下面的整行控件）。
+ * 不加这几条的话 .setting 的 flex 会把 .setting-text 挤成一个字宽，
+ * 中文就变成竖排 —— 合并上游时丢过一次，症状很明显。 */
+.setting-stack { flex-wrap: wrap; padding-bottom: 12px; }
+.setting-stack .setting-text { flex: 1 1 0; }
+
 /* 开关：40x20 轨道、12px 白圆点、开态强调蓝 */
 .switch { display: inline-flex; flex: 0 0 auto; margin-left: auto; }
 .switch input {
@@ -723,3 +729,151 @@ button.small { flex: 0 0 auto; height: 28px; padding: 0 11px; font-size: 12px; }
   font-variant-numeric: tabular-nums;
 }
 .health-line.bad { color: #ff8a80; }
+
+
+/* ============================================================
+ * 魔改版补充样式
+ *
+ * 上游 v0.2.8 把启动器首页精简了，这里补回自用视频卡片、
+ * 「第一次使用」说明区块等仍在使用的 class。
+ * ============================================================ */
+
+/* 以下为 card-note 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.card-note .card-ico { color: var(--dim); }
+
+/* 以下为 grow 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.grow { flex: 1 1 auto; }
+
+/* 以下为 ha-arrow 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.ha-arrow { filter: drop-shadow(0 0.5px 1.6px rgba(0, 0, 0, 0.5)); }
+
+/* 以下为 lbl 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.lbl { flex: 0 0 auto; min-width: 38px; color: var(--dim); }
+
+/* 以下为 meta 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.meta { min-height: 16px; color: var(--dim); font-size: 12px; line-height: 1.5; }
+
+.meta b { color: var(--fg); font-weight: 500; }
+
+/* 以下为 note-cols 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+/* 首页三步：并排三列，一屏内看完，不用往下滚 */
+.note-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+
+.note-cols .note-step {
+  padding: 11px 12px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 12px;
+}
+
+.note-cols { grid-template-columns: 1fr; }
+
+/* 以下为 note-step 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.note-step { display: flex; align-items: flex-start; gap: 10px; font-size: 12.5px; line-height: 1.65; color: var(--fg-2); }
+
+.note-step > b {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: var(--surface-3);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.note-step span b { color: var(--fg); font-weight: 600; }
+
+/* 「红 / 绿」说明直接用叠加层上的那两种颜色，不用再靠文字对应 */
+.note-step > b.tag-red { background: rgba(255, 59, 59, 0.16); color: #ff7a7a; }
+
+.note-step > b.tag-green { background: rgba(53, 217, 107, 0.14); color: #5fe08d; }
+
+.note-cols .note-step {
+  padding: 11px 12px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 12px;
+}
+
+/* 以下为 note-steps 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.note-steps { gap: 10px; }
+
+/* 以下为 resume 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+/* ------------------------------------------------------- 信息条 / 徽章 */
+
+/* 「上次看到」：淡蓝底的信息条 */
+.resume {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  padding: 5px 6px 5px 12px;
+  border: 1px solid rgba(73, 178, 252, 0.22);
+  border-radius: var(--r);
+  background: rgba(73, 178, 252, 0.07);
+  font-size: 12px;
+}
+
+/* display:flex 会盖掉 [hidden] 的 display:none，必须显式兜一层 */
+.resume[hidden] { display: none !important; }
+
+.resume > .ico { width: 15px; height: 15px; color: var(--accent); }
+
+/* 以下为 resume-info 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.resume-info { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+
+.resume-info b { font-weight: 500; }
+
+.resume-info .dim { color: var(--dim); }
+
+/* 以下为 resume-tag 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.resume-tag { flex: 0 0 auto; color: var(--accent); font-weight: 600; letter-spacing: 0.3px; }
+
+/* 以下为 row 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+/* -------------------------------------------------------------- 输入控件 */
+
+.row { display: flex; align-items: center; gap: 8px; min-height: 32px; }
+
+/* 以下为 steps 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+/* ------------------------------------------------------ 标定步骤 / 排查工具 */
+
+.steps {
+  flex: 1 0 100%;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding-left: 32px; /* 设置行图标 20 + 间距 12，和上面的文字左对齐 */
+}
+
+.steps { grid-template-columns: 1fr; }
+
+/* 以下为 tag-green 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.note-step > b.tag-green { background: rgba(53, 217, 107, 0.14); color: #5fe08d; }
+
+/* 以下为 tag-red 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+/* 「红 / 绿」说明直接用叠加层上的那两种颜色，不用再靠文字对应 */
+.note-step > b.tag-red { background: rgba(255, 59, 59, 0.16); color: #ff7a7a; }
+
+/* 以下为 tool-label 相关样式：上游 v0.2.8 简化首页时移除，合并后补回 */
+
+.tool-label { margin-right: 2px; color: var(--dim-2); font-size: 11.5px; }

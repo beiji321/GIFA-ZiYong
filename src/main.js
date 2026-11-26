@@ -2962,6 +2962,71 @@ function createOverlay() {
   return overlay;
 }
 
+/**
+ * 上次的圆心坐标可能落在屏幕外（换过分辨率 / 改过缩放 / 拔过外接屏），
+ * 那样窗口建好了也看不见，表现就是「必须点一下②再锁定才冒出来」。
+ * 这里检测可见比例，太小就沿最近的边夹回工作区。
+ */
+function ensureOverlayReachable() {
+  if (!overlayWin || overlayWin.isDestroyed()) return false;
+  let b = null;
+  try {
+    b = overlayWin.getBounds();
+  } catch {
+    return false;
+  }
+  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return false;
+
+  let d = null;
+  try {
+    d = screen.getDisplayMatching(b);
+  } catch {
+    return false;
+  }
+  if (!d || !d.workArea) return false;
+  const area = d.workArea;
+
+  // 与工作区的相交面积占窗口面积的比例
+  const ix = Math.max(0, Math.min(b.x + b.width, area.x + area.width) - Math.max(b.x, area.x));
+  const iy = Math.max(0, Math.min(b.y + b.height, area.y + area.height) - Math.max(b.y, area.y));
+  const visible = (ix * iy) / Math.max(1, b.width * b.height);
+  if (visible >= 0.2) return false;
+
+  // 沿最近的边夹回工作区（窗口比工作区还大时贴左上角）
+  const nx = Math.max(area.x, Math.min(b.x, area.x + area.width - b.width));
+  const ny = Math.max(area.y, Math.min(b.y, area.y + area.height - b.height));
+  try {
+    overlayWin.setBounds({ x: Math.round(nx), y: Math.round(ny), width: b.width, height: b.height });
+  } catch {
+    return false;
+  }
+  settings.bearing.x = Math.round(nx + b.width / 2);
+  settings.bearing.y = Math.round(ny + b.height / 2);
+  saveBearingRatio(settings.bearing.x, settings.bearing.y);
+  persist();
+  pushDanmakuConfig();
+  pushRadarConfig();
+  console.log(
+    '[overlay] 叠加层跑到屏幕外（可见 %s%%），已拉回 (%s, %s)',
+    Math.round(visible * 100),
+    Math.round(nx),
+    Math.round(ny)
+  );
+  return true;
+}
+
+/**
+ * 方位标定开着就把叠加层叫起来。
+ * 关键在 ensureOverlayReachable：上次的圆心可能在屏幕外，
+ * 不拉回来就表现为「叠加层开了但看不见」。
+ */
+function ensureOverlayVisible() {
+  if (!settings.bearing.enabled) return;
+  showOverlay();
+  ensureOverlayReachable();
+  pushRadarConfig();
+}
+
 function showOverlay() {
   clearTimeout(overlayReleaseTimer);
   overlayReleaseTimer = null;
