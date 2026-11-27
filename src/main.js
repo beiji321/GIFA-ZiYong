@@ -2667,6 +2667,30 @@ function sameWindowBounds(first, second) {
   return first.x === second.x && first.y === second.y && first.width === second.width && first.height === second.height;
 }
 
+/* 沿单个轴计算沉浸后的位置：贴边就锁那条边，否则居中。
+ *
+ * 这个函数来自上游 v0.2.9（它把 X/Y 两轴统一成同一套贴边逻辑）。
+ * 但与上游不同的是**阈值**：
+ *
+ *   上游用 2px —— 只认「精确贴边」的窗口。
+ *   这里用 40px —— 用户之前反复反馈的「进出沉浸窗口上下漂」，
+ *   正是因为窗口离屏幕边差了几像素（没精确到 0）就被判为「不贴边」、
+ *   走了居中缩放，结果高度少了 66px 标题栏、位置挪动 33px。
+ *   40px 是实机验证过的容错范围：看着贴着边就该锁边。
+ *
+ * 两轴都调它：X 轴贴左/右、Y 轴贴上/下，规则一致。
+ */
+function fitImmersionAxis(start, size, fittedSize, workStart, workSize, edge = 40) {
+  const workEnd = workStart + workSize;
+  const distStart = start - workStart;
+  const distEnd = workEnd - (start + size);
+  if (distStart <= edge && !(distEnd <= edge)) return workStart;         // 贴起点边：锁起点
+  if (distEnd <= edge && !(distStart <= edge)) return workEnd - fittedSize; // 贴终点边：锁终点
+  // 普通位置或两侧都贴边（窗口比工作区还大）：沿这个轴居中
+  const centered = start + Math.round((size - fittedSize) / 2);
+  return Math.max(workStart, Math.min(workEnd - fittedSize, centered));
+}
+
 /* 沉浸窗口该放在哪、多大 —— 唯一的算法来源。
  *
  * 作者的 fitImmersionWindow 和魔改的 applyRatioLock 都会碰窗口几何，
@@ -2702,26 +2726,11 @@ function immersionPlacement() {
   const maxH = Math.max(1, Math.min(original.height, workArea.height) - frameH);
   const width = Math.max(1, Math.min(maxW, Math.round(maxH * immersionAspect))) + frameW;
   const height = Math.max(1, Math.min(maxH, Math.round(maxW / immersionAspect))) + frameH;
-  const left = Math.max(workArea.x, Math.min(workArea.x + workArea.width - width, original.x + Math.round((original.width - width) / 2)));
-
-  /* 贴边判定：只有真的贴着边（距离在阈值内）才锁那条边，
-   * 否则保持作者的居中。
-   *
-   * 阈值不能只看「哪边更近」—— 窗口在屏幕中间偏上时也会「离上边更近」，
-   * 但它并没有贴边，锁顶边会让它莫名其妙地挪动。 */
-  const EDGE = 40;
-  const distTop = original.y - workArea.y;
-  const distBottom = (workArea.y + workArea.height) - (original.y + original.height);
-  let top;
-  if (distTop <= EDGE) {
-    top = original.y;                                  // 贴上边：锁顶边
-  } else if (distBottom <= EDGE) {
-    top = original.y + original.height - height;        // 贴下边：锁底边
-  } else {
-    top = original.y + Math.round((original.height - height) / 2);  // 居中
-  }
-  top = Math.max(workArea.y, Math.min(workArea.y + workArea.height - height, top));
-  return { x: left, y: top, width, height };
+  /* 两轴贴边判定（上游 v0.2.9 的思路，阈值用我方 40px）。
+   * X 轴：贴左/右锁对应边；Y 轴：贴上/下锁对应边；都不贴则居中。 */
+  const x = fitImmersionAxis(original.x, original.width, width, workArea.x, workArea.width);
+  const y = fitImmersionAxis(original.y, original.height, height, workArea.y, workArea.height);
+  return { x, y, width, height };
 }
 
 function fitImmersionWindow() {

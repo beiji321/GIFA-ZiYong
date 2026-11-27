@@ -1,7 +1,7 @@
 {
   "name": "genshin-route-buddy",
   "productName": "原神跟跑助手",
-  "version": "0.2.8-mod",
+  "version": "0.2.9-mod",
   "description": "B站攻略视频悬浮窗：置顶于原神之上，自动读取视频里的角色朝向并在自己的小地图上标出",
   "main": "src/main.js",
   "author": "FinalLawer",
